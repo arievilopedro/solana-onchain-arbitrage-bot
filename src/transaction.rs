@@ -329,32 +329,14 @@ fn create_swap_instruction(
         AccountMeta::new_readonly(associated_token_program_id, false), // 6. Associated Token program
     ];
 
-    // Step 5: Add flashloan accounts with USDC vault_index=0 constraint
+    // Step 5: Add flashloan accounts using the single supported vault
     if use_flashloan {
-        let vault_authorities = [
-            Pubkey::from_str("5LFpzqgsxrSfhKwbaFiAEJ2kbc9QyimjKueswsyU4T3o").unwrap(),
-            Pubkey::from_str("4B2yxi8n7jr8w3K7cssokLNJZ6k2NjiwKwLdQ8L9dbAA").unwrap(),
-        ];
-        // USDC flashloan uses the PDA vault (index 0) only
-        let vault_index = if flashloan_base_mint == usdc_mint {
-            0
-        } else {
-            rand::random::<usize>() % vault_authorities.len()
-        };
-        let vault_authority = vault_authorities[vault_index];
+        let vault_authority =
+            Pubkey::from_str("5LFpzqgsxrSfhKwbaFiAEJ2kbc9QyimjKueswsyU4T3o").unwrap();
         accounts.push(AccountMeta::new_readonly(vault_authority, false));
 
-        // Vault index 0 uses PDA-derived token account, index 1 uses associated token account
-        // Defensive check: always use PDA for USDC regardless of vault_index
-        let vault_token_account = if vault_index == 0 || flashloan_base_mint == usdc_mint {
-            let token_pda = derive_vault_token_account(&executor_program_id, &flashloan_base_mint);
-            token_pda.0
-        } else {
-            spl_associated_token_account::get_associated_token_address(
-                &vault_authority,
-                &flashloan_base_mint,
-            )
-        };
+        let vault_token_account =
+            derive_vault_token_account(&executor_program_id, &flashloan_base_mint).0;
         accounts.push(AccountMeta::new(vault_token_account, false));
     }
 
