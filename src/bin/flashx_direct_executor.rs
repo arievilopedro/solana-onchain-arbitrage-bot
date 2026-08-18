@@ -351,7 +351,7 @@ fn axiom_swap_signals(
             if sol_amount < min_sol {
                 return None;
             }
-            let pump_program_pos = ix
+            let axiom_pump = ix
                 .accounts
                 .iter()
                 .enumerate()
@@ -359,8 +359,11 @@ fn axiom_swap_signals(
                     keys.get(*account_idx as usize)
                         .filter(|account| account.as_str() == PUMP_AMM_PROGRAM)
                         .map(|_| pos)
-                })?;
-            let pump = account_at(pump_program_pos + 1)?;
+                })
+                .and_then(|pump_program_pos| account_at(pump_program_pos + 1));
+            let pump = axiom_pump
+                .filter(|candidate| pools.pump.iter().any(|known| known == candidate))
+                .or_else(|| pools.pump.first().cloned())?;
             Some(AxiomSwapSignal {
                 mint,
                 pump,
