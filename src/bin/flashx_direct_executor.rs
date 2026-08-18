@@ -688,6 +688,42 @@ async fn route_for(
     Ok(route)
 }
 
+async fn prewarm_routes(state: Arc<Mutex<ExecutorState>>, limit: usize, process_delay_ms: u64) {
+    let routes = {
+        let guard = state.lock().await;
+        guard
+            .pools_by_mint
+            .iter()
+            .flat_map(|(mint, pools)| {
+                pools.pump.iter().flat_map(move |pump| {
+                    pools
+                        .dlmm
+                        .iter()
+                        .map(move |dlmm| (mint.clone(), pump.clone(), dlmm.clone()))
+                })
+            })
+            .take(limit)
+            .collect::<Vec<_>>()
+    };
+    info!("prewarming {} routes", routes.len());
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    for (mint, pump, dlmm) in routes {
+        let mut guard = state.lock().await;
+        match route_for(&mut guard, &mint, &pump, &dlmm, process_delay_ms).await {
+            Ok(_) => ok += 1,
+            Err(e) => {
+                failed += 1;
+                warn!(
+                    "prewarm route failed mint={} pump={} dlmm={}: {}",
+                    mint, pump, dlmm, e
+                );
+            }
+        }
+    }
+    info!("prewarm complete ok={} failed={}", ok, failed);
+}
+
 async fn fire_route(
     state: Arc<Mutex<ExecutorState>>,
     mint: String,
@@ -789,6 +825,8 @@ async fn main() -> anyhow::Result<()> {
         .arg(Arg::with_name("max-txs").long("max-txs").takes_value(true).default_value("3"))
         .arg(Arg::with_name("delay-ms").long("delay-ms").takes_value(true).default_value("10"))
         .arg(Arg::with_name("refresh-on-send").long("refresh-on-send"))
+        .arg(Arg::with_name("prewarm-routes").long("prewarm-routes"))
+        .arg(Arg::with_name("prewarm-limit").long("prewarm-limit").takes_value(true).default_value("0"))
         .arg(Arg::with_name("rabbit-pool-filter").long("rabbit-pool-filter"))
         .arg(Arg::with_name("pump-program-filter").long("pump-program-filter"))
         .arg(Arg::with_name("trigger-on-pool-touch").long("trigger-on-pool-touch"))
@@ -830,6 +868,8 @@ async fn main() -> anyhow::Result<()> {
     let max_txs: u64 = matches.value_of("max-txs").unwrap().parse()?;
     let delay_ms: u64 = matches.value_of("delay-ms").unwrap().parse()?;
     let refresh_on_send = matches.is_present("refresh-on-send");
+    let prewarm_routes_enabled = matches.is_present("prewarm-routes");
+    let prewarm_limit: usize = matches.value_of("prewarm-limit").unwrap().parse()?;
     let rabbit_pool_filter = matches.is_present("rabbit-pool-filter");
     let pump_program_filter = matches.is_present("pump-program-filter");
     let trigger_on_pool_touch = matches.is_present("trigger-on-pool-touch");
@@ -944,6 +984,23 @@ async fn main() -> anyhow::Result<()> {
         last_pool_touch_by_mint: HashMap::new(),
         pool_refresher: PoolDataRefresher::new(),
     }));
+
+    if prewarm_routes_enabled {
+        let route_count = {
+            let guard = state.lock().await;
+            let total = guard
+                .pools_by_mint
+                .values()
+                .map(|pools| pools.pump.len() * pools.dlmm.len())
+                .sum::<usize>();
+            if prewarm_limit == 0 {
+                total
+            } else {
+                total.min(prewarm_limit)
+            }
+        };
+        prewarm_routes(state.clone(), route_count, delay_ms).await;
+    }
 
     {
         let state = state.clone();
