@@ -217,7 +217,7 @@ fn push_pump_v2_tail_accounts(
 }
 
 // See https://docs.solanamevbot.com/home/onchain-bot/onchain-program for more information
-fn create_swap_instruction(
+pub fn create_swap_instruction(
     wallet_kp: &Keypair,
     mint_pool_data: &MintPoolData,
     compute_unit_limit: u32,
