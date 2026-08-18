@@ -532,19 +532,7 @@ fn axiom_swap_signals(
             };
             let amount_0 = read_le_u64(&ix.data[1..9]).unwrap_or(0);
             let sol_amount = amount_0 as f64 / 1_000_000_000.0;
-            let axiom_pump = ix
-                .accounts
-                .iter()
-                .enumerate()
-                .find_map(|(pos, account_idx)| {
-                    keys.get(*account_idx as usize)
-                        .filter(|account| account.as_str() == PUMP_AMM_PROGRAM)
-                        .map(|_| pos)
-                })
-                .and_then(|pump_program_pos| account_at(pump_program_pos + 1));
-            let pump = axiom_pump
-                .filter(|candidate| pools.pump.iter().any(|known| known == candidate))
-                .or_else(|| pools.pump.first().cloned())?;
+            let pump = pools.pump.first().cloned()?;
             let candidate_owners = ix
                 .accounts
                 .iter()
