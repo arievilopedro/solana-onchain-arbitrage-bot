@@ -421,6 +421,60 @@ fn axiom_swap_rows(
         .collect()
 }
 
+fn axiom_candidate_rows(
+    pools_by_mint: &HashMap<String, MintPools>,
+    swaps: &[Value],
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for swap in swaps {
+        let mint = swap.get("mint").and_then(Value::as_str).unwrap_or_default();
+        if mint.is_empty() || !seen.insert(mint.to_string()) {
+            continue;
+        }
+        let Some(pools) = pools_by_mint.get(mint) else {
+            out.push(json!({
+                "mint": mint,
+                "actionable": false,
+                "reason": "mint_not_in_pools_by_mint",
+                "pump_pool": swap.get("pump_pool").cloned().unwrap_or(Value::Null),
+                "dlmm": Value::Null,
+            }));
+            continue;
+        };
+        if pools.pump.is_empty() {
+            out.push(json!({
+                "mint": mint,
+                "actionable": false,
+                "reason": "missing_pump_pool",
+                "pump_pool": swap.get("pump_pool").cloned().unwrap_or(Value::Null),
+                "dlmm": pools.dlmm.first(),
+            }));
+            continue;
+        }
+        if pools.dlmm.is_empty() {
+            out.push(json!({
+                "mint": mint,
+                "actionable": false,
+                "reason": "missing_dlmm_pool",
+                "pump_pool": pools.pump.first(),
+                "dlmm": Value::Null,
+            }));
+            continue;
+        }
+        out.push(json!({
+            "mint": mint,
+            "actionable": true,
+            "reason": "pump_and_dlmm_available",
+            "pump_pool": pools.pump.first(),
+            "axiom_pump_pool": swap.get("pump_pool").cloned().unwrap_or(Value::Null),
+            "dlmm": pools.dlmm.first(),
+            "dlmm_count": pools.dlmm.len(),
+        }));
+    }
+    out
+}
+
 fn candidates_from_keys(
     pools_by_mint: &HashMap<String, MintPools>,
     keys: &[String],
@@ -514,6 +568,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(Arg::with_name("sol-usd").long("sol-usd").takes_value(true).default_value("180"))
         .arg(Arg::with_name("min-usd").long("min-usd").takes_value(true).default_value("0"))
         .arg(Arg::with_name("only-actionable").long("only-actionable"))
+        .arg(Arg::with_name("only-axiom-actionable").long("only-axiom-actionable"))
         .arg(Arg::with_name("require-flashx").long("require-flashx"))
         .arg(Arg::with_name("required-accounts").long("required-accounts").takes_value(true).default_value(""))
         .arg(Arg::with_name("reject-accounts").long("reject-accounts").takes_value(true).default_value(""))
@@ -533,6 +588,7 @@ async fn main() -> anyhow::Result<()> {
     let rabbit_pool_filter = matches.is_present("rabbit-pool-filter");
     let pump_program_filter = matches.is_present("pump-program-filter");
     let only_actionable = matches.is_present("only-actionable");
+    let only_axiom_actionable = matches.is_present("only-axiom-actionable");
     let require_flashx = matches.is_present("require-flashx");
     let log_keys = matches.is_present("log-keys");
     let log_programs = matches.is_present("log-programs");
@@ -645,6 +701,7 @@ async fn main() -> anyhow::Result<()> {
             let pump_swaps = pump_swap_rows(&txn, &keys, sol_usd);
             let flashx_instructions = flashx_instruction_rows(&txn, &keys);
             let axiom_swaps = axiom_swap_rows(&txn, &keys);
+            let axiom_candidates = axiom_candidate_rows(&pools_by_mint, &axiom_swaps);
             let instructions = if log_instructions {
                 instruction_rows(&txn, &keys)
             } else {
@@ -669,6 +726,13 @@ async fn main() -> anyhow::Result<()> {
             if only_actionable && candidates.is_empty() {
                 continue;
             }
+            if only_axiom_actionable
+                && !axiom_candidates
+                    .iter()
+                    .any(|candidate| candidate.get("actionable").and_then(Value::as_bool).unwrap_or(false))
+            {
+                continue;
+            }
 
             let row = json!({
                 "ts_ms": now_ms(),
@@ -685,6 +749,7 @@ async fn main() -> anyhow::Result<()> {
                 "instruction_mints": mints_for_candidates,
                 "pump_swaps": pump_swaps,
                 "axiom_swaps": axiom_swaps,
+                "axiom_candidates": axiom_candidates,
                 "flashx_instructions": flashx_instructions,
                 "candidates": candidates,
                 "programs": if log_programs { json!(programs) } else { Value::Null },
