@@ -430,6 +430,7 @@ fn axiom_swap_rows(
     rpc_client: Option<&RpcClient>,
     tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
     keys: &[String],
+    pools_by_mint: &HashMap<String, MintPools>,
 ) -> Vec<Value> {
     let Some(msg) = &tx.message else {
         return Vec::new();
@@ -476,6 +477,10 @@ fn axiom_swap_rows(
             let pump_pool = pump_program_positions
                 .first()
                 .and_then(|program_pos| account_at(program_pos + 1));
+            let known_pump_pool = pools_by_mint
+                .get(&mint)
+                .and_then(|pools| pools.pump.first())
+                .cloned();
             let pump_sell_estimate = if side == "sell" {
                 rpc_client
                     .zip(pump_pool.as_deref())
@@ -493,6 +498,23 @@ fn axiom_swap_rows(
             } else {
                 None
             };
+            let known_pump_sell_estimate = if side == "sell" {
+                rpc_client.zip(known_pump_pool.as_deref()).map(
+                    |(rpc, pump)| match estimate_pump_sell_sol(rpc, pump, &mint, amount_0) {
+                        Ok(sol) => json!({
+                            "ok": true,
+                            "sol": sol,
+                            "usd_at_180": sol * 180.0,
+                        }),
+                        Err(e) => json!({
+                            "ok": false,
+                            "error": e,
+                        }),
+                    },
+                )
+            } else {
+                None
+            };
 
             Some(json!({
                 "instruction_index": idx,
@@ -505,6 +527,8 @@ fn axiom_swap_rows(
                 "byte_sol_guess": if side == "buy" { amount_0_as_sol } else { amount_1_as_sol },
                 "byte_sol_guess_source": if side == "buy" { "amount_0" } else { "amount_1" },
                 "pump_sell_estimate": pump_sell_estimate.unwrap_or(Value::Null),
+                "known_pump_pool": known_pump_pool,
+                "known_pump_sell_estimate": known_pump_sell_estimate.unwrap_or(Value::Null),
                 "mint": mint,
                 "quote_mint": quote_mint,
                 "user": account_at(1),
@@ -804,7 +828,8 @@ async fn main() -> anyhow::Result<()> {
             let programs = program_ids(&txn, &keys);
             let pump_swaps = pump_swap_rows(&txn, &keys, sol_usd);
             let flashx_instructions = flashx_instruction_rows(&txn, &keys);
-            let axiom_swaps = axiom_swap_rows(rpc_client.as_ref(), &txn, &keys);
+            let axiom_swaps =
+                axiom_swap_rows(rpc_client.as_ref(), &txn, &keys, &pools_by_mint);
             let axiom_candidates = axiom_candidate_rows(&pools_by_mint, &axiom_swaps);
             let instructions = if log_instructions {
                 instruction_rows(&txn, &keys)
