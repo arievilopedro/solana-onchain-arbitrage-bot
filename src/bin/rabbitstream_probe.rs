@@ -19,6 +19,8 @@ const USDT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 const USD1: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
 const FLASHX: &str = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9";
 const PUMP_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+const PUMP_BUY_DISCRIMINATOR: &str = "33e685a4017f83ad";
+const PUMP_SELL_DISCRIMINATOR: &str = "66063d1201daebea";
 
 #[derive(Clone, Debug)]
 struct MintPools {
@@ -207,6 +209,78 @@ fn instruction_rows(
                 "data_hex": bytes_to_hex(&ix.data),
                 "data_len": ix.data.len(),
             })
+        })
+        .collect()
+}
+
+fn read_le_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    Some(u64::from_le_bytes(buf))
+}
+
+fn pump_swap_rows(
+    tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
+    keys: &[String],
+    sol_usd: f64,
+) -> Vec<Value> {
+    let Some(msg) = &tx.message else {
+        return Vec::new();
+    };
+    msg.instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, ix)| {
+            let program = keys.get(ix.program_id_index as usize)?;
+            if program != PUMP_AMM_PROGRAM || ix.accounts.len() < 5 || ix.data.len() < 16 {
+                return None;
+            }
+            let discriminator = bytes_to_hex(&ix.data[..8]);
+            let side = if discriminator == PUMP_BUY_DISCRIMINATOR {
+                "buy"
+            } else if discriminator == PUMP_SELL_DISCRIMINATOR {
+                "sell"
+            } else {
+                "unknown"
+            };
+            if side == "unknown" {
+                return None;
+            }
+
+            let account_at = |pos: usize| -> Option<String> {
+                ix.accounts
+                    .get(pos)
+                    .and_then(|account_idx| keys.get(*account_idx as usize))
+                    .cloned()
+            };
+            let amount_0 = read_le_u64(&ix.data[8..16]).unwrap_or(0);
+            let amount_1 = if ix.data.len() >= 24 {
+                read_le_u64(&ix.data[16..24]).unwrap_or(0)
+            } else {
+                0
+            };
+            let estimated_sol = if side == "buy" {
+                amount_0 as f64 / 1_000_000_000.0
+            } else {
+                0.0
+            };
+
+            Some(json!({
+                "instruction_index": idx,
+                "side": side,
+                "discriminator": discriminator,
+                "pool": account_at(0),
+                "user": account_at(1),
+                "quote_mint": account_at(3),
+                "mint": account_at(4),
+                "amount_0": amount_0,
+                "amount_1": amount_1,
+                "estimated_sol": estimated_sol,
+                "estimated_usd": estimated_sol * sol_usd,
+            }))
         })
         .collect()
 }
@@ -426,12 +500,21 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
             let programs = program_ids(&txn, &keys);
+            let pump_swaps = pump_swap_rows(&txn, &keys, sol_usd);
             let instructions = if log_instructions {
                 instruction_rows(&txn, &keys)
             } else {
                 Vec::new()
             };
-            let candidates = candidates_from_keys(&pools_by_mint, &keys, &mints);
+            let mut mints_for_candidates = mints.clone();
+            for swap in &pump_swaps {
+                if let Some(mint) = swap.get("mint").and_then(Value::as_str) {
+                    if !is_excluded_mint(mint) && !mints_for_candidates.contains(&mint.to_string()) {
+                        mints_for_candidates.push(mint.to_string());
+                    }
+                }
+            }
+            let candidates = candidates_from_keys(&pools_by_mint, &keys, &mints_for_candidates);
             if only_actionable && candidates.is_empty() {
                 continue;
             }
@@ -447,6 +530,8 @@ async fn main() -> anyhow::Result<()> {
                 "keys_count": keys.len(),
                 "programs_count": programs.len(),
                 "mints": mints,
+                "instruction_mints": mints_for_candidates,
+                "pump_swaps": pump_swaps,
                 "candidates": candidates,
                 "programs": if log_programs { json!(programs) } else { Value::Null },
                 "keys": if log_keys { json!(keys) } else { Value::Null },
