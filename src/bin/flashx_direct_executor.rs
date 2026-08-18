@@ -628,36 +628,57 @@ async fn send_signed_transaction(
     rpc_clients: &[Arc<RpcClient>],
     send_config: &SendConfig,
     tx: VersionedTransaction,
-) -> Vec<anyhow::Result<String>> {
-    let mut out = Vec::new();
+) -> Vec<(&'static str, anyhow::Result<String>)> {
+    let mut tasks = Vec::new();
     if let Some(sender) = &send_config.fast {
-        let res = tokio::time::timeout(
-            Duration::from_millis(sender.timeout_ms),
-            send_fast(sender, &tx),
-        )
-        .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("fast sender timeout after {}ms", sender.timeout_ms)));
-        out.push(res);
+        let sender = sender.clone();
+        let tx = tx.clone();
+        tasks.push(tokio::spawn(async move {
+            let res = tokio::time::timeout(
+                Duration::from_millis(sender.timeout_ms),
+                send_fast(&sender, &tx),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "fast sender timeout after {}ms",
+                    sender.timeout_ms
+                ))
+            });
+            ("fast", res)
+        }));
     }
     if send_config.send_rpc {
         for client in rpc_clients {
-            let res = client
-                .send_transaction_with_config(
-                    &tx,
-                    RpcSendTransactionConfig {
-                        skip_preflight: true,
-                        max_retries: Some(0),
-                        preflight_commitment: Some(RpcCommitmentLevel::Processed),
-                        ..Default::default()
-                    },
-                )
-                .map(|sig| sig.to_string())
-                .map_err(anyhow::Error::from);
-            out.push(res);
+            let client = client.clone();
+            let tx = tx.clone();
+            tasks.push(tokio::task::spawn_blocking(move || {
+                let res = client
+                    .send_transaction_with_config(
+                        &tx,
+                        RpcSendTransactionConfig {
+                            skip_preflight: true,
+                            max_retries: Some(0),
+                            preflight_commitment: Some(RpcCommitmentLevel::Processed),
+                            ..Default::default()
+                        },
+                    )
+                    .map(|sig| sig.to_string())
+                    .map_err(anyhow::Error::from);
+                ("rpc", res)
+            }));
         }
     }
-    if out.is_empty() {
-        out.push(Err(anyhow::anyhow!("no transaction senders configured")));
+    if tasks.is_empty() {
+        return vec![("none", Err(anyhow::anyhow!("no transaction senders configured")))];
+    }
+
+    let mut out = Vec::new();
+    for task in tasks {
+        match task.await {
+            Ok(res) => out.push(res),
+            Err(e) => out.push(("sender", Err(anyhow::anyhow!("sender task failed: {}", e)))),
+        }
     }
     out
 }
@@ -799,21 +820,37 @@ async fn fire_route(
         if parallel_sends {
             let send_src_sig = src_sig.clone();
             tokio::spawn(async move {
-                for res in send_signed_transaction(&sending_rpc_clients, &send_config, tx).await {
+                for (transport, res) in
+                    send_signed_transaction(&sending_rpc_clients, &send_config, tx).await
+                {
                     match res {
-                        Ok(sig) => info!("sent {} for src_sig={}", sig, send_src_sig),
+                        Ok(sig) => info!(
+                            "sent transport={} sig={} for src_sig={}",
+                            transport, sig, send_src_sig
+                        ),
                         Err(e) => {
-                            error!("send failed src_sig={}: {}", send_src_sig, e);
+                            error!(
+                                "send failed transport={} src_sig={}: {}",
+                                transport, send_src_sig, e
+                            );
                         }
                     }
                 }
             });
         } else {
-            for res in send_signed_transaction(&sending_rpc_clients, &send_config, tx).await {
+            for (transport, res) in
+                send_signed_transaction(&sending_rpc_clients, &send_config, tx).await
+            {
                 match res {
-                    Ok(sig) => info!("sent {} for src_sig={}", sig, src_sig),
+                    Ok(sig) => info!(
+                        "sent transport={} sig={} for src_sig={}",
+                        transport, sig, src_sig
+                    ),
                     Err(e) => {
-                        error!("send failed src_sig={}: {}", src_sig, e);
+                        error!(
+                            "send failed transport={} src_sig={}: {}",
+                            transport, src_sig, e
+                        );
                     }
                 }
             }
