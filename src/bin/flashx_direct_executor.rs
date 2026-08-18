@@ -417,6 +417,19 @@ fn token_balance_mints_in_pools(
         .collect()
 }
 
+fn keys_in_pools<'a>(
+    keys: impl IntoIterator<Item = &'a String>,
+    pools_by_mint: &HashMap<String, MintPools>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in keys {
+        if pools_by_mint.contains_key(key) && !out.contains(key) {
+            out.push(key.clone());
+        }
+    }
+    out
+}
+
 fn account_keys(
     tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
     meta: Option<&yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta>,
@@ -485,7 +498,14 @@ fn axiom_swap_signals(
                     None
                 }
             });
+            let ix_mints = keys_in_pools(
+                ix.accounts
+                    .iter()
+                    .filter_map(|account_idx| keys.get(*account_idx as usize)),
+                pools_by_mint,
+            );
             let mint = fixed_mint
+                .or_else(|| ix_mints.into_iter().next())
                 .or_else(|| token_balance_mints_in_pools(meta, pools_by_mint).into_iter().next())?;
             let pools = pools_by_mint.get(&mint)?;
             if pools.dlmm.is_empty() {
