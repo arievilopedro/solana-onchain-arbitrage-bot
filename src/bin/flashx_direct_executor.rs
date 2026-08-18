@@ -230,6 +230,12 @@ fn estimate_wsol_volume_usd(
     meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
     sol_usd: f64,
 ) -> f64 {
+    estimate_wsol_volume_sol(meta) * sol_usd
+}
+
+fn estimate_wsol_volume_sol(
+    meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
+) -> f64 {
     let mut pre = HashMap::new();
     let mut post = HashMap::new();
     for b in &meta.pre_token_balances {
@@ -255,7 +261,7 @@ fn estimate_wsol_volume_usd(
             max_abs = diff;
         }
     }
-    max_abs * sol_usd
+    max_abs
 }
 
 fn owner_wsol_volume_sol(
@@ -496,6 +502,14 @@ fn axiom_swap_signals(
                     .or_else(|| {
                         keyed_wsol_volume_sol(meta, &candidate_owners)
                             .map(|sol| (sol, "meta_wsol_ix_owner"))
+                    })
+                    .or_else(|| {
+                        let sol = estimate_wsol_volume_sol(meta);
+                        if sol > 0.0 {
+                            Some((sol, "meta_wsol_tx"))
+                        } else {
+                            None
+                        }
                     })
                     .or_else(|| {
                         instruction_account_native_volume_sol(meta, &instruction_accounts)
