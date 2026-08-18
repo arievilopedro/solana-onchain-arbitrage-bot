@@ -6,10 +6,12 @@ use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_onchain_arbitrage_bot::ata::ensure_base_atas_exist;
 use solana_onchain_arbitrage_bot::config::Config;
+use solana_onchain_arbitrage_bot::dex::pump::PumpAmmInfo;
 use solana_onchain_arbitrage_bot::pool_refreshers::PoolDataRefresher;
 use solana_onchain_arbitrage_bot::pools::MintPoolData;
 use solana_onchain_arbitrage_bot::refresh::initialize_pools_from_markets;
 use solana_onchain_arbitrage_bot::transaction::create_swap_instruction;
+use solana_program::program_pack::Pack;
 use solana_sdk::address_lookup_table::state::AddressLookupTable;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::commitment_config::CommitmentLevel as RpcCommitmentLevel;
@@ -21,6 +23,7 @@ use solana_sdk::signature::{read_keypair_file, Keypair};
 use solana_sdk::signer::Signer;
 use solana_sdk::system_instruction;
 use solana_sdk::transaction::VersionedTransaction;
+use spl_token::state::Account as TokenAccount;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::str::FromStr;
@@ -440,7 +443,54 @@ fn read_le_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(buf))
 }
 
+fn token_account_amount(data: &[u8]) -> Option<u64> {
+    TokenAccount::unpack(data).ok().map(|account| account.amount)
+}
+
+fn estimate_pump_sell_sol(
+    rpc: &RpcClient,
+    pump: &str,
+    mint: &str,
+    token_in_raw: u64,
+) -> Option<f64> {
+    if token_in_raw == 0 {
+        return None;
+    }
+
+    let pump_pubkey = Pubkey::from_str(pump).ok()?;
+    let mint_pubkey = Pubkey::from_str(mint).ok()?;
+    let wsol_pubkey = Pubkey::from_str(WSOL).ok()?;
+    let pool_account = rpc.get_account(&pump_pubkey).ok()?;
+    let pool = PumpAmmInfo::load_checked(&pool_account.data).ok()?;
+
+    let (token_vault, sol_vault) = if pool.base_mint == mint_pubkey
+        && pool.quote_mint == wsol_pubkey
+    {
+        (pool.pool_base_token_account, pool.pool_quote_token_account)
+    } else if pool.quote_mint == mint_pubkey && pool.base_mint == wsol_pubkey {
+        (pool.pool_quote_token_account, pool.pool_base_token_account)
+    } else {
+        return None;
+    };
+
+    let accounts = rpc.get_multiple_accounts(&[token_vault, sol_vault]).ok()?;
+    let token_account = accounts.get(0)?.as_ref()?;
+    let sol_account = accounts.get(1)?.as_ref()?;
+    let token_reserve = token_account_amount(&token_account.data)? as u128;
+    let sol_reserve = token_account_amount(&sol_account.data)? as u128;
+    if token_reserve == 0 || sol_reserve == 0 {
+        return None;
+    }
+
+    let token_in = token_in_raw as u128;
+    let out_lamports =
+        sol_reserve.saturating_mul(token_in) / token_reserve.saturating_add(token_in);
+    let conservative_sol = (out_lamports as f64) * 0.97 / 1_000_000_000.0;
+    (conservative_sol > 0.0).then_some(conservative_sol)
+}
+
 fn axiom_swap_signals(
+    rpc_client: &RpcClient,
     tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
     meta: Option<&yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta>,
     keys: &[String],
@@ -481,6 +531,19 @@ fn axiom_swap_signals(
             };
             let amount_0 = read_le_u64(&ix.data[1..9]).unwrap_or(0);
             let sol_amount = amount_0 as f64 / 1_000_000_000.0;
+            let axiom_pump = ix
+                .accounts
+                .iter()
+                .enumerate()
+                .find_map(|(pos, account_idx)| {
+                    keys.get(*account_idx as usize)
+                        .filter(|account| account.as_str() == PUMP_AMM_PROGRAM)
+                        .map(|_| pos)
+                })
+                .and_then(|pump_program_pos| account_at(pump_program_pos + 1));
+            let pump = axiom_pump
+                .filter(|candidate| pools.pump.iter().any(|known| known == candidate))
+                .or_else(|| pools.pump.first().cloned())?;
             let candidate_owners = ix
                 .accounts
                 .iter()
@@ -515,25 +578,14 @@ fn axiom_swap_signals(
                 measured
             } else if side == "buy" {
                 (sol_amount, "instruction_bytes_buy")
+            } else if let Some(sol) = estimate_pump_sell_sol(rpc_client, &pump, &mint, amount_0) {
+                (sol, "pump_sell_estimate")
             } else {
                 return None;
             };
             if measured_sol < min_sol {
                 return None;
             }
-            let axiom_pump = ix
-                .accounts
-                .iter()
-                .enumerate()
-                .find_map(|(pos, account_idx)| {
-                    keys.get(*account_idx as usize)
-                        .filter(|account| account.as_str() == PUMP_AMM_PROGRAM)
-                        .map(|_| pos)
-                })
-                .and_then(|pump_program_pos| account_at(pump_program_pos + 1));
-            let pump = axiom_pump
-                .filter(|candidate| pools.pump.iter().any(|known| known == candidate))
-                .or_else(|| pools.pump.first().cloned())?;
             Some(AxiomSwapSignal {
                 mint,
                 pump,
@@ -1343,8 +1395,15 @@ async fn main() -> anyhow::Result<()> {
                 let mut guard = state.lock().await;
                 reload_pools_if_changed(&mut guard);
                 if has_flashx {
-                    let axiom_swaps =
-                        axiom_swap_signals(&txn, meta, &keys, &guard.pools_by_mint, sol_usd, axiom_min_sol);
+                    let axiom_swaps = axiom_swap_signals(
+                        guard.rpc_client.as_ref(),
+                        &txn,
+                        meta,
+                        &keys,
+                        &guard.pools_by_mint,
+                        sol_usd,
+                        axiom_min_sol,
+                    );
                     let mints = axiom_swaps
                         .iter()
                         .map(|swap| swap.mint.clone())
