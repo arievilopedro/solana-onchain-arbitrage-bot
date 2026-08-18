@@ -6,7 +6,6 @@ use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_onchain_arbitrage_bot::ata::ensure_base_atas_exist;
 use solana_onchain_arbitrage_bot::config::Config;
-use solana_onchain_arbitrage_bot::dex::pump::PumpAmmInfo;
 use solana_onchain_arbitrage_bot::pool_refreshers::PoolDataRefresher;
 use solana_onchain_arbitrage_bot::pools::MintPoolData;
 use solana_onchain_arbitrage_bot::refresh::initialize_pools_from_markets;
@@ -26,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -69,6 +68,13 @@ struct MintPools {
     dlmm: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+struct PumpReserve {
+    token_reserve: u64,
+    sol_reserve: u64,
+    updated_ms: u128,
+}
+
 #[derive(Clone)]
 struct RouteState {
     config: Config,
@@ -101,8 +107,12 @@ struct ExecutorState {
     cached_blockhash: Hash,
     pools_file: String,
     pools_mtime: Option<SystemTime>,
+    pump_reserves_file: String,
+    pump_reserves_mtime: Option<SystemTime>,
+    pump_reserves_max_age_ms: u128,
     max_dlmm: usize,
     pools_by_mint: HashMap<String, MintPools>,
+    pump_reserves_by_pool: HashMap<String, PumpReserve>,
     route_cache: HashMap<String, RouteState>,
     flash_by_mint: HashMap<String, Vec<FlashEvent>>,
     last_signal_by_mint: HashMap<String, Instant>,
@@ -200,6 +210,42 @@ fn load_pools_by_mint(path: &str, max_dlmm: usize) -> anyhow::Result<HashMap<Str
     Ok(out)
 }
 
+fn load_pump_reserves(path: &str) -> anyhow::Result<HashMap<String, PumpReserve>> {
+    if path.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path))?;
+    let v: Value = serde_json::from_str(&raw)?;
+    let mut out = HashMap::new();
+    let Some(obj) = v.as_object() else {
+        return Ok(out);
+    };
+    for (pool, rec) in obj {
+        let token_reserve = rec
+            .get("token_reserve")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let sol_reserve = rec.get("sol_reserve").and_then(Value::as_u64).unwrap_or(0);
+        let updated_ms = rec
+            .get("updated_ms")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<u128>().ok())
+            .or_else(|| rec.get("updated_ms").and_then(Value::as_u64).map(u128::from))
+            .unwrap_or(0);
+        if token_reserve > 0 && sol_reserve > 0 && updated_ms > 0 {
+            out.insert(
+                pool.clone(),
+                PumpReserve {
+                    token_reserve,
+                    sol_reserve,
+                    updated_ms,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 fn file_mtime(path: &str) -> Option<SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
@@ -218,6 +264,27 @@ fn reload_pools_if_changed(state: &mut ExecutorState) {
                 );
             }
             Err(e) => error!("failed to reload pools_by_mint: {}", e),
+        }
+    }
+}
+
+fn reload_pump_reserves_if_changed(state: &mut ExecutorState) {
+    if state.pump_reserves_file.is_empty() {
+        return;
+    }
+    let mtime = file_mtime(&state.pump_reserves_file);
+    if mtime.is_some() && mtime != state.pump_reserves_mtime {
+        match load_pump_reserves(&state.pump_reserves_file) {
+            Ok(reserves) => {
+                state.pump_reserves_by_pool = reserves;
+                state.pump_reserves_mtime = mtime;
+                info!(
+                    "reloaded {} pump reserves from {}",
+                    state.pump_reserves_by_pool.len(),
+                    state.pump_reserves_file
+                );
+            }
+            Err(e) => error!("failed to reload pump reserves: {}", e),
         }
     }
 }
@@ -441,44 +508,29 @@ fn read_le_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(buf))
 }
 
-fn token_account_amount(data: &[u8]) -> Option<u64> {
-    let amount = data.get(64..72)?;
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(amount);
-    Some(u64::from_le_bytes(buf))
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
-fn estimate_pump_sell_sol(
-    rpc: &RpcClient,
+fn estimate_cached_pump_sell_sol(
+    reserves_by_pool: &HashMap<String, PumpReserve>,
     pump: &str,
-    mint: &str,
     token_in_raw: u64,
+    max_age_ms: u128,
 ) -> Option<f64> {
     if token_in_raw == 0 {
         return None;
     }
-
-    let pump_pubkey = Pubkey::from_str(pump).ok()?;
-    let mint_pubkey = Pubkey::from_str(mint).ok()?;
-    let wsol_pubkey = Pubkey::from_str(WSOL).ok()?;
-    let pool_account = rpc.get_account(&pump_pubkey).ok()?;
-    let pool = PumpAmmInfo::load_checked(&pool_account.data).ok()?;
-
-    let (token_vault, sol_vault) = if pool.base_mint == mint_pubkey
-        && pool.quote_mint == wsol_pubkey
-    {
-        (pool.pool_base_token_account, pool.pool_quote_token_account)
-    } else if pool.quote_mint == mint_pubkey && pool.base_mint == wsol_pubkey {
-        (pool.pool_quote_token_account, pool.pool_base_token_account)
-    } else {
+    let reserve = reserves_by_pool.get(pump)?;
+    let age_ms = now_ms().saturating_sub(reserve.updated_ms);
+    if max_age_ms > 0 && age_ms > max_age_ms {
         return None;
-    };
-
-    let accounts = rpc.get_multiple_accounts(&[token_vault, sol_vault]).ok()?;
-    let token_account = accounts.get(0)?.as_ref()?;
-    let sol_account = accounts.get(1)?.as_ref()?;
-    let token_reserve = token_account_amount(&token_account.data)? as u128;
-    let sol_reserve = token_account_amount(&sol_account.data)? as u128;
+    }
+    let token_reserve = reserve.token_reserve as u128;
+    let sol_reserve = reserve.sol_reserve as u128;
     if token_reserve == 0 || sol_reserve == 0 {
         return None;
     }
@@ -491,11 +543,12 @@ fn estimate_pump_sell_sol(
 }
 
 fn axiom_swap_signals(
-    rpc_client: &RpcClient,
     tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
     meta: Option<&yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta>,
     keys: &[String],
     pools_by_mint: &HashMap<String, MintPools>,
+    pump_reserves_by_pool: &HashMap<String, PumpReserve>,
+    pump_reserves_max_age_ms: u128,
     sol_usd: f64,
     min_sol: f64,
 ) -> Vec<AxiomSwapSignal> {
@@ -572,11 +625,16 @@ fn axiom_swap_signals(
                 measured
             } else if side == "buy" {
                 (sol_amount, "instruction_bytes_buy")
-            } else if let Some(sol) = estimate_pump_sell_sol(rpc_client, &pump, &mint, amount_0) {
-                (sol, "pump_sell_estimate")
+            } else if let Some(sol) = estimate_cached_pump_sell_sol(
+                pump_reserves_by_pool,
+                &pump,
+                amount_0,
+                pump_reserves_max_age_ms,
+            ) {
+                (sol, "pump_sell_cache")
             } else {
                 info!(
-                    "AXIOM_ESTIMATE_FAIL mint={} signal={} raw_amount={} pump={} dlmms={} min_sol={:.6}",
+                    "AXIOM_ESTIMATE_FAIL mint={} signal={} raw_amount={} volume_source=pump_sell_cache pump={} dlmms={} min_sol={:.6}",
                     mint,
                     side,
                     amount_0,
@@ -1108,6 +1166,8 @@ async fn main() -> anyhow::Result<()> {
         .arg(Arg::with_name("geyser-url").long("geyser-url").takes_value(true).required(true))
         .arg(Arg::with_name("geyser-token").long("geyser-token").takes_value(true).default_value(""))
         .arg(Arg::with_name("pools-by-mint-file").long("pools-by-mint-file").takes_value(true).required(true))
+        .arg(Arg::with_name("pump-reserves-file").long("pump-reserves-file").takes_value(true).default_value(""))
+        .arg(Arg::with_name("pump-reserves-max-age-ms").long("pump-reserves-max-age-ms").takes_value(true).default_value("30000"))
         .arg(Arg::with_name("sol-usd").long("sol-usd").takes_value(true).default_value("180"))
         .arg(Arg::with_name("axiom-min-sol").long("axiom-min-sol").takes_value(true).default_value("0.01"))
         .arg(Arg::with_name("min-usd").long("min-usd").takes_value(true).default_value("50"))
@@ -1153,6 +1213,8 @@ async fn main() -> anyhow::Result<()> {
     let geyser_url = matches.value_of("geyser-url").unwrap();
     let geyser_token = matches.value_of("geyser-token").unwrap();
     let pools_file = matches.value_of("pools-by-mint-file").unwrap();
+    let pump_reserves_file = matches.value_of("pump-reserves-file").unwrap();
+    let pump_reserves_max_age_ms: u128 = matches.value_of("pump-reserves-max-age-ms").unwrap().parse()?;
     let sol_usd: f64 = matches.value_of("sol-usd").unwrap().parse()?;
     let axiom_min_sol: f64 = matches.value_of("axiom-min-sol").unwrap().parse()?;
     let min_usd: f64 = matches.value_of("min-usd").unwrap().parse()?;
@@ -1253,6 +1315,21 @@ async fn main() -> anyhow::Result<()> {
     let pools_by_mint = load_pools_by_mint(pools_file, max_dlmm)?;
     let pools_mtime = file_mtime(pools_file);
     info!("loaded {} actionable mints from {}", pools_by_mint.len(), pools_file);
+    let pump_reserves_by_pool = load_pump_reserves(pump_reserves_file).unwrap_or_else(|e| {
+        if !pump_reserves_file.is_empty() {
+            warn!("failed to load pump reserves from {}: {}", pump_reserves_file, e);
+        }
+        HashMap::new()
+    });
+    let pump_reserves_mtime = file_mtime(pump_reserves_file);
+    if !pump_reserves_file.is_empty() {
+        info!(
+            "loaded {} pump reserves from {} max_age_ms={}",
+            pump_reserves_by_pool.len(),
+            pump_reserves_file,
+            pump_reserves_max_age_ms
+        );
+    }
     let subscribe_account_include =
         subscription_accounts(&pools_by_mint, rabbit_pool_filter, pump_program_filter, max_filter_accounts);
     info!(
@@ -1273,8 +1350,12 @@ async fn main() -> anyhow::Result<()> {
         cached_blockhash: initial_blockhash,
         pools_file: pools_file.to_string(),
         pools_mtime,
+        pump_reserves_file: pump_reserves_file.to_string(),
+        pump_reserves_mtime,
+        pump_reserves_max_age_ms,
         max_dlmm,
         pools_by_mint,
+        pump_reserves_by_pool,
         route_cache: HashMap::new(),
         flash_by_mint: HashMap::new(),
         last_signal_by_mint: HashMap::new(),
@@ -1408,13 +1489,15 @@ async fn main() -> anyhow::Result<()> {
             let (volume_usd, mints, candidates) = {
                 let mut guard = state.lock().await;
                 reload_pools_if_changed(&mut guard);
+                reload_pump_reserves_if_changed(&mut guard);
                 if has_flashx {
                     let axiom_swaps = axiom_swap_signals(
-                        guard.rpc_client.as_ref(),
                         &txn,
                         meta,
                         &keys,
                         &guard.pools_by_mint,
+                        &guard.pump_reserves_by_pool,
+                        guard.pump_reserves_max_age_ms,
                         sol_usd,
                         axiom_min_sol,
                     );

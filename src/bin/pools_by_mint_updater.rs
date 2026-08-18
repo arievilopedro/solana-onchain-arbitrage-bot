@@ -34,6 +34,14 @@ struct DiscoveredPool {
     pool: String,
 }
 
+#[derive(Debug)]
+struct PumpReserve {
+    pool: String,
+    mint: String,
+    token_reserve: u64,
+    sol_reserve: u64,
+}
+
 fn pubkey_bytes_to_string(bytes: &[u8]) -> Option<String> {
     if bytes.len() != 32 {
         return None;
@@ -74,6 +82,13 @@ fn now_seen() -> String {
         .unwrap_or_default()
         .as_secs()
         .to_string()
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn load_json(path: &str) -> Value {
@@ -121,6 +136,26 @@ fn upsert_pool(root: &mut Value, pool: &DiscoveredPool) -> bool {
     rec_obj.insert("count".to_string(), json!(count + 1));
     rec_obj.insert("last_seen".to_string(), json!(now_seen()));
     !existed
+}
+
+fn token_account_amount(data: &[u8]) -> Option<u64> {
+    let amount = data.get(64..72)?;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(amount);
+    Some(u64::from_le_bytes(buf))
+}
+
+fn upsert_pump_reserve(root: &mut Value, reserve: &PumpReserve) {
+    let root_obj = ensure_object(root);
+    root_obj.insert(
+        reserve.pool.clone(),
+        json!({
+            "mint": reserve.mint,
+            "token_reserve": reserve.token_reserve,
+            "sol_reserve": reserve.sol_reserve,
+            "updated_ms": now_ms().to_string(),
+        }),
+    );
 }
 
 fn mint_for_pair(a: &Pubkey, b: &Pubkey) -> Option<String> {
@@ -208,25 +243,58 @@ fn candidate_pool_keys(
 async fn validate_candidates(
     rpc: Arc<RpcClient>,
     candidates: Vec<String>,
-) -> anyhow::Result<Vec<DiscoveredPool>> {
+) -> anyhow::Result<(Vec<DiscoveredPool>, Vec<PumpReserve>)> {
     task::spawn_blocking(move || {
-        let pubkeys = candidates
+        let keyed_candidates = candidates
             .iter()
-            .filter_map(|s| Pubkey::from_str(s).ok())
+            .filter_map(|s| Pubkey::from_str(s).ok().map(|p| (s.clone(), p)))
             .collect::<Vec<_>>();
+        let pubkeys = keyed_candidates.iter().map(|(_, p)| *p).collect::<Vec<_>>();
         let accounts = rpc.get_multiple_accounts(&pubkeys)?;
         let mut out = Vec::new();
-        for ((pool, pubkey), account) in candidates.iter().zip(pubkeys.iter()).zip(accounts) {
+        let mut reserves = Vec::new();
+        for ((pool, pubkey), account) in keyed_candidates.iter().zip(accounts) {
             let Some(account) = account else {
                 continue;
             };
             if let Some(found) = validate_account(pool, &account.owner, &account.data) {
+                if found.side == "pump" {
+                    if let Ok(info) = PumpAmmInfo::load_checked(&account.data) {
+                        let wsol = Pubkey::from_str(WSOL)?;
+                        if let Some(mint) = mint_for_pair(&info.base_mint, &info.quote_mint) {
+                            let (token_vault, sol_vault) = if info.base_mint == wsol {
+                                (info.pool_quote_token_account, info.pool_base_token_account)
+                            } else {
+                                (info.pool_base_token_account, info.pool_quote_token_account)
+                            };
+                            if let Ok(vault_accounts) =
+                                rpc.get_multiple_accounts(&[token_vault, sol_vault])
+                            {
+                                if let (Some(Some(token_account)), Some(Some(sol_account))) =
+                                    (vault_accounts.get(0), vault_accounts.get(1))
+                                {
+                                    if let (Some(token_reserve), Some(sol_reserve)) = (
+                                        token_account_amount(&token_account.data),
+                                        token_account_amount(&sol_account.data),
+                                    ) {
+                                        reserves.push(PumpReserve {
+                                            pool: pool.to_string(),
+                                            mint,
+                                            token_reserve,
+                                            sol_reserve,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if pubkey.to_string() == found.pool {
                     out.push(found);
                 }
             }
         }
-        anyhow::Ok(out)
+        anyhow::Ok((out, reserves))
     })
     .await?
 }
@@ -252,6 +320,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(Arg::with_name("geyser-token").long("geyser-token").takes_value(true).default_value(""))
         .arg(Arg::with_name("rpc-url").long("rpc-url").takes_value(true).required(true))
         .arg(Arg::with_name("pools-by-mint-file").long("pools-by-mint-file").takes_value(true).required(true))
+        .arg(Arg::with_name("pump-reserves-file").long("pump-reserves-file").takes_value(true).default_value(""))
         .arg(Arg::with_name("include-accounts").long("include-accounts").takes_value(true).default_value(""))
         .arg(Arg::with_name("max-candidate-accounts").long("max-candidate-accounts").takes_value(true).default_value("80"))
         .arg(Arg::with_name("write-interval-ms").long("write-interval-ms").takes_value(true).default_value("500"))
@@ -262,6 +331,7 @@ async fn main() -> anyhow::Result<()> {
     let geyser_token = matches.value_of("geyser-token").unwrap();
     let rpc = Arc::new(RpcClient::new(matches.value_of("rpc-url").unwrap().to_string()));
     let pools_file = matches.value_of("pools-by-mint-file").unwrap().to_string();
+    let pump_reserves_file = matches.value_of("pump-reserves-file").unwrap().to_string();
     let max_candidate_accounts = matches
         .value_of("max-candidate-accounts")
         .unwrap()
@@ -282,11 +352,18 @@ async fn main() -> anyhow::Result<()> {
     include_accounts.dedup();
 
     let pools_json = Arc::new(Mutex::new(load_json(&pools_file)));
+    let pump_reserves_json = Arc::new(Mutex::new(if pump_reserves_file.is_empty() {
+        json!({})
+    } else {
+        load_json(&pump_reserves_file)
+    }));
     let dirty = Arc::new(Mutex::new(false));
     {
         let pools_json = pools_json.clone();
+        let pump_reserves_json = pump_reserves_json.clone();
         let dirty = dirty.clone();
         let pools_file = pools_file.clone();
+        let pump_reserves_file = pump_reserves_file.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(write_interval_ms)).await;
@@ -300,10 +377,20 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 let snapshot = pools_json.lock().unwrap().clone();
+                let pump_reserves_snapshot = pump_reserves_json.lock().unwrap().clone();
                 if let Err(e) = atomic_write_json(&pools_file, &snapshot) {
                     error!("failed writing {}: {}", pools_file, e);
                 } else {
                     info!("updated {}", pools_file);
+                }
+                if !pump_reserves_file.is_empty() {
+                    if let Err(e) =
+                        atomic_write_json(&pump_reserves_file, &pump_reserves_snapshot)
+                    {
+                        error!("failed writing {}: {}", pump_reserves_file, e);
+                    } else {
+                        info!("updated {}", pump_reserves_file);
+                    }
                 }
             }
         });
@@ -385,14 +472,14 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            let discovered = match validate_candidates(rpc.clone(), candidates).await {
+            let (discovered, reserves) = match validate_candidates(rpc.clone(), candidates).await {
                 Ok(rows) => rows,
                 Err(e) => {
                     warn!("pool validation failed sig={}: {}", sig, e);
                     continue;
                 }
             };
-            if discovered.is_empty() {
+            if discovered.is_empty() && reserves.is_empty() {
                 continue;
             }
 
@@ -405,12 +492,19 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            if !pump_reserves_file.is_empty() && !reserves.is_empty() {
+                let mut root = pump_reserves_json.lock().unwrap();
+                for reserve in &reserves {
+                    upsert_pump_reserve(&mut root, reserve);
+                }
+            }
             *dirty.lock().unwrap() = true;
             info!(
-                "POOL_UPDATE slot={} sig={} discovered={} added={}",
+                "POOL_UPDATE slot={} sig={} discovered={} reserves={} added={}",
                 tx_update.slot,
                 sig,
                 discovered.len(),
+                reserves.len(),
                 added
             );
             for pool in discovered {
