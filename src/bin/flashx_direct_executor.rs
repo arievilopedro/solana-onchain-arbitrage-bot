@@ -480,12 +480,7 @@ fn axiom_swap_signals(
                 _ => return None,
             };
             let amount_0 = read_le_u64(&ix.data[1..9]).unwrap_or(0);
-            let amount_1 = read_le_u64(&ix.data[9..17]).unwrap_or(0);
-            let sol_amount = if side == "buy" {
-                amount_0 as f64 / 1_000_000_000.0
-            } else {
-                amount_1 as f64 / 1_000_000_000.0
-            };
+            let sol_amount = amount_0 as f64 / 1_000_000_000.0;
             let candidate_owners = ix
                 .accounts
                 .iter()
