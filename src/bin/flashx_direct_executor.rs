@@ -738,6 +738,7 @@ async fn fire_route(
     delay_ms: u64,
     refresh_on_send: bool,
     no_failure_mode: bool,
+    parallel_sends: bool,
 ) {
     for i in 0..max_txs {
         let dlmm = dlmms[(i as usize) % dlmms.len()].clone();
@@ -794,11 +795,26 @@ async fn fire_route(
                 return;
             }
         };
-        for res in send_signed_transaction(&sending_rpc_clients, &send_config, tx).await {
-            match res {
-                Ok(sig) => info!("sent {} for src_sig={}", sig, src_sig),
-                Err(e) => {
-                    error!("send failed src_sig={}: {}", src_sig, e);
+
+        if parallel_sends {
+            let send_src_sig = src_sig.clone();
+            tokio::spawn(async move {
+                for res in send_signed_transaction(&sending_rpc_clients, &send_config, tx).await {
+                    match res {
+                        Ok(sig) => info!("sent {} for src_sig={}", sig, send_src_sig),
+                        Err(e) => {
+                            error!("send failed src_sig={}: {}", send_src_sig, e);
+                        }
+                    }
+                }
+            });
+        } else {
+            for res in send_signed_transaction(&sending_rpc_clients, &send_config, tx).await {
+                match res {
+                    Ok(sig) => info!("sent {} for src_sig={}", sig, src_sig),
+                    Err(e) => {
+                        error!("send failed src_sig={}: {}", src_sig, e);
+                    }
                 }
             }
         }
@@ -828,6 +844,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(Arg::with_name("max-dlmm").long("max-dlmm").takes_value(true).default_value("1"))
         .arg(Arg::with_name("max-txs").long("max-txs").takes_value(true).default_value("3"))
         .arg(Arg::with_name("delay-ms").long("delay-ms").takes_value(true).default_value("10"))
+        .arg(Arg::with_name("parallel-sends").long("parallel-sends"))
         .arg(Arg::with_name("refresh-on-send").long("refresh-on-send"))
         .arg(Arg::with_name("no-failure-mode").long("no-failure-mode"))
         .arg(Arg::with_name("prewarm-routes").long("prewarm-routes"))
@@ -872,6 +889,7 @@ async fn main() -> anyhow::Result<()> {
     let max_dlmm: usize = matches.value_of("max-dlmm").unwrap().parse()?;
     let max_txs: u64 = matches.value_of("max-txs").unwrap().parse()?;
     let delay_ms: u64 = matches.value_of("delay-ms").unwrap().parse()?;
+    let parallel_sends = matches.is_present("parallel-sends");
     let refresh_on_send = matches.is_present("refresh-on-send");
     let no_failure_mode = matches.is_present("no-failure-mode");
     let prewarm_routes_enabled = matches.is_present("prewarm-routes");
@@ -1284,6 +1302,7 @@ async fn main() -> anyhow::Result<()> {
                     delay_ms,
                     refresh_on_send,
                     no_failure_mode,
+                    parallel_sends,
                 ));
             }
         }
