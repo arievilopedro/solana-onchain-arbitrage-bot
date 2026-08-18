@@ -1295,11 +1295,12 @@ async fn main() -> anyhow::Result<()> {
     };
     let send_config = SendConfig { fast, send_rpc };
     info!(
-        "senders fast={} rpc={} fast_tip={}..{}",
+        "senders fast={} rpc={} fast_tip={}..{} axiom_min_sol={:.6}",
         send_config.fast.is_some(),
         send_config.send_rpc,
         fast_tip_from,
-        fast_tip_to
+        fast_tip_to,
+        axiom_min_sol
     );
 
     let mut lut_addresses = base_config
@@ -1563,6 +1564,19 @@ async fn main() -> anyhow::Result<()> {
             }
 
             for (mint, pump, dlmms, candidate_volume_usd, source, sol_amount, volume_source) in candidates {
+                if source == "sell" && sol_amount > 0.0 && sol_amount < axiom_min_sol {
+                    info!(
+                        "AXIOM_FILTERED_LATE mint={} signal={} sol={:.6} vol=${:.0} volume_source={} min_sol={:.6} sig={}",
+                        mint,
+                        source,
+                        sol_amount,
+                        candidate_volume_usd,
+                        volume_source,
+                        axiom_min_sol,
+                        sig
+                    );
+                    continue;
+                }
                 let should_fire = {
                     let mut guard = state.lock().await;
                     let now = Instant::now();
