@@ -294,6 +294,42 @@ fn owner_wsol_volume_sol(
     }
 }
 
+fn keyed_wsol_volume_sol(
+    meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
+    candidate_owners: &HashSet<String>,
+) -> Option<f64> {
+    let mut pre = HashMap::new();
+    let mut post = HashMap::new();
+    for b in &meta.pre_token_balances {
+        if b.mint == WSOL && candidate_owners.contains(&b.owner) {
+            if let Some(ui) = &b.ui_token_amount {
+                pre.insert(b.account_index, token_amount(&ui.amount, ui.decimals));
+            }
+        }
+    }
+    for b in &meta.post_token_balances {
+        if b.mint == WSOL && candidate_owners.contains(&b.owner) {
+            if let Some(ui) = &b.ui_token_amount {
+                post.insert(b.account_index, token_amount(&ui.amount, ui.decimals));
+            }
+        }
+    }
+    let max_abs = pre
+        .keys()
+        .chain(post.keys())
+        .map(|idx| {
+            let a = pre.get(idx).copied().unwrap_or(0.0);
+            let b = post.get(idx).copied().unwrap_or(0.0);
+            (b - a).abs()
+        })
+        .fold(0.0, f64::max);
+    if max_abs > 0.0 {
+        Some(max_abs)
+    } else {
+        None
+    }
+}
+
 fn token_balance_mints(
     meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
 ) -> Vec<String> {
@@ -388,9 +424,18 @@ fn axiom_swap_signals(
             } else {
                 amount_1 as f64 / 1_000_000_000.0
             };
+            let candidate_owners = ix
+                .accounts
+                .iter()
+                .filter_map(|account_idx| keys.get(*account_idx as usize).cloned())
+                .collect::<HashSet<_>>();
             let (sol_amount, volume_source) = meta
                 .and_then(|meta| owner_wsol_volume_sol(meta, &user))
                 .map(|sol| (sol, "meta_wsol_owner"))
+                .or_else(|| {
+                    meta.and_then(|meta| keyed_wsol_volume_sol(meta, &candidate_owners))
+                        .map(|sol| (sol, "meta_wsol_ix_owner"))
+                })
                 .unwrap_or((sol_amount, "instruction_bytes"));
             if sol_amount < min_sol {
                 return None;
