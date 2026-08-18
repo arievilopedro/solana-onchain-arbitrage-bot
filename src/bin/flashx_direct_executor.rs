@@ -404,32 +404,6 @@ fn token_balance_mints(
     out
 }
 
-fn token_balance_mints_in_pools(
-    meta: Option<&yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta>,
-    pools_by_mint: &HashMap<String, MintPools>,
-) -> Vec<String> {
-    let Some(meta) = meta else {
-        return Vec::new();
-    };
-    token_balance_mints(meta)
-        .into_iter()
-        .filter(|mint| pools_by_mint.contains_key(mint))
-        .collect()
-}
-
-fn keys_in_pools<'a>(
-    keys: impl IntoIterator<Item = &'a String>,
-    pools_by_mint: &HashMap<String, MintPools>,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    for key in keys {
-        if pools_by_mint.contains_key(key) && !out.contains(key) {
-            out.push(key.clone());
-        }
-    }
-    out
-}
-
 fn account_keys(
     tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
     meta: Option<&yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta>,
@@ -490,23 +464,11 @@ fn axiom_swap_signals(
                     .and_then(|account_idx| keys.get(*account_idx as usize))
                     .cloned()
             };
-            let fixed_mint = account_at(12).and_then(|mint| {
-                let quote_mint = account_at(13)?;
-                if !is_excluded_mint(&mint) && quote_mint == WSOL {
-                    Some(mint)
-                } else {
-                    None
-                }
-            });
-            let ix_mints = keys_in_pools(
-                ix.accounts
-                    .iter()
-                    .filter_map(|account_idx| keys.get(*account_idx as usize)),
-                pools_by_mint,
-            );
-            let mint = fixed_mint
-                .or_else(|| ix_mints.into_iter().next())
-                .or_else(|| token_balance_mints_in_pools(meta, pools_by_mint).into_iter().next())?;
+            let mint = account_at(12)?;
+            let quote_mint = account_at(13)?;
+            if is_excluded_mint(&mint) || quote_mint != WSOL {
+                return None;
+            }
             let pools = pools_by_mint.get(&mint)?;
             if pools.dlmm.is_empty() {
                 return None;
@@ -530,7 +492,7 @@ fn axiom_swap_signals(
                 .filter_map(|account_idx| keys.get(*account_idx as usize).cloned())
                 .collect::<HashSet<_>>();
             let instruction_accounts = ix.accounts.iter().copied().map(u32::from).collect::<HashSet<_>>();
-            let (sol_amount, volume_source) = if let Some(meta) = meta {
+            let (measured_sol, volume_source) = if let Some(meta) = meta {
                 owner_wsol_volume_sol(meta, &user)
                     .map(|sol| (sol, "meta_wsol_owner"))
                     .or_else(|| {
@@ -552,11 +514,12 @@ fn axiom_swap_signals(
                     .or_else(|| {
                         instruction_account_native_volume_sol(meta, &instruction_accounts)
                             .map(|sol| (sol, "meta_native_ix_account"))
-                    })?
+                    })
+                    .unwrap_or((sol_amount, "instruction_bytes"))
             } else {
                 (sol_amount, "instruction_bytes")
             };
-            if sol_amount < min_sol {
+            if measured_sol < min_sol {
                 return None;
             }
             let axiom_pump = ix
@@ -576,8 +539,8 @@ fn axiom_swap_signals(
                 mint,
                 pump,
                 side,
-                sol_amount,
-                volume_usd: sol_amount * sol_usd,
+                sol_amount: measured_sol,
+                volume_usd: measured_sol * sol_usd,
                 volume_source,
             })
         })
