@@ -11,7 +11,6 @@ use solana_onchain_arbitrage_bot::pool_refreshers::PoolDataRefresher;
 use solana_onchain_arbitrage_bot::pools::MintPoolData;
 use solana_onchain_arbitrage_bot::refresh::initialize_pools_from_markets;
 use solana_onchain_arbitrage_bot::transaction::create_swap_instruction;
-use solana_program::program_pack::Pack;
 use solana_sdk::address_lookup_table::state::AddressLookupTable;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::commitment_config::CommitmentLevel as RpcCommitmentLevel;
@@ -23,7 +22,6 @@ use solana_sdk::signature::{read_keypair_file, Keypair};
 use solana_sdk::signer::Signer;
 use solana_sdk::system_instruction;
 use solana_sdk::transaction::VersionedTransaction;
-use spl_token::state::Account as TokenAccount;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::str::FromStr;
@@ -444,7 +442,10 @@ fn read_le_u64(bytes: &[u8]) -> Option<u64> {
 }
 
 fn token_account_amount(data: &[u8]) -> Option<u64> {
-    TokenAccount::unpack(data).ok().map(|account| account.amount)
+    let amount = data.get(64..72)?;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(amount);
+    Some(u64::from_le_bytes(buf))
 }
 
 fn estimate_pump_sell_sol(
