@@ -127,6 +127,46 @@ fn token_balance_mints(
     out
 }
 
+fn lamport_deltas(
+    meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
+    keys: &[String],
+    sol_usd: f64,
+) -> Vec<Value> {
+    let len = meta.pre_balances.len().min(meta.post_balances.len());
+    (0..len)
+        .filter_map(|idx| {
+            let pre = meta.pre_balances[idx] as i128;
+            let post = meta.post_balances[idx] as i128;
+            let delta = post - pre;
+            if delta == 0 {
+                return None;
+            }
+            let sol = delta as f64 / 1_000_000_000.0;
+            Some(json!({
+                "index": idx,
+                "account": keys.get(idx).cloned().unwrap_or_default(),
+                "delta_lamports": delta,
+                "delta_sol": sol,
+                "delta_usd": sol * sol_usd,
+            }))
+        })
+        .collect()
+}
+
+fn max_abs_lamport_volume_usd(
+    meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
+    sol_usd: f64,
+) -> f64 {
+    let len = meta.pre_balances.len().min(meta.post_balances.len());
+    (0..len)
+        .map(|idx| {
+            let pre = meta.pre_balances[idx] as i128;
+            let post = meta.post_balances[idx] as i128;
+            ((post - pre).abs() as f64 / 1_000_000_000.0) * sol_usd
+        })
+        .fold(0.0, f64::max)
+}
+
 fn account_keys(
     tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
     meta: Option<&yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta>,
@@ -280,6 +320,36 @@ fn pump_swap_rows(
                 "amount_1": amount_1,
                 "estimated_sol": estimated_sol,
                 "estimated_usd": estimated_sol * sol_usd,
+            }))
+        })
+        .collect()
+}
+
+fn flashx_instruction_rows(
+    tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
+    keys: &[String],
+) -> Vec<Value> {
+    let Some(msg) = &tx.message else {
+        return Vec::new();
+    };
+    msg.instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, ix)| {
+            let program = keys.get(ix.program_id_index as usize)?;
+            if program != FLASHX {
+                return None;
+            }
+            let accounts = ix
+                .accounts
+                .iter()
+                .filter_map(|account_idx| keys.get(*account_idx as usize).cloned())
+                .collect::<Vec<_>>();
+            Some(json!({
+                "index": idx,
+                "accounts": accounts,
+                "data_hex": bytes_to_hex(&ix.data),
+                "data_len": ix.data.len(),
             }))
         })
         .collect()
@@ -491,16 +561,23 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            let (volume_usd, mints) = if let Some(meta) = meta {
-                (estimate_wsol_volume_usd(meta, sol_usd), token_balance_mints(meta))
+            let (volume_usd, lamports, mints) = if let Some(meta) = meta {
+                let wsol_volume = estimate_wsol_volume_usd(meta, sol_usd);
+                let native_volume = max_abs_lamport_volume_usd(meta, sol_usd);
+                (
+                    wsol_volume.max(native_volume),
+                    lamport_deltas(meta, &keys, sol_usd),
+                    token_balance_mints(meta),
+                )
             } else {
-                (0.0, Vec::new())
+                (0.0, Vec::new(), Vec::new())
             };
             if volume_usd < min_usd {
                 continue;
             }
             let programs = program_ids(&txn, &keys);
             let pump_swaps = pump_swap_rows(&txn, &keys, sol_usd);
+            let flashx_instructions = flashx_instruction_rows(&txn, &keys);
             let instructions = if log_instructions {
                 instruction_rows(&txn, &keys)
             } else {
@@ -527,11 +604,13 @@ async fn main() -> anyhow::Result<()> {
                 "flashx": has_flashx,
                 "pump_program": has_pump_program,
                 "volume_usd": volume_usd,
+                "lamport_deltas": lamports,
                 "keys_count": keys.len(),
                 "programs_count": programs.len(),
                 "mints": mints,
                 "instruction_mints": mints_for_candidates,
                 "pump_swaps": pump_swaps,
+                "flashx_instructions": flashx_instructions,
                 "candidates": candidates,
                 "programs": if log_programs { json!(programs) } else { Value::Null },
                 "keys": if log_keys { json!(keys) } else { Value::Null },
