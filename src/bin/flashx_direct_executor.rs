@@ -523,6 +523,7 @@ fn build_versioned_transaction(
     blockhash: Hash,
     address_lookup_table_accounts: &[AddressLookupTableAccount],
     fast_sender: Option<&FastSender>,
+    no_failure_mode: bool,
 ) -> anyhow::Result<VersionedTransaction> {
     let enable_flashloan = config.flashloan.as_ref().map_or(false, |k| k.enabled);
     let compute_unit_limit = config.bot.compute_unit_limit;
@@ -552,6 +553,7 @@ fn build_versioned_transaction(
         mint_pool_data,
         compute_unit_limit,
         enable_flashloan,
+        no_failure_mode,
     )?);
 
     let message = Message::try_compile(
@@ -735,6 +737,7 @@ async fn fire_route(
     max_txs: u64,
     delay_ms: u64,
     refresh_on_send: bool,
+    no_failure_mode: bool,
 ) {
     for i in 0..max_txs {
         let dlmm = dlmms[(i as usize) % dlmms.len()].clone();
@@ -783,6 +786,7 @@ async fn fire_route(
             blockhash,
             &lookup_tables,
             send_config.fast.as_ref(),
+            no_failure_mode,
         ) {
             Ok(tx) => tx,
             Err(e) => {
@@ -825,6 +829,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(Arg::with_name("max-txs").long("max-txs").takes_value(true).default_value("3"))
         .arg(Arg::with_name("delay-ms").long("delay-ms").takes_value(true).default_value("10"))
         .arg(Arg::with_name("refresh-on-send").long("refresh-on-send"))
+        .arg(Arg::with_name("no-failure-mode").long("no-failure-mode"))
         .arg(Arg::with_name("prewarm-routes").long("prewarm-routes"))
         .arg(Arg::with_name("prewarm-limit").long("prewarm-limit").takes_value(true).default_value("0"))
         .arg(Arg::with_name("rabbit-pool-filter").long("rabbit-pool-filter"))
@@ -868,6 +873,7 @@ async fn main() -> anyhow::Result<()> {
     let max_txs: u64 = matches.value_of("max-txs").unwrap().parse()?;
     let delay_ms: u64 = matches.value_of("delay-ms").unwrap().parse()?;
     let refresh_on_send = matches.is_present("refresh-on-send");
+    let no_failure_mode = matches.is_present("no-failure-mode");
     let prewarm_routes_enabled = matches.is_present("prewarm-routes");
     let prewarm_limit: usize = matches.value_of("prewarm-limit").unwrap().parse()?;
     let rabbit_pool_filter = matches.is_present("rabbit-pool-filter");
@@ -1277,6 +1283,7 @@ async fn main() -> anyhow::Result<()> {
                     max_txs,
                     delay_ms,
                     refresh_on_send,
+                    no_failure_mode,
                 ));
             }
         }

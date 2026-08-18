@@ -64,6 +64,7 @@ pub async fn build_and_send_transaction(
         mint_pool_data,
         compute_unit_limit,
         enable_flashloan,
+        false,
     )?;
 
     let mut all_instructions = instructions.clone();
@@ -222,6 +223,7 @@ pub fn create_swap_instruction(
     mint_pool_data: &MintPoolData,
     compute_unit_limit: u32,
     use_flashloan: bool,
+    no_failure_mode: bool,
 ) -> anyhow::Result<Instruction> {
     debug!("Creating swap instruction for all DEX types");
 
@@ -676,8 +678,6 @@ pub fn create_swap_instruction(
     let mut data = vec![28u8];
 
     let minimum_profit: u64 = 0;
-    // When true, the bot will not fail the transaction even when it can't find a profitable arbitrage. It will just do nothing and succeed.
-    let no_failure_mode = false;
 
     data.extend_from_slice(&minimum_profit.to_le_bytes());
     data.extend_from_slice(&compute_unit_limit.to_le_bytes());
