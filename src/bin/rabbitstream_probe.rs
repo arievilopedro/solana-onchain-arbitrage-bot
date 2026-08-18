@@ -171,6 +171,46 @@ fn program_ids(
     out
 }
 
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn instruction_rows(
+    tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
+    keys: &[String],
+) -> Vec<Value> {
+    let Some(msg) = &tx.message else {
+        return Vec::new();
+    };
+    msg.instructions
+        .iter()
+        .enumerate()
+        .map(|(idx, ix)| {
+            let program_idx = ix.program_id_index as usize;
+            let program = keys.get(program_idx).cloned().unwrap_or_default();
+            let accounts = ix
+                .accounts
+                .iter()
+                .filter_map(|account_idx| keys.get(*account_idx as usize).cloned())
+                .collect::<Vec<_>>();
+            json!({
+                "index": idx,
+                "program": program,
+                "program_index": program_idx,
+                "accounts": accounts,
+                "data_hex": bytes_to_hex(&ix.data),
+                "data_len": ix.data.len(),
+            })
+        })
+        .collect()
+}
+
 fn candidates_from_keys(
     pools_by_mint: &HashMap<String, MintPools>,
     keys: &[String],
@@ -269,6 +309,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(Arg::with_name("reject-accounts").long("reject-accounts").takes_value(true).default_value(""))
         .arg(Arg::with_name("log-keys").long("log-keys"))
         .arg(Arg::with_name("log-programs").long("log-programs"))
+        .arg(Arg::with_name("log-instructions").long("log-instructions"))
         .arg(Arg::with_name("json").long("json"))
         .get_matches();
 
@@ -285,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
     let require_flashx = matches.is_present("require-flashx");
     let log_keys = matches.is_present("log-keys");
     let log_programs = matches.is_present("log-programs");
+    let log_instructions = matches.is_present("log-instructions");
     let json_logs = matches.is_present("json");
     let required_accounts = parse_csv(matches.value_of("required-accounts").unwrap());
     let reject_accounts = parse_csv(matches.value_of("reject-accounts").unwrap());
@@ -384,6 +426,11 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
             let programs = program_ids(&txn, &keys);
+            let instructions = if log_instructions {
+                instruction_rows(&txn, &keys)
+            } else {
+                Vec::new()
+            };
             let candidates = candidates_from_keys(&pools_by_mint, &keys, &mints);
             if only_actionable && candidates.is_empty() {
                 continue;
@@ -403,6 +450,7 @@ async fn main() -> anyhow::Result<()> {
                 "candidates": candidates,
                 "programs": if log_programs { json!(programs) } else { Value::Null },
                 "keys": if log_keys { json!(keys) } else { Value::Null },
+                "instructions": if log_instructions { json!(instructions) } else { Value::Null },
             });
 
             if json_logs {
@@ -425,6 +473,13 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if log_keys {
                     info!("KEYS sig={} keys={:?}", row["signature"].as_str().unwrap_or_default(), keys);
+                }
+                if log_instructions {
+                    info!(
+                        "INSTRUCTIONS sig={} instructions={}",
+                        row["signature"].as_str().unwrap_or_default(),
+                        row["instructions"]
+                    );
                 }
             }
         }
