@@ -2,8 +2,12 @@ use anyhow::Context;
 use clap::{App, Arg};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use solana_client::rpc_client::RpcClient;
+use solana_onchain_arbitrage_bot::dex::pump::PumpAmmInfo;
+use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -262,6 +266,73 @@ fn read_le_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(buf))
 }
 
+fn token_account_amount(data: &[u8]) -> Option<u64> {
+    let amount = data.get(64..72)?;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(amount);
+    Some(u64::from_le_bytes(buf))
+}
+
+fn estimate_pump_sell_sol(
+    rpc: &RpcClient,
+    pump: &str,
+    mint: &str,
+    token_in_raw: u64,
+) -> Result<f64, String> {
+    if token_in_raw == 0 {
+        return Err("zero_token_in".to_string());
+    }
+
+    let pump_pubkey = Pubkey::from_str(pump).map_err(|_| "invalid_pump_pubkey")?;
+    let mint_pubkey = Pubkey::from_str(mint).map_err(|_| "invalid_mint_pubkey")?;
+    let wsol_pubkey = Pubkey::from_str(WSOL).map_err(|_| "invalid_wsol_pubkey")?;
+    let pool_account = rpc
+        .get_account(&pump_pubkey)
+        .map_err(|e| format!("get_pool_account: {}", e))?;
+    let pool = PumpAmmInfo::load_checked(&pool_account.data)
+        .map_err(|e| format!("parse_pump_pool: {}", e))?;
+
+    let (token_vault, sol_vault) = if pool.base_mint == mint_pubkey
+        && pool.quote_mint == wsol_pubkey
+    {
+        (pool.pool_base_token_account, pool.pool_quote_token_account)
+    } else if pool.quote_mint == mint_pubkey && pool.base_mint == wsol_pubkey {
+        (pool.pool_quote_token_account, pool.pool_base_token_account)
+    } else {
+        return Err(format!(
+            "pool_mint_mismatch base={} quote={}",
+            pool.base_mint, pool.quote_mint
+        ));
+    };
+
+    let accounts = rpc
+        .get_multiple_accounts(&[token_vault, sol_vault])
+        .map_err(|e| format!("get_vault_accounts: {}", e))?;
+    let token_account = accounts
+        .get(0)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| "missing_token_vault".to_string())?;
+    let sol_account = accounts
+        .get(1)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| "missing_sol_vault".to_string())?;
+    let token_reserve = token_account_amount(&token_account.data)
+        .ok_or_else(|| "parse_token_vault_amount".to_string())? as u128;
+    let sol_reserve = token_account_amount(&sol_account.data)
+        .ok_or_else(|| "parse_sol_vault_amount".to_string())? as u128;
+    if token_reserve == 0 || sol_reserve == 0 {
+        return Err(format!(
+            "zero_reserve token_reserve={} sol_reserve={}",
+            token_reserve, sol_reserve
+        ));
+    }
+
+    let token_in = token_in_raw as u128;
+    let out_lamports =
+        sol_reserve.saturating_mul(token_in) / token_reserve.saturating_add(token_in);
+    Ok((out_lamports as f64) * 0.97 / 1_000_000_000.0)
+}
+
 fn pump_swap_rows(
     tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
     keys: &[String],
@@ -356,6 +427,7 @@ fn flashx_instruction_rows(
 }
 
 fn axiom_swap_rows(
+    rpc_client: Option<&RpcClient>,
     tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
     keys: &[String],
 ) -> Vec<Value> {
@@ -389,6 +461,8 @@ fn axiom_swap_rows(
             };
             let amount_0 = read_le_u64(&ix.data[1..9]).unwrap_or(0);
             let amount_1 = read_le_u64(&ix.data[9..17]).unwrap_or(0);
+            let amount_0_as_sol = amount_0 as f64 / 1_000_000_000.0;
+            let amount_1_as_sol = amount_1 as f64 / 1_000_000_000.0;
             let pump_program_positions = ix
                 .accounts
                 .iter()
@@ -402,6 +476,23 @@ fn axiom_swap_rows(
             let pump_pool = pump_program_positions
                 .first()
                 .and_then(|program_pos| account_at(program_pos + 1));
+            let pump_sell_estimate = if side == "sell" {
+                rpc_client
+                    .zip(pump_pool.as_deref())
+                    .map(|(rpc, pump)| match estimate_pump_sell_sol(rpc, pump, &mint, amount_0) {
+                        Ok(sol) => json!({
+                            "ok": true,
+                            "sol": sol,
+                            "usd_at_180": sol * 180.0,
+                        }),
+                        Err(e) => json!({
+                            "ok": false,
+                            "error": e,
+                        }),
+                    })
+            } else {
+                None
+            };
 
             Some(json!({
                 "instruction_index": idx,
@@ -409,6 +500,11 @@ fn axiom_swap_rows(
                 "discriminator": discriminator,
                 "amount_0": amount_0,
                 "amount_1": amount_1,
+                "amount_0_as_sol": amount_0_as_sol,
+                "amount_1_as_sol": amount_1_as_sol,
+                "byte_sol_guess": if side == "buy" { amount_0_as_sol } else { amount_1_as_sol },
+                "byte_sol_guess_source": if side == "buy" { "amount_0" } else { "amount_1" },
+                "pump_sell_estimate": pump_sell_estimate.unwrap_or(Value::Null),
                 "mint": mint,
                 "quote_mint": quote_mint,
                 "user": account_at(1),
@@ -561,6 +657,7 @@ async fn main() -> anyhow::Result<()> {
     let matches = App::new("rabbitstream_probe")
         .arg(Arg::with_name("geyser-url").long("geyser-url").takes_value(true).required(true))
         .arg(Arg::with_name("geyser-token").long("geyser-token").takes_value(true).default_value(""))
+        .arg(Arg::with_name("rpc-url").long("rpc-url").takes_value(true).default_value(""))
         .arg(Arg::with_name("pools-by-mint-file").long("pools-by-mint-file").takes_value(true).required(true))
         .arg(Arg::with_name("rabbit-pool-filter").long("rabbit-pool-filter"))
         .arg(Arg::with_name("pump-program-filter").long("pump-program-filter"))
@@ -581,6 +678,7 @@ async fn main() -> anyhow::Result<()> {
 
     let geyser_url = matches.value_of("geyser-url").unwrap();
     let geyser_token = matches.value_of("geyser-token").unwrap();
+    let rpc_url = matches.value_of("rpc-url").unwrap();
     let pools_file = matches.value_of("pools-by-mint-file").unwrap();
     let max_dlmm = matches.value_of("max-dlmm").unwrap().parse::<usize>()?;
     let sol_usd = matches.value_of("sol-usd").unwrap().parse::<f64>()?;
@@ -597,6 +695,11 @@ async fn main() -> anyhow::Result<()> {
     let json_logs = matches.is_present("json");
     let required_accounts = parse_csv(matches.value_of("required-accounts").unwrap());
     let reject_accounts = parse_csv(matches.value_of("reject-accounts").unwrap());
+    let rpc_client = if rpc_url.is_empty() {
+        None
+    } else {
+        Some(RpcClient::new(rpc_url.to_string()))
+    };
 
     let pools_by_mint = load_pools_by_mint(pools_file, max_dlmm)?;
     let subscribe_account_include = subscription_accounts(
@@ -701,7 +804,7 @@ async fn main() -> anyhow::Result<()> {
             let programs = program_ids(&txn, &keys);
             let pump_swaps = pump_swap_rows(&txn, &keys, sol_usd);
             let flashx_instructions = flashx_instruction_rows(&txn, &keys);
-            let axiom_swaps = axiom_swap_rows(&txn, &keys);
+            let axiom_swaps = axiom_swap_rows(rpc_client.as_ref(), &txn, &keys);
             let axiom_candidates = axiom_candidate_rows(&pools_by_mint, &axiom_swaps);
             let instructions = if log_instructions {
                 instruction_rows(&txn, &keys)
