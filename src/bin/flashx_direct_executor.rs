@@ -549,7 +549,12 @@ fn axiom_swap_signals(
                 .iter()
                 .filter_map(|account_idx| keys.get(*account_idx as usize).cloned())
                 .collect::<HashSet<_>>();
-            let instruction_accounts = ix.accounts.iter().copied().map(u32::from).collect::<HashSet<_>>();
+            let instruction_accounts = ix
+                .accounts
+                .iter()
+                .copied()
+                .map(u32::from)
+                .collect::<HashSet<_>>();
             let measured_from_meta = meta.and_then(|meta| {
                 owner_wsol_volume_sol(meta, &user)
                     .map(|sol| (sol, "meta_wsol_owner"))
@@ -581,9 +586,29 @@ fn axiom_swap_signals(
             } else if let Some(sol) = estimate_pump_sell_sol(rpc_client, &pump, &mint, amount_0) {
                 (sol, "pump_sell_estimate")
             } else {
+                info!(
+                    "AXIOM_ESTIMATE_FAIL mint={} signal={} raw_amount={} pump={} dlmms={} min_sol={:.6}",
+                    mint,
+                    side,
+                    amount_0,
+                    pump,
+                    pools.dlmm.len(),
+                    min_sol
+                );
                 return None;
             };
             if measured_sol < min_sol {
+                info!(
+                    "AXIOM_FILTERED mint={} signal={} sol={:.6} raw_amount={} volume_source={} pump={} dlmms={} min_sol={:.6}",
+                    mint,
+                    side,
+                    measured_sol,
+                    amount_0,
+                    volume_source,
+                    pump,
+                    pools.dlmm.len(),
+                    min_sol
+                );
                 return None;
             }
             Some(AxiomSwapSignal {
