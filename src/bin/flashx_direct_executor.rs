@@ -53,6 +53,7 @@ struct FastSender {
     tip_accounts: Vec<Pubkey>,
     tip_from: u64,
     tip_to: u64,
+    timeout_ms: u64,
 }
 
 #[derive(Clone)]
@@ -628,7 +629,13 @@ async fn send_signed_transaction(
 ) -> Vec<anyhow::Result<String>> {
     let mut out = Vec::new();
     if let Some(sender) = &send_config.fast {
-        out.push(send_fast(sender, &tx).await);
+        let res = tokio::time::timeout(
+            Duration::from_millis(sender.timeout_ms),
+            send_fast(sender, &tx),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("fast sender timeout after {}ms", sender.timeout_ms)));
+        out.push(res);
     }
     if send_config.send_rpc {
         for client in rpc_clients {
@@ -646,6 +653,9 @@ async fn send_signed_transaction(
                 .map_err(anyhow::Error::from);
             out.push(res);
         }
+    }
+    if out.is_empty() {
+        out.push(Err(anyhow::anyhow!("no transaction senders configured")));
     }
     out
 }
@@ -796,6 +806,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(Arg::with_name("cashback-address").long("cashback-address").takes_value(true).default_value(""))
         .arg(Arg::with_name("fast-tip-from").long("fast-tip-from").takes_value(true).default_value("1000000"))
         .arg(Arg::with_name("fast-tip-to").long("fast-tip-to").takes_value(true).default_value("1000000"))
+        .arg(Arg::with_name("fast-timeout-ms").long("fast-timeout-ms").takes_value(true).default_value("700"))
         .arg(
             Arg::with_name("fast-tip-accounts")
                 .long("fast-tip-accounts")
@@ -838,6 +849,7 @@ async fn main() -> anyhow::Result<()> {
     let cashback_address_arg = matches.value_of("cashback-address").unwrap();
     let fast_tip_from: u64 = matches.value_of("fast-tip-from").unwrap().parse()?;
     let fast_tip_to: u64 = matches.value_of("fast-tip-to").unwrap().parse()?;
+    let fast_timeout_ms: u64 = matches.value_of("fast-timeout-ms").unwrap().parse()?;
     let fast_tip_accounts_raw = matches.value_of("fast-tip-accounts").unwrap();
 
     let base_config = Config::load(base_config_path)?;
@@ -869,13 +881,16 @@ async fn main() -> anyhow::Result<()> {
             cashback_address_arg.to_string()
         };
         Some(FastSender {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(fast_timeout_ms))
+                .build()?,
             url: fast_url.to_string(),
             api_key: fast_api_key.to_string(),
             cashback_address,
             tip_accounts: parse_pubkey_list(fast_tip_accounts_raw)?,
             tip_from: fast_tip_from,
             tip_to: fast_tip_to,
+            timeout_ms: fast_timeout_ms,
         })
     };
     let send_config = SendConfig { fast, send_rpc };
