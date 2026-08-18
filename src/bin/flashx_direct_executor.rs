@@ -366,6 +366,26 @@ fn instruction_account_wsol_volume_sol(
     }
 }
 
+fn instruction_account_native_volume_sol(
+    meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
+    instruction_accounts: &HashSet<u32>,
+) -> Option<f64> {
+    let len = meta.pre_balances.len().min(meta.post_balances.len());
+    let max_abs = (0..len)
+        .filter(|idx| instruction_accounts.contains(&(*idx as u32)))
+        .map(|idx| {
+            let pre = meta.pre_balances[idx] as i128;
+            let post = meta.post_balances[idx] as i128;
+            (post - pre).abs() as f64 / 1_000_000_000.0
+        })
+        .fold(0.0, f64::max);
+    if max_abs > 0.0 {
+        Some(max_abs)
+    } else {
+        None
+    }
+}
+
 fn token_balance_mints(
     meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
 ) -> Vec<String> {
@@ -476,6 +496,10 @@ fn axiom_swap_signals(
                     .or_else(|| {
                         keyed_wsol_volume_sol(meta, &candidate_owners)
                             .map(|sol| (sol, "meta_wsol_ix_owner"))
+                    })
+                    .or_else(|| {
+                        instruction_account_native_volume_sol(meta, &instruction_accounts)
+                            .map(|sol| (sol, "meta_native_ix_account"))
                     })?
             } else {
                 (sol_amount, "instruction_bytes")
