@@ -466,8 +466,9 @@ fn axiom_candidate_rows(
             "mint": mint,
             "actionable": true,
             "reason": "pump_and_dlmm_available",
-            "pump_pool": pools.pump.first(),
+            "pump_pool": swap.get("pump_pool").cloned().unwrap_or(Value::Null),
             "axiom_pump_pool": swap.get("pump_pool").cloned().unwrap_or(Value::Null),
+            "known_pump_pool": pools.pump.first(),
             "dlmm": pools.dlmm.first(),
             "dlmm_count": pools.dlmm.len(),
         }));

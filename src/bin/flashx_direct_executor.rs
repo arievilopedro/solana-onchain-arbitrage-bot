@@ -79,6 +79,15 @@ struct FlashEvent {
     volume_usd: f64,
 }
 
+#[derive(Clone, Debug)]
+struct AxiomSwapSignal {
+    mint: String,
+    pump: String,
+    side: &'static str,
+    sol_amount: f64,
+    volume_usd: f64,
+}
+
 struct ExecutorState {
     base_config: Config,
     rpc_client: Arc<RpcClient>,
@@ -286,6 +295,83 @@ fn account_keys(
     keys
 }
 
+fn read_le_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    Some(u64::from_le_bytes(buf))
+}
+
+fn axiom_swap_signals(
+    tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
+    keys: &[String],
+    pools_by_mint: &HashMap<String, MintPools>,
+    sol_usd: f64,
+    min_sol: f64,
+) -> Vec<AxiomSwapSignal> {
+    let Some(msg) = &tx.message else {
+        return Vec::new();
+    };
+    msg.instructions
+        .iter()
+        .filter_map(|ix| {
+            let program = keys.get(ix.program_id_index as usize)?;
+            if program != FLASHX || ix.accounts.len() < 14 || ix.data.len() < 17 {
+                return None;
+            }
+            let account_at = |pos: usize| -> Option<String> {
+                ix.accounts
+                    .get(pos)
+                    .and_then(|account_idx| keys.get(*account_idx as usize))
+                    .cloned()
+            };
+            let mint = account_at(12)?;
+            let quote_mint = account_at(13)?;
+            if is_excluded_mint(&mint) || quote_mint != WSOL {
+                return None;
+            }
+            let pools = pools_by_mint.get(&mint)?;
+            if pools.dlmm.is_empty() {
+                return None;
+            }
+            let side = match ix.data[0] {
+                0 => "sell",
+                1 => "buy",
+                _ => return None,
+            };
+            let amount_0 = read_le_u64(&ix.data[1..9]).unwrap_or(0);
+            let amount_1 = read_le_u64(&ix.data[9..17]).unwrap_or(0);
+            let sol_amount = if side == "buy" {
+                amount_0 as f64 / 1_000_000_000.0
+            } else {
+                amount_1 as f64 / 1_000_000_000.0
+            };
+            if sol_amount < min_sol {
+                return None;
+            }
+            let pump_program_pos = ix
+                .accounts
+                .iter()
+                .enumerate()
+                .find_map(|(pos, account_idx)| {
+                    keys.get(*account_idx as usize)
+                        .filter(|account| account.as_str() == PUMP_AMM_PROGRAM)
+                        .map(|_| pos)
+                })?;
+            let pump = account_at(pump_program_pos + 1)?;
+            Some(AxiomSwapSignal {
+                mint,
+                pump,
+                side,
+                sol_amount,
+                volume_usd: sol_amount * sol_usd,
+            })
+        })
+        .collect()
+}
+
 fn signal_candidates_from_keys(
     pools_by_mint: &HashMap<String, MintPools>,
     keys: &[String],
@@ -305,6 +391,34 @@ fn signal_candidates_from_keys(
             continue;
         }
         out.push((mint.clone(), pump, pools.dlmm.clone()));
+    }
+    out
+}
+
+fn signal_candidates_from_axiom_swaps(
+    pools_by_mint: &HashMap<String, MintPools>,
+    swaps: &[AxiomSwapSignal],
+) -> Vec<(String, String, Vec<String>, f64, &'static str, f64)> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for swap in swaps {
+        let Some(pools) = pools_by_mint.get(&swap.mint) else {
+            continue;
+        };
+        if pools.dlmm.is_empty() {
+            continue;
+        }
+        let key = format!("{}:{}", swap.mint, swap.pump);
+        if seen.insert(key) {
+            out.push((
+                swap.mint.clone(),
+                swap.pump.clone(),
+                pools.dlmm.clone(),
+                swap.volume_usd,
+                swap.side,
+                swap.sol_amount,
+            ));
+        }
     }
     out
 }
@@ -652,6 +766,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(Arg::with_name("geyser-token").long("geyser-token").takes_value(true).default_value(""))
         .arg(Arg::with_name("pools-by-mint-file").long("pools-by-mint-file").takes_value(true).required(true))
         .arg(Arg::with_name("sol-usd").long("sol-usd").takes_value(true).default_value("180"))
+        .arg(Arg::with_name("axiom-min-sol").long("axiom-min-sol").takes_value(true).default_value("0.01"))
         .arg(Arg::with_name("min-usd").long("min-usd").takes_value(true).default_value("50"))
         .arg(Arg::with_name("cluster-window-ms").long("cluster-window-ms").takes_value(true).default_value("10000"))
         .arg(Arg::with_name("cluster-min-usd").long("cluster-min-usd").takes_value(true).default_value("400"))
@@ -691,6 +806,7 @@ async fn main() -> anyhow::Result<()> {
     let geyser_token = matches.value_of("geyser-token").unwrap();
     let pools_file = matches.value_of("pools-by-mint-file").unwrap();
     let sol_usd: f64 = matches.value_of("sol-usd").unwrap().parse()?;
+    let axiom_min_sol: f64 = matches.value_of("axiom-min-sol").unwrap().parse()?;
     let min_usd: f64 = matches.value_of("min-usd").unwrap().parse()?;
     let cluster_window_ms: u64 = matches.value_of("cluster-window-ms").unwrap().parse()?;
     let cluster_min_usd: f64 = matches.value_of("cluster-min-usd").unwrap().parse()?;
@@ -919,9 +1035,29 @@ async fn main() -> anyhow::Result<()> {
             let (volume_usd, mints, candidates) = {
                 let mut guard = state.lock().await;
                 reload_pools_if_changed(&mut guard);
-                if trigger_on_pool_touch && !has_flashx {
+                if has_flashx {
+                    let axiom_swaps =
+                        axiom_swap_signals(&txn, &keys, &guard.pools_by_mint, sol_usd, axiom_min_sol);
+                    let mints = axiom_swaps
+                        .iter()
+                        .map(|swap| swap.mint.clone())
+                        .collect::<Vec<_>>();
+                    let candidates =
+                        signal_candidates_from_axiom_swaps(&guard.pools_by_mint, &axiom_swaps);
+                    let volume_usd = candidates
+                        .iter()
+                        .map(|(_, _, _, volume_usd, _, _)| *volume_usd)
+                        .fold(0.0, f64::max);
+                    (volume_usd, mints, candidates)
+                } else if trigger_on_pool_touch {
                     let candidates = signal_candidates_from_keys(&guard.pools_by_mint, &keys);
                     let mints = candidates.iter().map(|(mint, _, _)| mint.clone()).collect::<Vec<_>>();
+                    let candidates = candidates
+                        .into_iter()
+                        .map(|(mint, pump, dlmms)| {
+                            (mint, pump, dlmms, min_usd.max(1.0), "pool_touch", 0.0)
+                        })
+                        .collect::<Vec<_>>();
                     (min_usd.max(1.0), mints, candidates)
                 } else if let Some(meta) = meta {
                     let volume_usd = estimate_wsol_volume_usd(meta, sol_usd);
@@ -930,10 +1066,22 @@ async fn main() -> anyhow::Result<()> {
                     }
                     let mints = token_balance_mints(meta);
                     let candidates = signal_candidates(&guard.pools_by_mint, &keys, &mints);
+                    let candidates = candidates
+                        .into_iter()
+                        .map(|(mint, pump, dlmms)| {
+                            (mint, pump, dlmms, volume_usd, "meta", 0.0)
+                        })
+                        .collect::<Vec<_>>();
                     (volume_usd, mints, candidates)
                 } else {
                     let candidates = signal_candidates_from_keys(&guard.pools_by_mint, &keys);
                     let mints = candidates.iter().map(|(mint, _, _)| mint.clone()).collect::<Vec<_>>();
+                    let candidates = candidates
+                        .into_iter()
+                        .map(|(mint, pump, dlmms)| {
+                            (mint, pump, dlmms, min_usd.max(1.0), "keys", 0.0)
+                        })
+                        .collect::<Vec<_>>();
                     (min_usd.max(1.0), mints, candidates)
                 }
             };
@@ -951,7 +1099,7 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            for (mint, pump, dlmms) in candidates {
+            for (mint, pump, dlmms, candidate_volume_usd, source, sol_amount) in candidates {
                 let should_fire = {
                     let mut guard = state.lock().await;
                     let now = Instant::now();
@@ -963,7 +1111,7 @@ async fn main() -> anyhow::Result<()> {
                     rows.retain(|r| now.duration_since(r.at) <= Duration::from_millis(cluster_window_ms));
                     rows.push(FlashEvent {
                         at: now,
-                        volume_usd,
+                        volume_usd: candidate_volume_usd,
                     });
                     let cluster_usd = rows.iter().map(|r| r.volume_usd).sum::<f64>();
                     let cluster_count = rows.len();
@@ -1023,9 +1171,11 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 info!(
-                    "ACTIONABLE_FLASHX mint={} vol=${:.0} slot={} pump={} dlmms={} meta={} flashx={} sig={}",
+                    "ACTIONABLE_FLASHX mint={} signal={} sol={:.6} vol=${:.0} slot={} pump={} dlmms={} meta={} flashx={} sig={}",
                     mint,
-                    volume_usd,
+                    source,
+                    sol_amount,
+                    candidate_volume_usd,
                     tx_update.slot,
                     pump,
                     dlmms.len(),
