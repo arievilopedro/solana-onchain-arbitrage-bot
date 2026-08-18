@@ -355,6 +355,72 @@ fn flashx_instruction_rows(
         .collect()
 }
 
+fn axiom_swap_rows(
+    tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
+    keys: &[String],
+) -> Vec<Value> {
+    let Some(msg) = &tx.message else {
+        return Vec::new();
+    };
+    msg.instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, ix)| {
+            let program = keys.get(ix.program_id_index as usize)?;
+            if program != FLASHX || ix.accounts.len() < 14 || ix.data.len() < 17 {
+                return None;
+            }
+            let account_at = |pos: usize| -> Option<String> {
+                ix.accounts
+                    .get(pos)
+                    .and_then(|account_idx| keys.get(*account_idx as usize))
+                    .cloned()
+            };
+            let mint = account_at(12)?;
+            let quote_mint = account_at(13)?;
+            if is_excluded_mint(&mint) || quote_mint != WSOL {
+                return None;
+            }
+            let discriminator = ix.data[0];
+            let side = match discriminator {
+                0 => "sell",
+                1 => "buy",
+                _ => "unknown",
+            };
+            let amount_0 = read_le_u64(&ix.data[1..9]).unwrap_or(0);
+            let amount_1 = read_le_u64(&ix.data[9..17]).unwrap_or(0);
+            let pump_program_positions = ix
+                .accounts
+                .iter()
+                .enumerate()
+                .filter_map(|(pos, account_idx)| {
+                    keys.get(*account_idx as usize)
+                        .filter(|account| account.as_str() == PUMP_AMM_PROGRAM)
+                        .map(|_| pos)
+                })
+                .collect::<Vec<_>>();
+            let pump_pool = pump_program_positions
+                .first()
+                .and_then(|program_pos| account_at(program_pos + 1));
+
+            Some(json!({
+                "instruction_index": idx,
+                "side": side,
+                "discriminator": discriminator,
+                "amount_0": amount_0,
+                "amount_1": amount_1,
+                "mint": mint,
+                "quote_mint": quote_mint,
+                "user": account_at(1),
+                "pump_pool": pump_pool,
+                "pump_program_positions": pump_program_positions,
+                "data_hex": bytes_to_hex(&ix.data),
+                "data_len": ix.data.len(),
+            }))
+        })
+        .collect()
+}
+
 fn candidates_from_keys(
     pools_by_mint: &HashMap<String, MintPools>,
     keys: &[String],
@@ -578,6 +644,7 @@ async fn main() -> anyhow::Result<()> {
             let programs = program_ids(&txn, &keys);
             let pump_swaps = pump_swap_rows(&txn, &keys, sol_usd);
             let flashx_instructions = flashx_instruction_rows(&txn, &keys);
+            let axiom_swaps = axiom_swap_rows(&txn, &keys);
             let instructions = if log_instructions {
                 instruction_rows(&txn, &keys)
             } else {
@@ -585,6 +652,13 @@ async fn main() -> anyhow::Result<()> {
             };
             let mut mints_for_candidates = mints.clone();
             for swap in &pump_swaps {
+                if let Some(mint) = swap.get("mint").and_then(Value::as_str) {
+                    if !is_excluded_mint(mint) && !mints_for_candidates.contains(&mint.to_string()) {
+                        mints_for_candidates.push(mint.to_string());
+                    }
+                }
+            }
+            for swap in &axiom_swaps {
                 if let Some(mint) = swap.get("mint").and_then(Value::as_str) {
                     if !is_excluded_mint(mint) && !mints_for_candidates.contains(&mint.to_string()) {
                         mints_for_candidates.push(mint.to_string());
@@ -610,6 +684,7 @@ async fn main() -> anyhow::Result<()> {
                 "mints": mints,
                 "instruction_mints": mints_for_candidates,
                 "pump_swaps": pump_swaps,
+                "axiom_swaps": axiom_swaps,
                 "flashx_instructions": flashx_instructions,
                 "candidates": candidates,
                 "programs": if log_programs { json!(programs) } else { Value::Null },
