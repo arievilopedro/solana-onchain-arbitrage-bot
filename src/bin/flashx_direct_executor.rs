@@ -404,6 +404,19 @@ fn token_balance_mints(
     out
 }
 
+fn token_balance_mints_in_pools(
+    meta: Option<&yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta>,
+    pools_by_mint: &HashMap<String, MintPools>,
+) -> Vec<String> {
+    let Some(meta) = meta else {
+        return Vec::new();
+    };
+    token_balance_mints(meta)
+        .into_iter()
+        .filter(|mint| pools_by_mint.contains_key(mint))
+        .collect()
+}
+
 fn account_keys(
     tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
     meta: Option<&yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta>,
@@ -464,11 +477,16 @@ fn axiom_swap_signals(
                     .and_then(|account_idx| keys.get(*account_idx as usize))
                     .cloned()
             };
-            let mint = account_at(12)?;
-            let quote_mint = account_at(13)?;
-            if is_excluded_mint(&mint) || quote_mint != WSOL {
-                return None;
-            }
+            let fixed_mint = account_at(12).and_then(|mint| {
+                let quote_mint = account_at(13)?;
+                if !is_excluded_mint(&mint) && quote_mint == WSOL {
+                    Some(mint)
+                } else {
+                    None
+                }
+            });
+            let mint = fixed_mint
+                .or_else(|| token_balance_mints_in_pools(meta, pools_by_mint).into_iter().next())?;
             let pools = pools_by_mint.get(&mint)?;
             if pools.dlmm.is_empty() {
                 return None;
