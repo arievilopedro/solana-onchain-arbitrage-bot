@@ -487,7 +487,7 @@ fn axiom_swap_signals(
                 .filter_map(|account_idx| keys.get(*account_idx as usize).cloned())
                 .collect::<HashSet<_>>();
             let instruction_accounts = ix.accounts.iter().copied().map(u32::from).collect::<HashSet<_>>();
-            let (measured_sol, volume_source) = if let Some(meta) = meta {
+            let measured_from_meta = meta.and_then(|meta| {
                 owner_wsol_volume_sol(meta, &user)
                     .map(|sol| (sol, "meta_wsol_owner"))
                     .or_else(|| {
@@ -510,9 +510,13 @@ fn axiom_swap_signals(
                         instruction_account_native_volume_sol(meta, &instruction_accounts)
                             .map(|sol| (sol, "meta_native_ix_account"))
                     })
-                    .unwrap_or((sol_amount, "instruction_bytes"))
+            });
+            let (measured_sol, volume_source) = if let Some(measured) = measured_from_meta {
+                measured
+            } else if side == "buy" {
+                (sol_amount, "instruction_bytes_buy")
             } else {
-                (sol_amount, "instruction_bytes")
+                return None;
             };
             if measured_sol < min_sol {
                 return None;
