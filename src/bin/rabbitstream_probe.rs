@@ -163,6 +163,41 @@ fn estimate_wsol_volume_usd(
         * sol_usd
 }
 
+fn owner_wsol_delta_sol(
+    meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
+    owner: &str,
+) -> Option<f64> {
+    let mut pre = HashMap::new();
+    let mut post = HashMap::new();
+    for b in &meta.pre_token_balances {
+        if b.mint == WSOL && b.owner == owner {
+            if let Some(ui) = &b.ui_token_amount {
+                pre.insert(b.account_index, token_amount(&ui.amount, ui.decimals));
+            }
+        }
+    }
+    for b in &meta.post_token_balances {
+        if b.mint == WSOL && b.owner == owner {
+            if let Some(ui) = &b.ui_token_amount {
+                post.insert(b.account_index, token_amount(&ui.amount, ui.decimals));
+            }
+        }
+    }
+    pre.keys()
+        .chain(post.keys())
+        .map(|idx| {
+            let a = pre.get(idx).copied().unwrap_or(0.0);
+            let b = post.get(idx).copied().unwrap_or(0.0);
+            b - a
+        })
+        .max_by(|a, b| {
+            a.abs()
+                .partial_cmp(&b.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .filter(|delta| delta.abs() > 0.0)
+}
+
 fn token_balance_mints(
     meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
 ) -> Vec<String> {
@@ -473,6 +508,7 @@ fn flashx_instruction_rows(
 fn axiom_swap_rows(
     rpc_client: Option<&RpcClient>,
     tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
+    meta: Option<&yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta>,
     keys: &[String],
     pools_by_mint: &HashMap<String, MintPools>,
 ) -> Vec<Value> {
@@ -495,11 +531,17 @@ fn axiom_swap_rows(
             };
             let (mint, quote_mint) = resolve_flashx_mint_pair(keys, &ix.accounts, pools_by_mint)?;
             let discriminator = ix.data[0];
-            let side = match discriminator {
+            let byte_side = match discriminator {
                 0 => "sell",
                 1 => "buy",
                 _ => "unknown",
             };
+            let user = account_at(1);
+            let side_from_meta = meta
+                .zip(user.as_deref())
+                .and_then(|(meta, user)| owner_wsol_delta_sol(meta, user))
+                .map(|delta| if delta < 0.0 { "buy" } else { "sell" });
+            let side = side_from_meta.unwrap_or(byte_side);
             let amount_0 = read_le_u64(&ix.data[1..9]).unwrap_or(0);
             let amount_1 = read_le_u64(&ix.data[9..17]).unwrap_or(0);
             let amount_0_as_sol = amount_0 as f64 / 1_000_000_000.0;
@@ -559,6 +601,8 @@ fn axiom_swap_rows(
             Some(json!({
                 "instruction_index": idx,
                 "side": side,
+                "byte_side": byte_side,
+                "side_from_meta": side_from_meta,
                 "discriminator": discriminator,
                 "amount_0": amount_0,
                 "amount_1": amount_1,
@@ -571,7 +615,7 @@ fn axiom_swap_rows(
                 "known_pump_sell_estimate": known_pump_sell_estimate.unwrap_or(Value::Null),
                 "mint": mint,
                 "quote_mint": quote_mint,
-                "user": account_at(1),
+                "user": user,
                 "pump_pool": pump_pool,
                 "pump_program_positions": pump_program_positions,
                 "data_hex": bytes_to_hex(&ix.data),
@@ -869,7 +913,7 @@ async fn main() -> anyhow::Result<()> {
             let pump_swaps = pump_swap_rows(&txn, &keys, sol_usd);
             let flashx_instructions = flashx_instruction_rows(&txn, &keys);
             let axiom_swaps =
-                axiom_swap_rows(rpc_client.as_ref(), &txn, &keys, &pools_by_mint);
+                axiom_swap_rows(rpc_client.as_ref(), &txn, meta, &keys, &pools_by_mint);
             let axiom_candidates = axiom_candidate_rows(&pools_by_mint, &axiom_swaps);
             let instructions = if log_instructions {
                 instruction_rows(&txn, &keys)

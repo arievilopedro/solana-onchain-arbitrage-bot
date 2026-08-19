@@ -422,6 +422,41 @@ fn owner_wsol_volume_sol(
     }
 }
 
+fn owner_wsol_delta_sol(
+    meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
+    owner: &str,
+) -> Option<f64> {
+    let mut pre = HashMap::new();
+    let mut post = HashMap::new();
+    for b in &meta.pre_token_balances {
+        if b.mint == WSOL && b.owner == owner {
+            if let Some(ui) = &b.ui_token_amount {
+                pre.insert(b.account_index, token_amount(&ui.amount, ui.decimals));
+            }
+        }
+    }
+    for b in &meta.post_token_balances {
+        if b.mint == WSOL && b.owner == owner {
+            if let Some(ui) = &b.ui_token_amount {
+                post.insert(b.account_index, token_amount(&ui.amount, ui.decimals));
+            }
+        }
+    }
+    pre.keys()
+        .chain(post.keys())
+        .map(|idx| {
+            let a = pre.get(idx).copied().unwrap_or(0.0);
+            let b = post.get(idx).copied().unwrap_or(0.0);
+            b - a
+        })
+        .max_by(|a, b| {
+            a.abs()
+                .partial_cmp(&b.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .filter(|delta| delta.abs() > 0.0)
+}
+
 fn keyed_wsol_volume_sol(
     meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
     candidate_owners: &HashSet<String>,
@@ -628,11 +663,15 @@ fn axiom_swap_signals(
                 return None;
             }
             let user = account_at(1)?;
-            let side = match ix.data[0] {
+            let byte_side = match ix.data[0] {
                 0 => "sell",
                 1 => "buy",
                 _ => return None,
             };
+            let side = meta
+                .and_then(|meta| owner_wsol_delta_sol(meta, &user))
+                .map(|delta| if delta < 0.0 { "buy" } else { "sell" })
+                .unwrap_or(byte_side);
             let amount_0 = read_le_u64(&ix.data[1..9]).unwrap_or(0);
             let sol_amount = amount_0 as f64 / 1_000_000_000.0;
             let pump = pools.pump.first().cloned()?;
