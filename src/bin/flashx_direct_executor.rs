@@ -43,9 +43,19 @@ const FLASHX: &str = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9";
 const PUMP_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const SMB_LUT: &str = "4sKLJ1Qoudh8PJyqBeuKocYdsZvxTcRShUt9aKqwhgvC";
 const DEFAULT_FAST_URL: &str = "https://fast.circular.fi/transactions";
+const DEFAULT_HELIUS_SENDER_URL: &str = "http://fra-sender.helius-rpc.com/fast";
+const CIRCULAR_TIP_ACCOUNTS: &str = "FAST3dMFZvESiEipBvLSiXq3QCV51o3xuoHScqRU6cB6,FASTHPW6akdGh9PFSdhMTbCuGkCSX7LsUjjnaB2RTQ4v,FASTYKWXRfAoty7SQCM1mGVrmPUyyNcF4tc3DUkLDAu9,FASTPB76TxKPMZ7Q29m8v4zJn8gUjbWyvTEQaaxhwN7M,FASTs6ctgbsuZegMzUs4DPUYhRSZUPCjgCVnttHbpQAp,FASTYmSidNfLwdwiQEhCTtzghxEtaipeNSDSwh9xDPs3,FASTCKnwwY6iL3CknRgg3Zqir7jeagDDhxSnBQQy5a1C,FASTKL1AamNKrwnvbKwo4PU8434BBdqVrTtugM6oDU71";
+const HELIUS_TIP_ACCOUNTS: &str = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE,D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ,9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta,5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn,2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD,2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ,wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF,3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT,4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey,4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FastSenderProvider {
+    Circular,
+    Helius,
+}
 
 #[derive(Clone)]
 struct FastSender {
+    provider: FastSenderProvider,
     client: reqwest::Client,
     url: String,
     api_key: String,
@@ -866,25 +876,41 @@ fn build_versioned_transaction(
 async fn send_fast(sender: &FastSender, tx: &VersionedTransaction) -> anyhow::Result<String> {
     let bytes = bincode::serialize(tx)?;
     let tx64 = base64::encode(bytes);
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "sendTransaction",
-        "params": [
-            tx64,
-            {
-                "cashbackAddress": sender.cashback_address
-            }
-        ]
-    });
-    let resp = sender
+    let body = match sender.provider {
+        FastSenderProvider::Circular => json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                tx64,
+                {
+                    "cashbackAddress": sender.cashback_address
+                }
+            ]
+        }),
+        FastSenderProvider::Helius => json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                tx64,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": true,
+                    "maxRetries": 0
+                }
+            ]
+        }),
+    };
+    let mut request = sender
         .client
         .post(&sender.url)
         .header("content-type", "application/json")
-        .header("x-api-key", &sender.api_key)
-        .json(&body)
-        .send()
-        .await?;
+        .json(&body);
+    if sender.provider == FastSenderProvider::Circular {
+        request = request.header("x-api-key", &sender.api_key);
+    }
+    let resp = request.send().await?;
     let status = resp.status();
     let value: Value = resp.json().await?;
     if !status.is_success() || value.get("error").is_some() {
@@ -1195,6 +1221,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(Arg::with_name("log-actionable-keys").long("log-actionable-keys"))
         .arg(Arg::with_name("max-filter-accounts").long("max-filter-accounts").takes_value(true).default_value("200"))
         .arg(Arg::with_name("send-rpc").long("send-rpc"))
+        .arg(Arg::with_name("sender-provider").long("sender-provider").takes_value(true).default_value("circular"))
         .arg(Arg::with_name("fast-url").long("fast-url").takes_value(true).default_value(DEFAULT_FAST_URL))
         .arg(Arg::with_name("fast-api-key").long("fast-api-key").takes_value(true).default_value(""))
         .arg(Arg::with_name("cashback-address").long("cashback-address").takes_value(true).default_value(""))
@@ -1205,7 +1232,7 @@ async fn main() -> anyhow::Result<()> {
             Arg::with_name("fast-tip-accounts")
                 .long("fast-tip-accounts")
                 .takes_value(true)
-                .default_value("FAST3dMFZvESiEipBvLSiXq3QCV51o3xuoHScqRU6cB6,FASTHPW6akdGh9PFSdhMTbCuGkCSX7LsUjjnaB2RTQ4v,FASTYKWXRfAoty7SQCM1mGVrmPUyyNcF4tc3DUkLDAu9,FASTPB76TxKPMZ7Q29m8v4zJn8gUjbWyvTEQaaxhwN7M,FASTs6ctgbsuZegMzUs4DPUYhRSZUPCjgCVnttHbpQAp,FASTYmSidNfLwdwiQEhCTtzghxEtaipeNSDSwh9xDPs3,FASTCKnwwY6iL3CknRgg3Zqir7jeagDDhxSnBQQy5a1C,FASTKL1AamNKrwnvbKwo4PU8434BBdqVrTtugM6oDU71"),
+                .default_value(""),
         )
         .get_matches();
 
@@ -1244,13 +1271,40 @@ async fn main() -> anyhow::Result<()> {
     let log_actionable_keys = matches.is_present("log-actionable-keys");
     let max_filter_accounts: usize = matches.value_of("max-filter-accounts").unwrap().parse()?;
     let send_rpc = matches.is_present("send-rpc");
-    let fast_url = matches.value_of("fast-url").unwrap();
+    let sender_provider = match matches.value_of("sender-provider").unwrap() {
+        "circular" => FastSenderProvider::Circular,
+        "helius" => FastSenderProvider::Helius,
+        other => anyhow::bail!("unsupported sender-provider {}; use circular or helius", other),
+    };
+    let fast_url_arg = matches.value_of("fast-url").unwrap();
     let fast_api_key = matches.value_of("fast-api-key").unwrap();
+    let mut fast_url = if sender_provider == FastSenderProvider::Helius
+        && fast_url_arg == DEFAULT_FAST_URL
+    {
+        DEFAULT_HELIUS_SENDER_URL.to_string()
+    } else {
+        fast_url_arg.to_string()
+    };
+    if sender_provider == FastSenderProvider::Helius
+        && !fast_api_key.is_empty()
+        && !fast_url.contains("api-key=")
+    {
+        let sep = if fast_url.contains('?') { '&' } else { '?' };
+        fast_url = format!("{}{}api-key={}", fast_url, sep, fast_api_key);
+    }
     let cashback_address_arg = matches.value_of("cashback-address").unwrap();
     let fast_tip_from: u64 = matches.value_of("fast-tip-from").unwrap().parse()?;
     let fast_tip_to: u64 = matches.value_of("fast-tip-to").unwrap().parse()?;
     let fast_timeout_ms: u64 = matches.value_of("fast-timeout-ms").unwrap().parse()?;
-    let fast_tip_accounts_raw = matches.value_of("fast-tip-accounts").unwrap();
+    let fast_tip_accounts_arg = matches.value_of("fast-tip-accounts").unwrap();
+    let fast_tip_accounts_raw = if fast_tip_accounts_arg.is_empty() {
+        match sender_provider {
+            FastSenderProvider::Circular => CIRCULAR_TIP_ACCOUNTS,
+            FastSenderProvider::Helius => HELIUS_TIP_ACCOUNTS,
+        }
+    } else {
+        fast_tip_accounts_arg
+    };
 
     let base_config = Config::load(base_config_path)?;
     let rpc_client = Arc::new(RpcClient::new(base_config.rpc.url.clone()));
@@ -1272,7 +1326,7 @@ async fn main() -> anyhow::Result<()> {
     info!("wallet={}", wallet.pubkey());
     ensure_base_atas_exist(&rpc_client, &wallet)?;
 
-    let fast = if fast_api_key.is_empty() {
+    let fast = if sender_provider == FastSenderProvider::Circular && fast_api_key.is_empty() {
         None
     } else {
         let cashback_address = if cashback_address_arg.is_empty() {
@@ -1281,10 +1335,11 @@ async fn main() -> anyhow::Result<()> {
             cashback_address_arg.to_string()
         };
         Some(FastSender {
+            provider: sender_provider,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_millis(fast_timeout_ms))
                 .build()?,
-            url: fast_url.to_string(),
+            url: fast_url.clone(),
             api_key: fast_api_key.to_string(),
             cashback_address,
             tip_accounts: parse_pubkey_list(fast_tip_accounts_raw)?,
@@ -1294,10 +1349,21 @@ async fn main() -> anyhow::Result<()> {
         })
     };
     let send_config = SendConfig { fast, send_rpc };
+    let fast_url_log = if fast_url.contains("api-key=") {
+        fast_url
+            .split("api-key=")
+            .next()
+            .map(|prefix| format!("{}api-key=<redacted>", prefix))
+            .unwrap_or_else(|| "<redacted>".to_string())
+    } else {
+        fast_url.clone()
+    };
     info!(
-        "senders fast={} rpc={} fast_tip={}..{} axiom_min_sol={:.6}",
+        "senders provider={:?} fast={} rpc={} fast_url={} fast_tip={}..{} axiom_min_sol={:.6}",
+        sender_provider,
         send_config.fast.is_some(),
         send_config.send_rpc,
+        fast_url_log,
         fast_tip_from,
         fast_tip_to,
         axiom_min_sol
