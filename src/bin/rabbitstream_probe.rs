@@ -36,6 +36,50 @@ fn is_excluded_mint(mint: &str) -> bool {
     matches!(mint, WSOL | USDC | USDT | USD1)
 }
 
+fn resolve_flashx_mint_pair(
+    keys: &[String],
+    accounts: &[u8],
+    pools_by_mint: &HashMap<String, MintPools>,
+) -> Option<(String, String)> {
+    let account_at = |pos: usize| -> Option<&str> {
+        accounts
+            .get(pos)
+            .and_then(|account_idx| keys.get(*account_idx as usize))
+            .map(String::as_str)
+    };
+
+    let fixed_a = account_at(12);
+    let fixed_b = account_at(13);
+    if let (Some(mint), Some(quote_mint)) = (fixed_a, fixed_b) {
+        if quote_mint == WSOL && pools_by_mint.contains_key(mint) && !is_excluded_mint(mint) {
+            return Some((mint.to_string(), quote_mint.to_string()));
+        }
+        if mint == WSOL && pools_by_mint.contains_key(quote_mint) && !is_excluded_mint(quote_mint) {
+            return Some((quote_mint.to_string(), mint.to_string()));
+        }
+    }
+
+    let has_wsol = accounts
+        .iter()
+        .filter_map(|account_idx| keys.get(*account_idx as usize))
+        .any(|key| key == WSOL);
+    if !has_wsol {
+        return None;
+    }
+
+    accounts
+        .iter()
+        .filter_map(|account_idx| keys.get(*account_idx as usize))
+        .find(|key| {
+            !is_excluded_mint(key)
+                && pools_by_mint
+                    .get(key.as_str())
+                    .map(|pools| !pools.dlmm.is_empty())
+                    .unwrap_or(false)
+        })
+        .map(|mint| (mint.clone(), WSOL.to_string()))
+}
+
 fn pubkey_bytes_to_string(bytes: &[u8]) -> Option<String> {
     if bytes.len() != 32 {
         return None;
@@ -449,11 +493,7 @@ fn axiom_swap_rows(
                     .and_then(|account_idx| keys.get(*account_idx as usize))
                     .cloned()
             };
-            let mint = account_at(12)?;
-            let quote_mint = account_at(13)?;
-            if is_excluded_mint(&mint) || quote_mint != WSOL {
-                return None;
-            }
+            let (mint, quote_mint) = resolve_flashx_mint_pair(keys, &ix.accounts, pools_by_mint)?;
             let discriminator = ix.data[0];
             let side = match discriminator {
                 0 => "sell",
