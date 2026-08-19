@@ -41,6 +41,8 @@ const USDT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 const USD1: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
 const FLASHX: &str = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9";
 const PUMP_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+const PUMP_BUY_DISCRIMINATOR: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
+const PUMP_SELL_DISCRIMINATOR: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
 const SMB_LUT: &str = "4sKLJ1Qoudh8PJyqBeuKocYdsZvxTcRShUt9aKqwhgvC";
 const DEFAULT_FAST_URL: &str = "https://fast.circular.fi/transactions";
 const DEFAULT_HELIUS_SENDER_URL: &str = "http://fra-sender.helius-rpc.com/fast";
@@ -759,6 +761,96 @@ fn axiom_swap_signals(
         .collect()
 }
 
+fn pump_swap_signals(
+    tx: &yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction,
+    keys: &[String],
+    pools_by_mint: &HashMap<String, MintPools>,
+    pump_reserves_by_pool: &HashMap<String, PumpReserve>,
+    pump_reserves_max_age_ms: u128,
+    sol_usd: f64,
+    min_sol: f64,
+) -> Vec<AxiomSwapSignal> {
+    let Some(msg) = &tx.message else {
+        return Vec::new();
+    };
+    msg.instructions
+        .iter()
+        .filter_map(|ix| {
+            let program = keys.get(ix.program_id_index as usize)?;
+            if program != PUMP_AMM_PROGRAM || ix.accounts.len() < 5 || ix.data.len() < 16 {
+                return None;
+            }
+            let side = if ix.data.starts_with(&PUMP_BUY_DISCRIMINATOR) {
+                "buy"
+            } else if ix.data.starts_with(&PUMP_SELL_DISCRIMINATOR) {
+                "sell"
+            } else {
+                return None;
+            };
+            let account_at = |pos: usize| -> Option<String> {
+                ix.accounts
+                    .get(pos)
+                    .and_then(|account_idx| keys.get(*account_idx as usize))
+                    .cloned()
+            };
+            let pump = account_at(0)?;
+            let quote_mint = account_at(3)?;
+            let mint = account_at(4)?;
+            if quote_mint != WSOL || is_excluded_mint(&mint) {
+                return None;
+            }
+            let pools = pools_by_mint.get(&mint)?;
+            if pools.dlmm.is_empty() {
+                return None;
+            }
+            let amount_0 = read_le_u64(&ix.data[8..16]).unwrap_or(0);
+            let (measured_sol, volume_source) = if side == "buy" {
+                (amount_0 as f64 / 1_000_000_000.0, "pump_swap_buy_bytes")
+            } else if let Some(sol) = estimate_cached_pump_sell_sol(
+                pump_reserves_by_pool,
+                &pump,
+                amount_0,
+                pump_reserves_max_age_ms,
+            ) {
+                (sol, "pump_swap_sell_cache")
+            } else {
+                info!(
+                    "PUMP_SWAP_ESTIMATE_FAIL mint={} signal={} raw_amount={} volume_source=pump_swap_sell_cache pump={} dlmms={} min_sol={:.6}",
+                    mint,
+                    side,
+                    amount_0,
+                    pump,
+                    pools.dlmm.len(),
+                    min_sol
+                );
+                return None;
+            };
+            if measured_sol < min_sol {
+                info!(
+                    "PUMP_SWAP_FILTERED mint={} signal={} sol={:.6} raw_amount={} volume_source={} pump={} dlmms={} min_sol={:.6}",
+                    mint,
+                    side,
+                    measured_sol,
+                    amount_0,
+                    volume_source,
+                    pump,
+                    pools.dlmm.len(),
+                    min_sol
+                );
+                return None;
+            }
+            Some(AxiomSwapSignal {
+                mint,
+                pump,
+                side,
+                sol_amount: measured_sol,
+                volume_usd: measured_sol * sol_usd,
+                volume_source,
+            })
+        })
+        .collect()
+}
+
 fn signal_candidates_from_keys(
     pools_by_mint: &HashMap<String, MintPools>,
     keys: &[String],
@@ -1290,6 +1382,8 @@ async fn main() -> anyhow::Result<()> {
         .arg(Arg::with_name("prewarm-limit").long("prewarm-limit").takes_value(true).default_value("0"))
         .arg(Arg::with_name("rabbit-pool-filter").long("rabbit-pool-filter"))
         .arg(Arg::with_name("pump-program-filter").long("pump-program-filter"))
+        .arg(Arg::with_name("trigger-on-pump-swap").long("trigger-on-pump-swap"))
+        .arg(Arg::with_name("pump-swap-min-sol").long("pump-swap-min-sol").takes_value(true).default_value("2"))
         .arg(Arg::with_name("trigger-on-pool-touch").long("trigger-on-pool-touch"))
         .arg(Arg::with_name("pool-touch-require-pump-program").long("pool-touch-require-pump-program"))
         .arg(Arg::with_name("pool-touch-cooldown-ms").long("pool-touch-cooldown-ms").takes_value(true).default_value("1000"))
@@ -1338,6 +1432,8 @@ async fn main() -> anyhow::Result<()> {
     let prewarm_limit: usize = matches.value_of("prewarm-limit").unwrap().parse()?;
     let rabbit_pool_filter = matches.is_present("rabbit-pool-filter");
     let pump_program_filter = matches.is_present("pump-program-filter");
+    let trigger_on_pump_swap = matches.is_present("trigger-on-pump-swap");
+    let pump_swap_min_sol: f64 = matches.value_of("pump-swap-min-sol").unwrap().parse()?;
     let trigger_on_pool_touch = matches.is_present("trigger-on-pool-touch");
     let pool_touch_require_pump_program = matches.is_present("pool-touch-require-pump-program");
     let pool_touch_cooldown_ms: u64 = matches.value_of("pool-touch-cooldown-ms").unwrap().parse()?;
@@ -1479,10 +1575,12 @@ async fn main() -> anyhow::Result<()> {
     let subscribe_account_include =
         subscription_accounts(&pools_by_mint, rabbit_pool_filter, pump_program_filter, max_filter_accounts);
     info!(
-        "stream filter accounts={} rabbit_pool_filter={} pump_program_filter={} trigger_on_pool_touch={}",
+        "stream filter accounts={} rabbit_pool_filter={} pump_program_filter={} trigger_on_pump_swap={} pump_swap_min_sol={:.6} trigger_on_pool_touch={}",
         subscribe_account_include.len(),
         rabbit_pool_filter,
         pump_program_filter,
+        trigger_on_pump_swap,
+        pump_swap_min_sol,
         trigger_on_pool_touch
     );
 
@@ -1609,7 +1707,7 @@ async fn main() -> anyhow::Result<()> {
             let keys = account_keys(&txn, meta);
             let has_flashx = keys.iter().any(|k| k == FLASHX);
             let has_pump_program = keys.iter().any(|k| k == PUMP_AMM_PROGRAM);
-            if !has_flashx && !trigger_on_pool_touch {
+            if !has_flashx && !(trigger_on_pump_swap && has_pump_program) && !trigger_on_pool_touch {
                 continue;
             }
             let is_pool_touch_candidate = trigger_on_pool_touch && !has_flashx;
@@ -1653,6 +1751,27 @@ async fn main() -> anyhow::Result<()> {
                         .collect::<Vec<_>>();
                     let candidates =
                         signal_candidates_from_axiom_swaps(&guard.pools_by_mint, &axiom_swaps);
+                    let volume_usd = candidates
+                        .iter()
+                        .map(|(_, _, _, volume_usd, _, _, _)| *volume_usd)
+                        .fold(0.0, f64::max);
+                    (volume_usd, mints, candidates)
+                } else if trigger_on_pump_swap && has_pump_program {
+                    let pump_swaps = pump_swap_signals(
+                        &txn,
+                        &keys,
+                        &guard.pools_by_mint,
+                        &guard.pump_reserves_by_pool,
+                        guard.pump_reserves_max_age_ms,
+                        sol_usd,
+                        pump_swap_min_sol,
+                    );
+                    let mints = pump_swaps
+                        .iter()
+                        .map(|swap| swap.mint.clone())
+                        .collect::<Vec<_>>();
+                    let candidates =
+                        signal_candidates_from_axiom_swaps(&guard.pools_by_mint, &pump_swaps);
                     let volume_usd = candidates
                         .iter()
                         .map(|(_, _, _, volume_usd, _, _, _)| *volume_usd)
