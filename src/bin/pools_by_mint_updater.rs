@@ -1,7 +1,10 @@
 use clap::{App, Arg};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Map, Value};
+use solana_account_decoder::UiAccountEncoding;
 use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 use solana_onchain_arbitrage_bot::dex::meteora::constants::dlmm_program_id;
 use solana_onchain_arbitrage_bot::dex::meteora::dlmm_info::DlmmInfo;
 use solana_onchain_arbitrage_bot::dex::pump::constants::pump_program_id;
@@ -26,6 +29,8 @@ const WSOL: &str = "So11111111111111111111111111111111111111112";
 const FLASHX: &str = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9";
 const PUMP_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+const DLMM_TOKEN_X_MINT_OFFSET: usize = 96;
+const DLMM_TOKEN_Y_MINT_OFFSET: usize = 128;
 
 #[derive(Debug)]
 struct DiscoveredPool {
@@ -136,6 +141,46 @@ fn upsert_pool(root: &mut Value, pool: &DiscoveredPool) -> bool {
     rec_obj.insert("count".to_string(), json!(count + 1));
     rec_obj.insert("last_seen".to_string(), json!(now_seen()));
     !existed
+}
+
+fn known_mints(root: &Value, limit: usize) -> Vec<String> {
+    let Some(obj) = root.as_object() else {
+        return Vec::new();
+    };
+    let mut rows = obj
+        .iter()
+        .filter_map(|(mint, rec)| {
+            if Pubkey::from_str(mint).is_err() {
+                return None;
+            }
+            let pump_count = rec
+                .get("pump")
+                .and_then(Value::as_object)
+                .map(|pools| {
+                    pools
+                        .values()
+                        .map(|meta| meta.get("count").and_then(Value::as_u64).unwrap_or(0))
+                        .sum::<u64>()
+                })
+                .unwrap_or(0);
+            let dlmm_count = rec
+                .get("dlmm")
+                .and_then(Value::as_object)
+                .map(|pools| {
+                    pools
+                        .values()
+                        .map(|meta| meta.get("count").and_then(Value::as_u64).unwrap_or(0))
+                        .sum::<u64>()
+                })
+                .unwrap_or(0);
+            Some((mint.clone(), pump_count.saturating_add(dlmm_count)))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.into_iter()
+        .take(if limit == 0 { usize::MAX } else { limit })
+        .map(|(mint, _)| mint)
+        .collect()
 }
 
 fn token_account_amount(data: &[u8]) -> Option<u64> {
@@ -299,6 +344,72 @@ async fn validate_candidates(
     .await?
 }
 
+fn memcmp_pubkey(offset: usize, pubkey: &Pubkey) -> RpcFilterType {
+    RpcFilterType::Memcmp(Memcmp::new_raw_bytes(offset, pubkey.to_bytes().to_vec()))
+}
+
+fn dlmm_program_accounts_config(x_mint: &Pubkey, y_mint: &Pubkey) -> RpcProgramAccountsConfig {
+    RpcProgramAccountsConfig {
+        filters: Some(vec![
+            memcmp_pubkey(DLMM_TOKEN_X_MINT_OFFSET, x_mint),
+            memcmp_pubkey(DLMM_TOKEN_Y_MINT_OFFSET, y_mint),
+        ]),
+        account_config: RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+async fn discover_dlmm_pools_for_mints(
+    rpc: Arc<RpcClient>,
+    mints: Vec<String>,
+    max_per_mint: usize,
+) -> anyhow::Result<Vec<DiscoveredPool>> {
+    task::spawn_blocking(move || {
+        let program = dlmm_program_id();
+        let wsol = Pubkey::from_str(WSOL)?;
+        let mut out = Vec::new();
+        for mint_raw in mints {
+            let Ok(mint) = Pubkey::from_str(&mint_raw) else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            let configs = [
+                dlmm_program_accounts_config(&mint, &wsol),
+                dlmm_program_accounts_config(&wsol, &mint),
+            ];
+            for config in configs {
+                let accounts = match rpc.get_program_accounts_with_config(&program, config) {
+                    Ok(accounts) => accounts,
+                    Err(e) => {
+                        warn!("dlmm discovery failed mint={}: {}", mint_raw, e);
+                        continue;
+                    }
+                };
+                for (pool_pubkey, account) in accounts {
+                    if max_per_mint > 0 && seen.len() >= max_per_mint {
+                        break;
+                    }
+                    let pool = pool_pubkey.to_string();
+                    if !seen.insert(pool.clone()) {
+                        continue;
+                    }
+                    let Some(found) = validate_account(&pool, &account.owner, &account.data) else {
+                        continue;
+                    };
+                    if found.side == "dlmm" && found.mint == mint_raw {
+                        out.push(found);
+                    }
+                }
+            }
+        }
+        anyhow::Ok(out)
+    })
+    .await?
+}
+
 fn parse_csv(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -324,6 +435,9 @@ async fn main() -> anyhow::Result<()> {
         .arg(Arg::with_name("include-accounts").long("include-accounts").takes_value(true).default_value(""))
         .arg(Arg::with_name("max-candidate-accounts").long("max-candidate-accounts").takes_value(true).default_value("80"))
         .arg(Arg::with_name("write-interval-ms").long("write-interval-ms").takes_value(true).default_value("500"))
+        .arg(Arg::with_name("dlmm-discovery-interval-ms").long("dlmm-discovery-interval-ms").takes_value(true).default_value("60000"))
+        .arg(Arg::with_name("dlmm-discovery-max-mints").long("dlmm-discovery-max-mints").takes_value(true).default_value("300"))
+        .arg(Arg::with_name("dlmm-discovery-max-per-mint").long("dlmm-discovery-max-per-mint").takes_value(true).default_value("8"))
         .arg(Arg::with_name("full-scan").long("full-scan"))
         .get_matches();
 
@@ -340,6 +454,18 @@ async fn main() -> anyhow::Result<()> {
         .value_of("write-interval-ms")
         .unwrap()
         .parse::<u64>()?;
+    let dlmm_discovery_interval_ms = matches
+        .value_of("dlmm-discovery-interval-ms")
+        .unwrap()
+        .parse::<u64>()?;
+    let dlmm_discovery_max_mints = matches
+        .value_of("dlmm-discovery-max-mints")
+        .unwrap()
+        .parse::<usize>()?;
+    let dlmm_discovery_max_per_mint = matches
+        .value_of("dlmm-discovery-max-per-mint")
+        .unwrap()
+        .parse::<usize>()?;
     let full_scan = matches.is_present("full-scan");
 
     let mut include_accounts = vec![
@@ -395,13 +521,66 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    if dlmm_discovery_interval_ms > 0 {
+        let pools_json = pools_json.clone();
+        let dirty = dirty.clone();
+        let rpc = rpc.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(dlmm_discovery_interval_ms)).await;
+                let mints = {
+                    let root = pools_json.lock().unwrap();
+                    known_mints(&root, dlmm_discovery_max_mints)
+                };
+                if mints.is_empty() {
+                    continue;
+                }
+                match discover_dlmm_pools_for_mints(
+                    rpc.clone(),
+                    mints.clone(),
+                    dlmm_discovery_max_per_mint,
+                )
+                .await
+                {
+                    Ok(discovered) => {
+                        if discovered.is_empty() {
+                            info!("DLMM_DISCOVERY mints={} discovered=0 added=0", mints.len());
+                            continue;
+                        }
+                        let mut added = 0usize;
+                        {
+                            let mut root = pools_json.lock().unwrap();
+                            for pool in &discovered {
+                                if upsert_pool(&mut root, pool) {
+                                    added += 1;
+                                }
+                            }
+                        }
+                        if added > 0 {
+                            *dirty.lock().unwrap() = true;
+                        }
+                        info!(
+                            "DLMM_DISCOVERY mints={} discovered={} added={}",
+                            mints.len(),
+                            discovered.len(),
+                            added
+                        );
+                    }
+                    Err(e) => warn!("DLMM_DISCOVERY failed: {}", e),
+                }
+            }
+        });
+    }
 
     info!(
-        "updater loaded {}; subscribing accounts={} full_scan={} max_candidate_accounts={}",
+        "updater loaded {}; subscribing accounts={} full_scan={} max_candidate_accounts={} dlmm_discovery_interval_ms={} dlmm_discovery_max_mints={} dlmm_discovery_max_per_mint={}",
         pools_file,
         include_accounts.len(),
         full_scan,
-        max_candidate_accounts
+        max_candidate_accounts,
+        dlmm_discovery_interval_ms,
+        dlmm_discovery_max_mints,
+        dlmm_discovery_max_per_mint
     );
 
     let mut last_seen_sig = HashMap::<String, Instant>::new();
