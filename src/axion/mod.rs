@@ -95,19 +95,26 @@ pub mod yellowstone {
         out
     }
 
-    pub fn sol_volume(meta: Option<&TransactionStatusMeta>) -> (f64, &'static str) {
-        let Some(meta) = meta else {
-            return (0.0, "missing_meta");
-        };
+    pub fn sol_volume(
+        tx: &Transaction,
+        keys: &[Pubkey],
+        meta: Option<&TransactionStatusMeta>,
+        axion_program: Pubkey,
+    ) -> (f64, &'static str) {
+        if let Some(meta) = meta {
+            let wsol = wsol_volume(meta);
+            if wsol > 0.0 {
+                return (wsol, "meta_wsol_delta");
+            }
 
-        let wsol = wsol_volume(meta);
-        if wsol > 0.0 {
-            return (wsol, "meta_wsol_delta");
+            let native = native_sol_volume(meta);
+            if native > 0.0 {
+                return (native, "meta_native_delta");
+            }
         }
 
-        let native = native_sol_volume(meta);
-        if native > 0.0 {
-            return (native, "meta_native_delta");
+        if let Some(sol) = axion_instruction_sol_volume(tx, keys, axion_program) {
+            return (sol, "axion_instruction_amount");
         }
 
         (0.0, "none")
@@ -157,6 +164,43 @@ pub mod yellowstone {
             .fold(0.0, f64::max)
     }
 
+    fn axion_instruction_sol_volume(
+        tx: &Transaction,
+        keys: &[Pubkey],
+        axion_program: Pubkey,
+    ) -> Option<f64> {
+        let msg = tx.message.as_ref()?;
+        msg.instructions
+            .iter()
+            .filter(|ix| keys.get(ix.program_id_index as usize) == Some(&axion_program))
+            .filter_map(|ix| instruction_sol_lamports(&ix.data))
+            .max()
+            .map(|lamports| lamports as f64 / 1_000_000_000.0)
+            .filter(|sol| *sol > 0.0)
+    }
+
+    fn instruction_sol_lamports(data: &[u8]) -> Option<u64> {
+        if data.len() < 17 {
+            return None;
+        }
+        let amount_0 = read_le_u64(&data[1..9]).unwrap_or(0);
+        let amount_1 = read_le_u64(&data[9..17]).unwrap_or(0);
+        [amount_0, amount_1]
+            .iter()
+            .copied()
+            .filter(|amount| *amount > 0)
+            .min()
+    }
+
+    fn read_le_u64(bytes: &[u8]) -> Option<u64> {
+        if bytes.len() < 8 {
+            return None;
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[..8]);
+        Some(u64::from_le_bytes(buf))
+    }
+
     pub fn axion_trigger_signals(
         signature: String,
         slot: u64,
@@ -172,7 +216,7 @@ pub mod yellowstone {
         }
 
         let token_balance_mints = token_balance_mints(meta);
-        let (sol_amount, volume_source) = sol_volume(meta);
+        let (sol_amount, volume_source) = sol_volume(tx, &keys, meta, axion_program);
         collect_allowlisted_mints_from_strings(
             keys.iter(),
             token_balance_mints.iter(),
