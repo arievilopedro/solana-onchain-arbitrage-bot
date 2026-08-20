@@ -250,7 +250,7 @@ async fn run_geyser_account_worker(
         return Ok(());
     };
 
-    let enricher = StreamRpcEnricher::new(rpc_client);
+    let enricher = StreamRpcEnricher::new(rpc_client.clone());
     let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
     let mut last_route_groups_by_mint = HashMap::<Pubkey, usize>::new();
     info!("starting gRPC account worker: url={}", plan.url);
