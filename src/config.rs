@@ -154,8 +154,11 @@ pub struct HeliusSenderConfig {
     pub endpoint: String,
     #[serde(default, deserialize_with = "serde_string_or_env_default")]
     pub api_key: String,
+    #[serde(default = "default_helius_max_tps")]
     pub max_tps: u64,
+    #[serde(default = "default_helius_burst")]
     pub burst: u64,
+    #[serde(default = "default_helius_timeout_ms")]
     pub timeout_ms: u64,
     #[serde(default = "default_helius_tip_lamports")]
     pub tip_lamports: u64,
@@ -363,6 +366,18 @@ fn validate_stream_endpoint(name: &str, endpoint: &StreamEndpointConfig) -> anyh
 
 fn default_helius_tip_lamports() -> u64 {
     1_000_000
+}
+
+fn default_helius_max_tps() -> u64 {
+    50
+}
+
+fn default_helius_burst() -> u64 {
+    20
+}
+
+fn default_helius_timeout_ms() -> u64 {
+    700
 }
 
 fn ensure_parent_dir(field: &str, path: &str) -> anyhow::Result<()> {
