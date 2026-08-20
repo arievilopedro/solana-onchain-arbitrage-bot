@@ -18,6 +18,8 @@ use solana_sdk::transaction::Transaction;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::thread::sleep;
+use std::time::Duration;
 
 use crate::registry::MintRuntimeState;
 
@@ -352,7 +354,29 @@ pub fn load_lookup_table_account(
     rpc_client: &RpcClient,
     address: Pubkey,
 ) -> anyhow::Result<AddressLookupTableAccount> {
-    let account = rpc_client.get_account(&address)?;
+    let retry_delays_ms = [200, 400, 800, 1200, 1600];
+    let mut last_error = None;
+    let mut account = None;
+
+    for delay_ms in retry_delays_ms {
+        match rpc_client.get_account(&address) {
+            Ok(loaded) => {
+                account = Some(loaded);
+                break;
+            }
+            Err(error) => {
+                last_error = Some(error);
+                sleep(Duration::from_millis(delay_ms));
+            }
+        }
+    }
+
+    let account = match account {
+        Some(account) => account,
+        None => rpc_client
+            .get_account(&address)
+            .map_err(|error| last_error.unwrap_or(error))?,
+    };
     let lookup_table = AddressLookupTable::deserialize(&account.data)
         .map_err(|e| anyhow::anyhow!("failed to deserialize lookup table {}: {}", address, e))?;
     Ok(AddressLookupTableAccount {
