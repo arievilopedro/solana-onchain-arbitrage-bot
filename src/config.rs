@@ -182,7 +182,7 @@ where
     D: Deserializer<'de>,
 {
     let value_or_env = Option::<String>::deserialize(deserializer)?.unwrap_or_default();
-    resolve_env_string(&value_or_env).map_err(serde::de::Error::custom)
+    resolve_optional_env_string(&value_or_env).map_err(serde::de::Error::custom)
 }
 
 fn resolve_env_string(value_or_env: &str) -> Result<String, String> {
@@ -193,6 +193,19 @@ fn resolve_env_string(value_or_env: &str) -> Result<String, String> {
 
     if let Some(name) = value_or_env.strip_prefix('$') {
         return env::var(name).map_err(|_| format!("reading `{}` from env", name));
+    }
+
+    Ok(value_or_env.to_string())
+}
+
+fn resolve_optional_env_string(value_or_env: &str) -> Result<String, String> {
+    if value_or_env.starts_with("${") && value_or_env.ends_with('}') {
+        let name = &value_or_env[2..value_or_env.len() - 1];
+        return Ok(env::var(name).unwrap_or_default());
+    }
+
+    if let Some(name) = value_or_env.strip_prefix('$') {
+        return Ok(env::var(name).unwrap_or_default());
     }
 
     Ok(value_or_env.to_string())
@@ -313,4 +326,27 @@ fn ensure_parent_dir(field: &str, path: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_env_missing_is_an_error() {
+        env::remove_var("MISSING_REQUIRED_CONFIG_TEST");
+
+        let result = resolve_env_string("${MISSING_REQUIRED_CONFIG_TEST}");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn optional_env_missing_resolves_to_empty_string() {
+        env::remove_var("MISSING_OPTIONAL_CONFIG_TEST");
+
+        let result = resolve_optional_env_string("${MISSING_OPTIONAL_CONFIG_TEST}").unwrap();
+
+        assert_eq!(result, "");
+    }
 }
