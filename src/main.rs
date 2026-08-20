@@ -21,6 +21,9 @@ use solana_sdk::signer::Signer;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{info, Level};
+
+#[cfg(feature = "geyser")]
+use solana_onchain_arbitrage_bot::streams::{apply_pool_account_update, rpc::StreamRpcEnricher};
 use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
@@ -87,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
         report.discovered_dlmm,
         report.skipped_low_liquidity
     );
+    let mut registry = report.registry;
 
     if config.lookup_tables.route_shards.enabled {
         let store = RouteShardStore::load(&config.lookup_tables.route_shards.state_file)
@@ -96,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
             allowed_mints.iter().copied(),
             config.lookup_tables.route_shards.max_addresses,
         )?;
-        let summary = plan_route_shards(&config, &planner, &report.registry)?;
+        let summary = plan_route_shards(&config, &planner, &registry)?;
         RouteShardPlanFile::new(summary.operations.clone())
             .save(&config.lookup_tables.route_shards.plan_file)
             .context("failed to write route shard plan file")?;
@@ -129,8 +133,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if config.execution.compile_dry_run_on_startup {
-            let tx_dry_run =
-                dry_run_controlled_routes(&config, &rpc_client, &wallet, &report.registry)?;
+            let tx_dry_run = dry_run_controlled_routes(&config, &rpc_client, &wallet, &registry)?;
             info!(
                 "controlled tx dry-run: routes={} compiled={} missing_route_shard={} compile_failed={}",
                 tx_dry_run.routes,
@@ -141,7 +144,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!("supervisor bootstrap complete; stream workers are planned but not started yet");
+    info!("supervisor bootstrap complete; starting configured stream workers");
+    run_stream_workers(
+        rpc_client.clone(),
+        &mut registry,
+        grpc_plan,
+        rabbitstream_plan,
+    )
+    .await?;
 
     Ok(())
 }
@@ -165,6 +175,81 @@ fn log_stream_plans(
     } else {
         info!("RabbitStream trigger disabled");
     }
+}
+
+async fn run_stream_workers(
+    rpc_client: Arc<RpcClient>,
+    registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    grpc_plan: Option<GeyserAccountStreamPlan>,
+    rabbitstream_plan: Option<RabbitStreamPlan>,
+) -> anyhow::Result<()> {
+    if let Some(plan) = rabbitstream_plan {
+        info!(
+            "RabbitStream worker not started yet: url={} reason=trigger_parser_pending",
+            plan.url
+        );
+    }
+
+    run_geyser_account_worker(rpc_client, registry, grpc_plan).await
+}
+
+#[cfg(feature = "geyser")]
+async fn run_geyser_account_worker(
+    rpc_client: Arc<RpcClient>,
+    registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    grpc_plan: Option<GeyserAccountStreamPlan>,
+) -> anyhow::Result<()> {
+    use solana_onchain_arbitrage_bot::streams::grpc::yellowstone::run_account_stream;
+
+    let Some(plan) = grpc_plan else {
+        info!("gRPC account worker not started: grpc.enabled=false");
+        return Ok(());
+    };
+
+    let enricher = StreamRpcEnricher::new(rpc_client);
+    info!("starting gRPC account worker: url={}", plan.url);
+    run_account_stream(plan, |update| {
+        let report = apply_pool_account_update(
+            registry,
+            update,
+            |base_vault| enricher.base_vault_liquidity(base_vault),
+            |mint| enricher.mint_uses_token_2022(mint),
+            |pair| enricher.dlmm_bitmap_extension(pair),
+        )?;
+
+        if report.applied {
+            info!("gRPC account update applied");
+        } else if report.ignored_not_pool_program {
+            info!("gRPC account update ignored: not_pool_program");
+        } else if report.ignored_not_allowlisted {
+            info!("gRPC account update ignored: not_allowlisted");
+        } else if report.ignored_missing_mint_state {
+            info!("gRPC account update ignored: missing_mint_state");
+        } else if report.ignored_non_sol_route {
+            info!("gRPC account update ignored: non_sol_route");
+        }
+
+        Ok(())
+    })
+    .await
+}
+
+#[cfg(not(feature = "geyser"))]
+async fn run_geyser_account_worker(
+    _rpc_client: Arc<RpcClient>,
+    _registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    grpc_plan: Option<GeyserAccountStreamPlan>,
+) -> anyhow::Result<()> {
+    if let Some(plan) = grpc_plan {
+        info!(
+            "gRPC account worker not started: url={} reason=build_without_geyser_feature",
+            plan.url
+        );
+    } else {
+        info!("gRPC account worker not started: grpc.enabled=false");
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Default)]
