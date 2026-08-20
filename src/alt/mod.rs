@@ -11,6 +11,7 @@ use solana_program::pubkey::Pubkey;
 use solana_sdk::address_lookup_table::instruction::{create_lookup_table, extend_lookup_table};
 use solana_sdk::address_lookup_table::state::AddressLookupTable;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
@@ -380,7 +381,7 @@ pub fn execute_route_shard_plan(
     };
 
     for operation in plan.operations {
-        let recent_slot = rpc_client.get_slot()?;
+        let recent_slot = rpc_client.get_slot_with_commitment(CommitmentConfig::processed())?;
         let built = operation.build_instructions(wallet.pubkey(), wallet.pubkey(), recent_slot)?;
         let blockhash = rpc_client.get_latest_blockhash()?;
         let tx = Transaction::new_signed_with_payer(
