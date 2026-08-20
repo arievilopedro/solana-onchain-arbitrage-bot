@@ -3,7 +3,7 @@
 use crate::dex::meteora::constants::dlmm_program_id;
 use crate::dex::pump::pump_program_id;
 use crate::discovery::{dlmm_route_state_from_account, pump_route_state_from_account};
-use crate::registry::{PoolLiquidity, RuntimeRegistry};
+use crate::registry::{PoolKind, PoolLiquidity, RuntimeRegistry};
 use solana_program::pubkey::Pubkey;
 use solana_sdk::account::Account;
 
@@ -22,6 +22,10 @@ pub struct PoolAccountUpdate {
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct RegistryUpdateReport {
     pub applied: bool,
+    pub applied_kind: Option<PoolKind>,
+    pub applied_mint: Option<Pubkey>,
+    pub applied_pool: Option<Pubkey>,
+    pub applied_base_liquidity_lamports: Option<u64>,
     pub ignored_not_pool_program: bool,
     pub ignored_not_pool_account: bool,
     pub ignored_not_allowlisted: bool,
@@ -80,6 +84,9 @@ fn apply_pump_update(
         let mut route = route;
 
         route.last_update_slot = update.slot;
+        let applied_pool = route.pool;
+        let applied_base_liquidity_lamports =
+            route.liquidity.map(|liquidity| liquidity.base_lamports);
         let Some(state) = registry.get_mut(&mint) else {
             return Ok(RegistryUpdateReport {
                 ignored_missing_mint_state: true,
@@ -90,6 +97,10 @@ fn apply_pump_update(
         state.updated_slot = update.slot;
         return Ok(RegistryUpdateReport {
             applied: true,
+            applied_kind: Some(PoolKind::Pump),
+            applied_mint: Some(mint),
+            applied_pool: Some(applied_pool),
+            applied_base_liquidity_lamports,
             ..RegistryUpdateReport::default()
         });
     }
@@ -128,6 +139,9 @@ fn apply_dlmm_update(
         let mut route = route;
 
         route.last_update_slot = update.slot;
+        let applied_pool = route.lb_pair;
+        let applied_base_liquidity_lamports =
+            route.liquidity.map(|liquidity| liquidity.base_lamports);
         let Some(state) = registry.get_mut(&mint) else {
             return Ok(RegistryUpdateReport {
                 ignored_missing_mint_state: true,
@@ -138,6 +152,10 @@ fn apply_dlmm_update(
         state.updated_slot = update.slot;
         return Ok(RegistryUpdateReport {
             applied: true,
+            applied_kind: Some(PoolKind::MeteoraDlmm),
+            applied_mint: Some(mint),
+            applied_pool: Some(applied_pool),
+            applied_base_liquidity_lamports,
             ..RegistryUpdateReport::default()
         });
     }
@@ -275,6 +293,10 @@ mod tests {
             report,
             RegistryUpdateReport {
                 applied: true,
+                applied_kind: Some(PoolKind::Pump),
+                applied_mint: Some(mint),
+                applied_pool: Some(pool),
+                applied_base_liquidity_lamports: Some(1_000_000),
                 ..RegistryUpdateReport::default()
             }
         );

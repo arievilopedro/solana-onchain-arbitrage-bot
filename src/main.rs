@@ -149,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("supervisor bootstrap complete; starting configured stream workers");
     run_stream_workers(
+        &config,
         rpc_client.clone(),
         &mut registry,
         grpc_plan,
@@ -214,6 +215,7 @@ fn log_stream_plans(
 }
 
 async fn run_stream_workers(
+    config: &AppConfig,
     rpc_client: Arc<RpcClient>,
     registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     grpc_plan: Option<GeyserAccountStreamPlan>,
@@ -226,11 +228,12 @@ async fn run_stream_workers(
         );
     }
 
-    run_geyser_account_worker(rpc_client, registry, grpc_plan).await
+    run_geyser_account_worker(config, rpc_client, registry, grpc_plan).await
 }
 
 #[cfg(feature = "geyser")]
 async fn run_geyser_account_worker(
+    config: &AppConfig,
     rpc_client: Arc<RpcClient>,
     registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     grpc_plan: Option<GeyserAccountStreamPlan>,
@@ -243,6 +246,7 @@ async fn run_geyser_account_worker(
     };
 
     let enricher = StreamRpcEnricher::new(rpc_client);
+    let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
     info!("starting gRPC account worker: url={}", plan.url);
     run_account_stream(plan, |update| {
         let report = apply_pool_account_update(
@@ -254,7 +258,65 @@ async fn run_geyser_account_worker(
         )?;
 
         if report.applied {
-            info!("gRPC account update applied");
+            let route_summary = report
+                .applied_mint
+                .and_then(|mint| registry.get(&mint).map(|state| (mint, state)))
+                .map(|(mint, state)| {
+                    let now_ms = now_ms();
+                    let eligible_pump = state
+                        .eligible_pumps(
+                            config.execution.min_pool_base_liquidity_lamports,
+                            config.execution.max_pool_state_age_ms,
+                            now_ms,
+                        )
+                        .len();
+                    let eligible_dlmm = state
+                        .eligible_dlmms(
+                            config.execution.min_pool_base_liquidity_lamports,
+                            config.execution.max_pool_state_age_ms,
+                            now_ms,
+                        )
+                        .len();
+                    let route_groups = packer
+                        .pack_mint_state(
+                            state,
+                            config.execution.min_pool_base_liquidity_lamports,
+                            config.execution.max_pool_state_age_ms,
+                            now_ms,
+                        )
+                        .len();
+
+                    (mint, eligible_pump, eligible_dlmm, route_groups)
+                });
+
+            info!(
+                "gRPC account update applied: kind={:?} mint={} pool={} base_liquidity_lamports={} route_groups={}",
+                report.applied_kind,
+                report
+                    .applied_mint
+                    .map(|mint| mint.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                report
+                    .applied_pool
+                    .map(|pool| pool.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                report
+                    .applied_base_liquidity_lamports
+                    .map(|liquidity| liquidity.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                route_summary
+                    .map(|(_, _, _, route_groups)| route_groups.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+
+            if let Some((mint, eligible_pump, eligible_dlmm, route_groups)) = route_summary {
+                if route_groups > 0 {
+                    info!(
+                        "route candidate ready: mint={} eligible_pump={} eligible_dlmm={} route_groups={}",
+                        mint, eligible_pump, eligible_dlmm, route_groups
+                    );
+                }
+            }
         } else if report.ignored_not_pool_program {
             info!("gRPC account update ignored: not_pool_program");
         } else if report.ignored_not_pool_account {
@@ -274,6 +336,7 @@ async fn run_geyser_account_worker(
 
 #[cfg(not(feature = "geyser"))]
 async fn run_geyser_account_worker(
+    _config: &AppConfig,
     _rpc_client: Arc<RpcClient>,
     _registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     grpc_plan: Option<GeyserAccountStreamPlan>,
