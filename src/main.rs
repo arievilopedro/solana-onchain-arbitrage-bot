@@ -153,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
     run_stream_workers(
         &config,
         rpc_client.clone(),
+        &wallet,
         &mut registry,
         grpc_plan,
         rabbitstream_plan,
@@ -219,6 +220,7 @@ fn log_stream_plans(
 async fn run_stream_workers(
     config: &AppConfig,
     rpc_client: Arc<RpcClient>,
+    wallet: &solana_sdk::signature::Keypair,
     registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     grpc_plan: Option<GeyserAccountStreamPlan>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
@@ -230,13 +232,14 @@ async fn run_stream_workers(
         );
     }
 
-    run_geyser_account_worker(config, rpc_client, registry, grpc_plan).await
+    run_geyser_account_worker(config, rpc_client, wallet, registry, grpc_plan).await
 }
 
 #[cfg(feature = "geyser")]
 async fn run_geyser_account_worker(
     config: &AppConfig,
     rpc_client: Arc<RpcClient>,
+    wallet: &solana_sdk::signature::Keypair,
     registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     grpc_plan: Option<GeyserAccountStreamPlan>,
 ) -> anyhow::Result<()> {
@@ -289,6 +292,36 @@ async fn run_geyser_account_worker(
                             .map(|liquidity| liquidity.to_string())
                             .unwrap_or_else(|| "unknown".to_string())
                     );
+
+                    if summary.route_groups > 0 {
+                        if !config.execution.compile_dry_run_on_startup {
+                            info!(
+                                "live controlled tx dry-run skipped: mint={} reason=compile_dry_run_disabled",
+                                mint
+                            );
+                        } else if !config.lookup_tables.route_shards.enabled {
+                            info!(
+                                "live controlled tx dry-run skipped: mint={} reason=route_shards_disabled",
+                                mint
+                            );
+                        } else {
+                            let dry_run = dry_run_controlled_mint_routes(
+                                config,
+                                rpc_client.as_ref(),
+                                wallet,
+                                registry,
+                                mint,
+                            )?;
+                            info!(
+                                "live controlled tx dry-run: mint={} routes={} compiled={} missing_route_shard={} compile_failed={}",
+                                mint,
+                                dry_run.routes,
+                                dry_run.compiled,
+                                dry_run.missing_route_shard,
+                                dry_run.compile_failed
+                            );
+                        }
+                    }
                 }
             } else {
                 info!(
@@ -329,6 +362,7 @@ async fn run_geyser_account_worker(
 async fn run_geyser_account_worker(
     _config: &AppConfig,
     _rpc_client: Arc<RpcClient>,
+    _wallet: &solana_sdk::signature::Keypair,
     _registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     grpc_plan: Option<GeyserAccountStreamPlan>,
 ) -> anyhow::Result<()> {
@@ -462,6 +496,69 @@ fn dry_run_controlled_routes(
             } else {
                 summary.compile_failed += 1;
             }
+        }
+    }
+
+    Ok(summary)
+}
+
+fn dry_run_controlled_mint_routes(
+    config: &AppConfig,
+    rpc_client: &RpcClient,
+    wallet: &solana_sdk::signature::Keypair,
+    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    mint: Pubkey,
+) -> anyhow::Result<ControlledTxDryRunSummary> {
+    let Some(mint_state) = registry.get(&mint) else {
+        return Ok(ControlledTxDryRunSummary::default());
+    };
+
+    let protocol_alt = load_lookup_table_account(
+        rpc_client,
+        Pubkey::from_str(&config.lookup_tables.protocol_alt)?,
+    )
+    .context("failed to load protocol ALT")?;
+    let route_resolver =
+        RouteShardLookupResolver::load(&config.lookup_tables.route_shards.state_file)
+            .context("failed to load route shard resolver")?;
+    let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
+    let recent_blockhash = rpc_client.get_latest_blockhash()?;
+    let params = ControlledExecutionParams {
+        compute_unit_limit: config.compute.default_limit,
+        compute_unit_price: config.compute.unit_price,
+        use_flashloan: config.execution.use_flashloan,
+        no_failure_mode: config.execution.no_failure_mode,
+        sender_tip: sender_tip_config(config)?,
+    };
+    let now_ms = now_ms();
+    let mut summary = ControlledTxDryRunSummary::default();
+    let route_groups = packer.pack_mint_state(
+        mint_state,
+        config.execution.min_pool_base_liquidity_lamports,
+        config.execution.max_pool_state_age_ms,
+        now_ms,
+    );
+
+    for route in route_groups {
+        summary.routes += 1;
+        let Some(route_alt) = route_resolver.load_lookup_for_mint(rpc_client, route.mint)? else {
+            summary.missing_route_shard += 1;
+            continue;
+        };
+        let lookup_tables = lookup_tables_for_route(&protocol_alt, &route_alt);
+        if build_controlled_transaction(
+            wallet,
+            &route,
+            mint_state.token_program,
+            recent_blockhash,
+            &lookup_tables,
+            params.clone(),
+        )
+        .is_ok()
+        {
+            summary.compiled += 1;
+        } else {
+            summary.compile_failed += 1;
         }
     }
 
