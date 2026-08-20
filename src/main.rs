@@ -128,7 +128,10 @@ async fn main() -> anyhow::Result<()> {
             config.lookup_tables.route_shards.plan_file
         );
 
-        if config.lookup_tables.route_shards.execute_on_startup {
+        let should_execute_startup_route_shards =
+            config.lookup_tables.route_shards.execute_on_startup || !summary.operations.is_empty();
+
+        if should_execute_startup_route_shards {
             let maintenance = execute_route_shard_plan(
                 &rpc_client,
                 &wallet,
