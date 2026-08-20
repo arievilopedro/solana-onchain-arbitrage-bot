@@ -12,6 +12,8 @@ use solana_onchain_arbitrage_bot::execution::{
     build_controlled_transaction, ControlledExecutionParams,
 };
 use solana_onchain_arbitrage_bot::routes::FixedDlmmRoutePacker;
+use solana_onchain_arbitrage_bot::streams::grpc::GeyserAccountStreamPlan;
+use solana_onchain_arbitrage_bot::streams::rabbitstream::RabbitStreamPlan;
 use solana_onchain_arbitrage_bot::wallet::load_keypair;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
@@ -50,6 +52,8 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::load(config_path)?;
     let wallet = load_keypair(&config.wallet.private_key).context("failed to load wallet")?;
+    let grpc_plan = GeyserAccountStreamPlan::controlled_v1(&config.grpc)?;
+    let rabbitstream_plan = RabbitStreamPlan::controlled_v1(&config.rabbitstream)?;
     info!(
         "config OK: wallet={} mints={} sol_only={} route_shards={} auto_create={} auto_extend={} compile_dry_run={} grpc={} rabbitstream={}",
         wallet.pubkey(),
@@ -62,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         config.grpc.enabled,
         config.rabbitstream.enabled
     );
+    log_stream_plans(grpc_plan.as_ref(), rabbitstream_plan.as_ref());
 
     let allowed_mints = parse_allowed_mints(&config)?;
     let rpc_client = Arc::new(RpcClient::new(config.rpc.http.clone()));
@@ -136,9 +141,30 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!("supervisor bootstrap complete; stream workers will be wired in the next step");
+    info!("supervisor bootstrap complete; stream workers are planned but not started yet");
 
     Ok(())
+}
+
+fn log_stream_plans(
+    grpc_plan: Option<&GeyserAccountStreamPlan>,
+    rabbitstream_plan: Option<&RabbitStreamPlan>,
+) {
+    if let Some(plan) = grpc_plan {
+        info!(
+            "gRPC account stream planned: url={} owner_programs={:?}",
+            plan.url,
+            plan.owner_program_strings()
+        );
+    } else {
+        info!("gRPC account stream disabled");
+    }
+
+    if let Some(plan) = rabbitstream_plan {
+        info!("RabbitStream trigger planned: url={}", plan.url);
+    } else {
+        info!("RabbitStream trigger disabled");
+    }
 }
 
 #[derive(Debug, Default)]
