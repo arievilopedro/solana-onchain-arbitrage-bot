@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, Level};
 
 #[cfg(feature = "geyser")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "geyser")]
 use solana_onchain_arbitrage_bot::streams::{
     apply_pool_account_update, rpc::StreamRpcEnricher, SlotTracker,
@@ -254,8 +254,6 @@ fn run_rabbitstream_trigger_worker(
     allowed_mints: Vec<Pubkey>,
 ) -> anyhow::Result<()> {
     use solana_onchain_arbitrage_bot::streams::rabbitstream::yellowstone::run_axion_trigger_stream;
-    use std::collections::HashSet;
-
     let Some(plan) = rabbitstream_plan else {
         info!("RabbitStream worker not started: rabbitstream.enabled=false");
         return Ok(());
@@ -277,8 +275,19 @@ fn run_rabbitstream_trigger_worker(
 
     tokio::spawn(async move {
         let url = plan.url.clone();
+        let mut seen_signatures = HashSet::<String>::new();
+        let mut seen_signature_order = VecDeque::<String>::new();
         let result =
             run_axion_trigger_stream(plan, axion_program, allowed_mints, move |signal| {
+                if !seen_signatures.insert(signal.signature.clone()) {
+                    return Ok(());
+                }
+                seen_signature_order.push_back(signal.signature.clone());
+                while seen_signature_order.len() > 4096 {
+                    if let Some(old_signature) = seen_signature_order.pop_front() {
+                        seen_signatures.remove(&old_signature);
+                    }
+                }
                 info!(
                     "rabbitstream axion trigger: mint={} slot={} sig={}",
                     signal.mint, signal.slot, signal.signature
@@ -462,19 +471,6 @@ async fn run_geyser_account_worker(
                                 dry_run.missing_route_shard,
                                 dry_run.compile_failed
                             );
-                            if dry_run.compiled > 0 {
-                                if config.execution.send_live_transactions {
-                                    info!(
-                                        "live transaction send blocked: mint={} reason=sender_not_connected_yet compiled={}",
-                                        mint, dry_run.compiled
-                                    );
-                                } else {
-                                    info!(
-                                        "would_send live transaction: mint={} compiled={} sender={} reason=send_live_transactions_false",
-                                        mint, dry_run.compiled, config.sender.primary
-                                    );
-                                }
-                            }
                         }
                     }
                 }
