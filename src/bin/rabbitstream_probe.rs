@@ -202,7 +202,11 @@ fn token_balance_mints(
     meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    for b in meta.pre_token_balances.iter().chain(meta.post_token_balances.iter()) {
+    for b in meta
+        .pre_token_balances
+        .iter()
+        .chain(meta.post_token_balances.iter())
+    {
         if !b.mint.is_empty() && !is_excluded_mint(&b.mint) && !out.contains(&b.mint) {
             out.push(b.mint.clone());
         }
@@ -371,18 +375,17 @@ fn estimate_pump_sell_sol(
     let pool = PumpAmmInfo::load_checked(&pool_account.data)
         .map_err(|e| format!("parse_pump_pool: {}", e))?;
 
-    let (token_vault, sol_vault) = if pool.base_mint == mint_pubkey
-        && pool.quote_mint == wsol_pubkey
-    {
-        (pool.pool_base_token_account, pool.pool_quote_token_account)
-    } else if pool.quote_mint == mint_pubkey && pool.base_mint == wsol_pubkey {
-        (pool.pool_quote_token_account, pool.pool_base_token_account)
-    } else {
-        return Err(format!(
-            "pool_mint_mismatch base={} quote={}",
-            pool.base_mint, pool.quote_mint
-        ));
-    };
+    let (token_vault, sol_vault) =
+        if pool.base_mint == mint_pubkey && pool.quote_mint == wsol_pubkey {
+            (pool.pool_base_token_account, pool.pool_quote_token_account)
+        } else if pool.quote_mint == mint_pubkey && pool.base_mint == wsol_pubkey {
+            (pool.pool_quote_token_account, pool.pool_base_token_account)
+        } else {
+            return Err(format!(
+                "pool_mint_mismatch base={} quote={}",
+                pool.base_mint, pool.quote_mint
+            ));
+        };
 
     let accounts = rpc
         .get_multiple_accounts(&[token_vault, sol_vault])
@@ -564,24 +567,7 @@ fn axiom_swap_rows(
                 .and_then(|pools| pools.pump.first())
                 .cloned();
             let pump_sell_estimate = if side == "sell" {
-                rpc_client
-                    .zip(pump_pool.as_deref())
-                    .map(|(rpc, pump)| match estimate_pump_sell_sol(rpc, pump, &mint, amount_0) {
-                        Ok(sol) => json!({
-                            "ok": true,
-                            "sol": sol,
-                            "usd_at_180": sol * 180.0,
-                        }),
-                        Err(e) => json!({
-                            "ok": false,
-                            "error": e,
-                        }),
-                    })
-            } else {
-                None
-            };
-            let known_pump_sell_estimate = if side == "sell" {
-                rpc_client.zip(known_pump_pool.as_deref()).map(
+                rpc_client.zip(pump_pool.as_deref()).map(
                     |(rpc, pump)| match estimate_pump_sell_sol(rpc, pump, &mint, amount_0) {
                         Ok(sol) => json!({
                             "ok": true,
@@ -594,6 +580,25 @@ fn axiom_swap_rows(
                         }),
                     },
                 )
+            } else {
+                None
+            };
+            let known_pump_sell_estimate = if side == "sell" {
+                rpc_client
+                    .zip(known_pump_pool.as_deref())
+                    .map(
+                        |(rpc, pump)| match estimate_pump_sell_sol(rpc, pump, &mint, amount_0) {
+                            Ok(sol) => json!({
+                                "ok": true,
+                                "sol": sol,
+                                "usd_at_180": sol * 180.0,
+                            }),
+                            Err(e) => json!({
+                                "ok": false,
+                                "error": e,
+                            }),
+                        },
+                    )
             } else {
                 None
             };
@@ -625,10 +630,7 @@ fn axiom_swap_rows(
         .collect()
 }
 
-fn axiom_candidate_rows(
-    pools_by_mint: &HashMap<String, MintPools>,
-    swaps: &[Value],
-) -> Vec<Value> {
+fn axiom_candidate_rows(pools_by_mint: &HashMap<String, MintPools>, swaps: &[Value]) -> Vec<Value> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for swap in swaps {
@@ -763,21 +765,71 @@ async fn main() -> anyhow::Result<()> {
     let _ = tracing::subscriber::set_global_default(subscriber);
 
     let matches = App::new("rabbitstream_probe")
-        .arg(Arg::with_name("geyser-url").long("geyser-url").takes_value(true).required(true))
-        .arg(Arg::with_name("geyser-token").long("geyser-token").takes_value(true).default_value(""))
-        .arg(Arg::with_name("rpc-url").long("rpc-url").takes_value(true).default_value(""))
-        .arg(Arg::with_name("pools-by-mint-file").long("pools-by-mint-file").takes_value(true).required(true))
+        .arg(
+            Arg::with_name("geyser-url")
+                .long("geyser-url")
+                .takes_value(true)
+                .required(true),
+        )
+        .arg(
+            Arg::with_name("geyser-token")
+                .long("geyser-token")
+                .takes_value(true)
+                .default_value(""),
+        )
+        .arg(
+            Arg::with_name("rpc-url")
+                .long("rpc-url")
+                .takes_value(true)
+                .default_value(""),
+        )
+        .arg(
+            Arg::with_name("pools-by-mint-file")
+                .long("pools-by-mint-file")
+                .takes_value(true)
+                .required(true),
+        )
         .arg(Arg::with_name("rabbit-pool-filter").long("rabbit-pool-filter"))
         .arg(Arg::with_name("pump-program-filter").long("pump-program-filter"))
-        .arg(Arg::with_name("max-filter-accounts").long("max-filter-accounts").takes_value(true).default_value("200"))
-        .arg(Arg::with_name("max-dlmm").long("max-dlmm").takes_value(true).default_value("1"))
-        .arg(Arg::with_name("sol-usd").long("sol-usd").takes_value(true).default_value("180"))
-        .arg(Arg::with_name("min-usd").long("min-usd").takes_value(true).default_value("0"))
+        .arg(
+            Arg::with_name("max-filter-accounts")
+                .long("max-filter-accounts")
+                .takes_value(true)
+                .default_value("200"),
+        )
+        .arg(
+            Arg::with_name("max-dlmm")
+                .long("max-dlmm")
+                .takes_value(true)
+                .default_value("1"),
+        )
+        .arg(
+            Arg::with_name("sol-usd")
+                .long("sol-usd")
+                .takes_value(true)
+                .default_value("180"),
+        )
+        .arg(
+            Arg::with_name("min-usd")
+                .long("min-usd")
+                .takes_value(true)
+                .default_value("0"),
+        )
         .arg(Arg::with_name("only-actionable").long("only-actionable"))
         .arg(Arg::with_name("only-axiom-actionable").long("only-axiom-actionable"))
         .arg(Arg::with_name("require-flashx").long("require-flashx"))
-        .arg(Arg::with_name("required-accounts").long("required-accounts").takes_value(true).default_value(""))
-        .arg(Arg::with_name("reject-accounts").long("reject-accounts").takes_value(true).default_value(""))
+        .arg(
+            Arg::with_name("required-accounts")
+                .long("required-accounts")
+                .takes_value(true)
+                .default_value(""),
+        )
+        .arg(
+            Arg::with_name("reject-accounts")
+                .long("reject-accounts")
+                .takes_value(true)
+                .default_value(""),
+        )
         .arg(Arg::with_name("log-keys").long("log-keys"))
         .arg(Arg::with_name("log-programs").long("log-programs"))
         .arg(Arg::with_name("log-instructions").long("log-instructions"))
@@ -791,7 +843,10 @@ async fn main() -> anyhow::Result<()> {
     let max_dlmm = matches.value_of("max-dlmm").unwrap().parse::<usize>()?;
     let sol_usd = matches.value_of("sol-usd").unwrap().parse::<f64>()?;
     let min_usd = matches.value_of("min-usd").unwrap().parse::<f64>()?;
-    let max_filter_accounts = matches.value_of("max-filter-accounts").unwrap().parse::<usize>()?;
+    let max_filter_accounts = matches
+        .value_of("max-filter-accounts")
+        .unwrap()
+        .parse::<usize>()?;
     let rabbit_pool_filter = matches.is_present("rabbit-pool-filter");
     let pump_program_filter = matches.is_present("pump-program-filter");
     let only_actionable = matches.is_present("only-actionable");
@@ -856,7 +911,10 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?;
-        info!("subscribed probe min_usd={} require_flashx={}", min_usd, require_flashx);
+        info!(
+            "subscribed probe min_usd={} require_flashx={}",
+            min_usd, require_flashx
+        );
 
         while let Some(update) = stream.next().await {
             let update = match update {
@@ -923,14 +981,16 @@ async fn main() -> anyhow::Result<()> {
             let mut mints_for_candidates = mints.clone();
             for swap in &pump_swaps {
                 if let Some(mint) = swap.get("mint").and_then(Value::as_str) {
-                    if !is_excluded_mint(mint) && !mints_for_candidates.contains(&mint.to_string()) {
+                    if !is_excluded_mint(mint) && !mints_for_candidates.contains(&mint.to_string())
+                    {
                         mints_for_candidates.push(mint.to_string());
                     }
                 }
             }
             for swap in &axiom_swaps {
                 if let Some(mint) = swap.get("mint").and_then(Value::as_str) {
-                    if !is_excluded_mint(mint) && !mints_for_candidates.contains(&mint.to_string()) {
+                    if !is_excluded_mint(mint) && !mints_for_candidates.contains(&mint.to_string())
+                    {
                         mints_for_candidates.push(mint.to_string());
                     }
                 }
@@ -940,9 +1000,12 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
             if only_axiom_actionable
-                && !axiom_candidates
-                    .iter()
-                    .any(|candidate| candidate.get("actionable").and_then(Value::as_bool).unwrap_or(false))
+                && !axiom_candidates.iter().any(|candidate| {
+                    candidate
+                        .get("actionable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
             {
                 continue;
             }
@@ -986,10 +1049,18 @@ async fn main() -> anyhow::Result<()> {
                     row["candidates"].as_array().map(|a| a.len()).unwrap_or(0)
                 );
                 if log_programs {
-                    info!("PROGRAMS sig={} programs={:?}", row["signature"].as_str().unwrap_or_default(), programs);
+                    info!(
+                        "PROGRAMS sig={} programs={:?}",
+                        row["signature"].as_str().unwrap_or_default(),
+                        programs
+                    );
                 }
                 if log_keys {
-                    info!("KEYS sig={} keys={:?}", row["signature"].as_str().unwrap_or_default(), keys);
+                    info!(
+                        "KEYS sig={} keys={:?}",
+                        row["signature"].as_str().unwrap_or_default(),
+                        keys
+                    );
                 }
                 if log_instructions {
                     info!(

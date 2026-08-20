@@ -59,45 +59,52 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
     )
     .await?;
 
-    info!("Initialized {} mints from markets config", mint_pool_data_map.len());
+    info!(
+        "Initialized {} mints from markets config",
+        mint_pool_data_map.len()
+    );
 
     // Ensure base token ATAs (WSOL, USDC, USD1) exist
     // Route token ATAs are NOT created here - the on-chain program creates them as needed
     ensure_base_atas_exist(&rpc_client, &wallet_kp)?;
 
     // Load lookup tables (global config)
-    let mut lookup_table_addresses = config.routing.markets.lookup_table_accounts.clone().unwrap_or_default();
+    let mut lookup_table_addresses = config
+        .routing
+        .markets
+        .lookup_table_accounts
+        .clone()
+        .unwrap_or_default();
     lookup_table_addresses.push("4sKLJ1Qoudh8PJyqBeuKocYdsZvxTcRShUt9aKqwhgvC".to_string());
 
     let mut lookup_table_accounts_list = vec![];
     for lookup_table_account in &lookup_table_addresses {
         match Pubkey::from_str(lookup_table_account) {
-            Ok(pubkey) => {
-                match rpc_client.get_account(&pubkey) {
-                    Ok(account) => {
-                        match AddressLookupTable::deserialize(&account.data) {
-                            Ok(lookup_table) => {
-                                let lookup_table_account = AddressLookupTableAccount {
-                                    key: pubkey,
-                                    addresses: lookup_table.addresses.into_owned(),
-                                };
-                                lookup_table_accounts_list.push(lookup_table_account);
-                                info!("   Successfully loaded lookup table: {}", pubkey);
-                            }
-                            Err(e) => {
-                                error!("   Failed to deserialize lookup table {}: {}", pubkey, e);
-                                continue;
-                            }
-                        }
+            Ok(pubkey) => match rpc_client.get_account(&pubkey) {
+                Ok(account) => match AddressLookupTable::deserialize(&account.data) {
+                    Ok(lookup_table) => {
+                        let lookup_table_account = AddressLookupTableAccount {
+                            key: pubkey,
+                            addresses: lookup_table.addresses.into_owned(),
+                        };
+                        lookup_table_accounts_list.push(lookup_table_account);
+                        info!("   Successfully loaded lookup table: {}", pubkey);
                     }
                     Err(e) => {
-                        error!("   Failed to fetch lookup table account {}: {}", pubkey, e);
+                        error!("   Failed to deserialize lookup table {}: {}", pubkey, e);
                         continue;
                     }
+                },
+                Err(e) => {
+                    error!("   Failed to fetch lookup table account {}: {}", pubkey, e);
+                    continue;
                 }
-            }
+            },
             Err(e) => {
-                error!("   Invalid lookup table pubkey string {}: {}", lookup_table_account, e);
+                error!(
+                    "   Invalid lookup table pubkey string {}: {}",
+                    lookup_table_account, e
+                );
                 continue;
             }
         }
@@ -106,7 +113,10 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
     if lookup_table_accounts_list.is_empty() {
         warn!("   Warning: No valid lookup tables were loaded");
     } else {
-        info!("   Loaded {} lookup tables successfully", lookup_table_accounts_list.len());
+        info!(
+            "   Loaded {} lookup tables successfully",
+            lookup_table_accounts_list.len()
+        );
     }
 
     let lookup_table_accounts_list = Arc::new(lookup_table_accounts_list);

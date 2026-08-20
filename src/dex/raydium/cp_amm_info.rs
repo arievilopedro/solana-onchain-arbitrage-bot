@@ -1,5 +1,5 @@
-use solana_program::pubkey::Pubkey;
 use anyhow::Result;
+use solana_program::pubkey::Pubkey;
 
 const AMM_CONFIG_OFFSET: usize = 8; // amm_config
 const POOL_CREATOR_OFFSET: usize = 40; // pool_creator
@@ -27,14 +27,15 @@ impl RaydiumCpAmmInfo {
         if data.len() < OBSERVATION_KEY_OFFSET + 32 {
             return Err(anyhow::anyhow!("Invalid data length for RaydiumCpAmmInfo"));
         }
-        
+
         let token_0_vault = Pubkey::new(&data[TOKEN_0_VAULT_OFFSET..TOKEN_0_VAULT_OFFSET + 32]);
         let token_1_vault = Pubkey::new(&data[TOKEN_1_VAULT_OFFSET..TOKEN_1_VAULT_OFFSET + 32]);
         let token_0_mint = Pubkey::new(&data[TOKEN_0_MINT_OFFSET..TOKEN_0_MINT_OFFSET + 32]);
         let token_1_mint = Pubkey::new(&data[TOKEN_1_MINT_OFFSET..TOKEN_1_MINT_OFFSET + 32]);
         let amm_config = Pubkey::new(&data[AMM_CONFIG_OFFSET..AMM_CONFIG_OFFSET + 32]);
-        let observation_key = Pubkey::new(&data[OBSERVATION_KEY_OFFSET..OBSERVATION_KEY_OFFSET + 32]);
-        
+        let observation_key =
+            Pubkey::new(&data[OBSERVATION_KEY_OFFSET..OBSERVATION_KEY_OFFSET + 32]);
+
         Ok(Self {
             token_0_mint,
             token_1_mint,

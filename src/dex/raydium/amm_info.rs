@@ -1,5 +1,5 @@
-use solana_program::pubkey::Pubkey;
 use anyhow::Result;
+use solana_program::pubkey::Pubkey;
 
 const COIN_VAULT_OFFSET: usize = 336; // coinVault/tokenVaultA
 const PC_VAULT_OFFSET: usize = 368; // pcVault/tokenVaultB
@@ -19,12 +19,12 @@ impl RaydiumAmmInfo {
         if data.len() < PC_MINT_OFFSET + 32 {
             return Err(anyhow::anyhow!("Invalid data length for RaydiumAmmInfo"));
         }
-        
+
         let coin_vault = Pubkey::new(&data[COIN_VAULT_OFFSET..COIN_VAULT_OFFSET + 32]);
         let pc_vault = Pubkey::new(&data[PC_VAULT_OFFSET..PC_VAULT_OFFSET + 32]);
         let coin_mint = Pubkey::new(&data[COIN_MINT_OFFSET..COIN_MINT_OFFSET + 32]);
         let pc_mint = Pubkey::new(&data[PC_MINT_OFFSET..PC_MINT_OFFSET + 32]);
-        
+
         Ok(Self {
             coin_mint,
             pc_mint,

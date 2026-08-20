@@ -208,10 +208,11 @@ fn extract_token_mint(
             Ok(Some(token_mint))
         }
         MarketPoolKind::Heaven => {
-            let info = HeavenPoolState::parse(data).ok_or_else(|| {
-                anyhow::anyhow!("Failed to parse Heaven pool")
-            })?;
-            let usdc_mint: Pubkey = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().unwrap();
+            let info = HeavenPoolState::parse(data)
+                .ok_or_else(|| anyhow::anyhow!("Failed to parse Heaven pool"))?;
+            let usdc_mint: Pubkey = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+                .parse()
+                .unwrap();
             let token_mint = if info.mint_a == sol || info.mint_a == usdc_mint {
                 info.mint_b
             } else if info.mint_b == sol || info.mint_b == usdc_mint {
@@ -270,19 +271,20 @@ pub async fn initialize_pools_from_markets(
     wallet_account: &Pubkey,
     rpc_client: Arc<RpcClient>,
 ) -> anyhow::Result<HashMap<Pubkey, MintPoolData>> {
-    info!("Initializing pools from {} markets", markets_config.markets.len());
+    info!(
+        "Initializing pools from {} markets",
+        markets_config.markets.len()
+    );
 
     // Parse all market addresses
     let market_pubkeys: Vec<Pubkey> = markets_config
         .markets
         .iter()
-        .filter_map(|s| {
-            match s.parse::<Pubkey>() {
-                Ok(pk) => Some(pk),
-                Err(e) => {
-                    error!("Invalid market address {}: {}", s, e);
-                    None
-                }
+        .filter_map(|s| match s.parse::<Pubkey>() {
+            Ok(pk) => Some(pk),
+            Err(e) => {
+                error!("Invalid market address {}: {}", s, e);
+                None
             }
         })
         .collect();
@@ -327,7 +329,10 @@ pub async fn initialize_pools_from_markets(
             let token_mint = match extract_token_mint(kind, &account.data, &pool_pubkey) {
                 Ok(Some(mint)) => mint,
                 Ok(None) => {
-                    warn!("Pool {} does not have SOL as one side, skipping", pool_pubkey);
+                    warn!(
+                        "Pool {} does not have SOL as one side, skipping",
+                        pool_pubkey
+                    );
                     continue;
                 }
                 Err(e) => {
@@ -371,20 +376,76 @@ pub async fn initialize_pools_from_markets(
         let pool_data = initialize_pool_data(
             mint,
             wallet_account,
-            if builder.raydium_pools.is_empty() { None } else { Some(&builder.raydium_pools) },
-            if builder.raydium_cp_pools.is_empty() { None } else { Some(&builder.raydium_cp_pools) },
-            if builder.pump_pools.is_empty() { None } else { Some(&builder.pump_pools) },
-            if builder.dlmm_pools.is_empty() { None } else { Some(&builder.dlmm_pools) },
-            if builder.whirlpool_pools.is_empty() { None } else { Some(&builder.whirlpool_pools) },
-            if builder.raydium_clmm_pools.is_empty() { None } else { Some(&builder.raydium_clmm_pools) },
-            if builder.damm_pools.is_empty() { None } else { Some(&builder.damm_pools) },
-            if builder.damm_v2_pools.is_empty() { None } else { Some(&builder.damm_v2_pools) },
-            if builder.vertigo_pools.is_empty() { None } else { Some(&builder.vertigo_pools) },
-            if builder.heaven_pools.is_empty() { None } else { Some(&builder.heaven_pools) },
-            if builder.futarchy_pools.is_empty() { None } else { Some(&builder.futarchy_pools) },
-            if builder.humidifi_pools.is_empty() { None } else { Some(&builder.humidifi_pools) },
-            if builder.pancakeswap_pools.is_empty() { None } else { Some(&builder.pancakeswap_pools) },
-            if builder.byreal_pools.is_empty() { None } else { Some(&builder.byreal_pools) },
+            if builder.raydium_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.raydium_pools)
+            },
+            if builder.raydium_cp_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.raydium_cp_pools)
+            },
+            if builder.pump_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.pump_pools)
+            },
+            if builder.dlmm_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.dlmm_pools)
+            },
+            if builder.whirlpool_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.whirlpool_pools)
+            },
+            if builder.raydium_clmm_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.raydium_clmm_pools)
+            },
+            if builder.damm_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.damm_pools)
+            },
+            if builder.damm_v2_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.damm_v2_pools)
+            },
+            if builder.vertigo_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.vertigo_pools)
+            },
+            if builder.heaven_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.heaven_pools)
+            },
+            if builder.futarchy_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.futarchy_pools)
+            },
+            if builder.humidifi_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.humidifi_pools)
+            },
+            if builder.pancakeswap_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.pancakeswap_pools)
+            },
+            if builder.byreal_pools.is_empty() {
+                None
+            } else {
+                Some(&builder.byreal_pools)
+            },
             rpc_client.clone(),
         )
         .await?;
@@ -420,7 +481,9 @@ pub async fn initialize_pool_data(
     let mint_account = rpc_client.get_account(&mint)?;
 
     // Determine token program based on mint account owner
-    let token_2022_program_id: Pubkey = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb".parse().unwrap();
+    let token_2022_program_id: Pubkey = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+        .parse()
+        .unwrap();
     let token_program = if mint_account.owner == spl_token::ID {
         spl_token::ID
     } else if mint_account.owner == token_2022_program_id {
@@ -434,7 +497,11 @@ pub async fn initialize_pool_data(
     // Determine memo_program based on whether token uses Token 2022
     // Token 2022 pools require the memo program in swap accounts
     let memo_program_id: Option<Pubkey> = if token_program != spl_token::ID {
-        Some("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr".parse().unwrap())
+        Some(
+            "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+                .parse()
+                .unwrap(),
+        )
     } else {
         None
     };
@@ -478,26 +545,25 @@ pub async fn initialize_pool_data(
                                 ));
                             };
 
-                            let (fee_wallet, fee_token_wallet) =
-                                if amm_info.is_mayhem_mode {
-                                    let wallet = pump_mayhem_fee_wallet();
-                                    (
-                                        wallet,
-                                        spl_associated_token_account::get_associated_token_address(
-                                            &wallet,
-                                            &amm_info.quote_mint,
-                                        ),
-                                    )
-                                } else {
-                                    let wallet = pump_fee_wallet();
-                                    (
-                                        wallet,
-                                        spl_associated_token_account::get_associated_token_address(
-                                            &wallet,
-                                            &amm_info.quote_mint,
-                                        ),
-                                    )
-                                };
+                            let (fee_wallet, fee_token_wallet) = if amm_info.is_mayhem_mode {
+                                let wallet = pump_mayhem_fee_wallet();
+                                (
+                                    wallet,
+                                    spl_associated_token_account::get_associated_token_address(
+                                        &wallet,
+                                        &amm_info.quote_mint,
+                                    ),
+                                )
+                            } else {
+                                let wallet = pump_fee_wallet();
+                                (
+                                    wallet,
+                                    spl_associated_token_account::get_associated_token_address(
+                                        &wallet,
+                                        &amm_info.quote_mint,
+                                    ),
+                                )
+                            };
 
                             let coin_creator_vault_ata =
                                 spl_associated_token_account::get_associated_token_address(
@@ -533,10 +599,7 @@ pub async fn initialize_pool_data(
                             info!("    Sol vault: {}", sol_vault);
                             info!("    Fee wallet: {}", fee_wallet);
                             info!("    Fee token wallet: {}", fee_token_wallet);
-                            info!(
-                                "    Coin creator vault ata: {}",
-                                coin_creator_vault_ata
-                            );
+                            info!("    Coin creator vault ata: {}", coin_creator_vault_ata);
                             info!(
                                 "    Coin creator vault authority: {}",
                                 amm_info.coin_creator_vault_authority
@@ -556,10 +619,7 @@ pub async fn initialize_pool_data(
                     }
                 }
                 Err(e) => {
-                    error!(
-                        "Error fetching Pump pool account {}: {:?}",
-                        pool_pubkey, e
-                    );
+                    error!("Error fetching Pump pool account {}: {:?}", pool_pubkey, e);
                     return Err(anyhow::anyhow!("Error fetching Pump pool account"));
                 }
             }
@@ -596,10 +656,7 @@ pub async fn initialize_pool_data(
                             }
 
                             if amm_info.coin_mint != sol_mint() && amm_info.pc_mint != sol_mint() {
-                                error!(
-                                    "SOL is not present in Raydium pool {}",
-                                    pool_pubkey
-                                );
+                                error!("SOL is not present in Raydium pool {}", pool_pubkey);
                                 return Err(anyhow::anyhow!(
                                     "SOL is not present in Raydium pool: {}",
                                     pool_pubkey
@@ -687,10 +744,7 @@ pub async fn initialize_pool_data(
                             } else if sol_mint() == amm_info.token_1_mint {
                                 (amm_info.token_1_vault, amm_info.token_0_vault)
                             } else {
-                                error!(
-                                    "SOL is not present in Raydium CP pool {}",
-                                    pool_pubkey
-                                );
+                                error!("SOL is not present in Raydium CP pool {}", pool_pubkey);
                                 return Err(anyhow::anyhow!(
                                     "SOL is not present in Raydium CP pool: {}",
                                     pool_pubkey
@@ -717,10 +771,7 @@ pub async fn initialize_pool_data(
                             info!("    Token vault: {}", token_vault);
                             info!("    Sol vault: {}", sol_vault);
                             info!("    AMM Config: {}", amm_info.amm_config);
-                            info!(
-                                "    Observation Key: {}\n",
-                                amm_info.observation_key
-                            );
+                            info!("    Observation Key: {}\n", amm_info.observation_key);
                         }
                         Err(e) => {
                             error!(
@@ -761,8 +812,7 @@ pub async fn initialize_pool_data(
                             let (token_vault, sol_vault) =
                                 amm_info.get_token_and_sol_vaults(&pool_data.mint, &sol);
 
-                            let bin_arrays = match amm_info.calculate_bin_arrays(&pool_pubkey)
-                            {
+                            let bin_arrays = match amm_info.calculate_bin_arrays(&pool_pubkey) {
                                 Ok(arrays) => arrays,
                                 Err(e) => {
                                     error!(
@@ -832,10 +882,7 @@ pub async fn initialize_pool_data(
                     }
                 }
                 Err(e) => {
-                    error!(
-                        "Error fetching DLMM pool account {}: {:?}",
-                        pool_pubkey, e
-                    );
+                    error!("Error fetching DLMM pool account {}: {:?}", pool_pubkey, e);
                     return Err(anyhow::anyhow!("Error fetching DLMM pool account"));
                 }
             }
@@ -877,10 +924,7 @@ pub async fn initialize_pool_data(
                             } else if sol == whirlpool.token_mint_b {
                                 (whirlpool.token_vault_b, whirlpool.token_vault_a)
                             } else {
-                                error!(
-                                    "SOL is not present in Whirlpool pool {}",
-                                    pool_pubkey
-                                );
+                                error!("SOL is not present in Whirlpool pool {}", pool_pubkey);
                                 return Err(anyhow::anyhow!(
                                     "SOL is not present in Whirlpool pool: {}",
                                     pool_pubkey
@@ -981,8 +1025,7 @@ pub async fn initialize_pool_data(
                             }
 
                             let sol = sol_mint();
-                            let (token_vault, sol_vault) = if sol == raydium_clmm.token_mint_0
-                            {
+                            let (token_vault, sol_vault) = if sol == raydium_clmm.token_mint_0 {
                                 (raydium_clmm.token_vault_1, raydium_clmm.token_vault_0)
                             } else if sol == raydium_clmm.token_mint_1 {
                                 (raydium_clmm.token_vault_0, raydium_clmm.token_vault_1)
@@ -992,10 +1035,7 @@ pub async fn initialize_pool_data(
                             };
 
                             let bitmap_extension = Pubkey::find_program_address(
-                                &[
-                                    POOL_TICK_ARRAY_BITMAP_SEED.as_bytes(),
-                                    pool_pubkey.as_ref(),
-                                ],
+                                &[POOL_TICK_ARRAY_BITMAP_SEED.as_bytes(), pool_pubkey.as_ref()],
                                 &raydium_clmm_prog_id,
                             )
                             .0;
@@ -1039,21 +1079,12 @@ pub async fn initialize_pool_data(
                             );
 
                             info!("Raydium CLMM pool added: {}", pool_pubkey);
-                            info!(
-                                "    Token mint 0: {}",
-                                raydium_clmm.token_mint_0
-                            );
-                            info!(
-                                "    Token mint 1: {}",
-                                raydium_clmm.token_mint_1
-                            );
+                            info!("    Token mint 0: {}", raydium_clmm.token_mint_0);
+                            info!("    Token mint 1: {}", raydium_clmm.token_mint_1);
                             info!("    Token vault: {}", token_vault);
                             info!("    Sol vault: {}", sol_vault);
                             info!("    AMM config: {}", raydium_clmm.amm_config);
-                            info!(
-                                "    Observation key: {}",
-                                raydium_clmm.observation_key
-                            );
+                            info!("    Observation key: {}", raydium_clmm.observation_key);
 
                             for (i, array) in tick_arrays.iter().enumerate() {
                                 info!("    Tick Array {}: {}", i, array);
@@ -1111,10 +1142,7 @@ pub async fn initialize_pool_data(
 
                             let sol = sol_mint();
                             if pool.token_a_mint != sol && pool.token_b_mint != sol {
-                                error!(
-                                    "SOL is not present in Meteora DAMM pool {}",
-                                    pool_pubkey
-                                );
+                                error!("SOL is not present in Meteora DAMM pool {}", pool_pubkey);
                                 return Err(anyhow::anyhow!(
                                     "SOL is not present in Meteora DAMM pool: {}",
                                     pool_pubkey
@@ -1221,22 +1249,10 @@ pub async fn initialize_pool_data(
                     match MeteoraDAmmV2Info::load_checked(&account.data) {
                         Ok(meteora_damm_v2_info) => {
                             info!("Meteora DAMM V2 pool added: {}", pool_pubkey);
-                            info!(
-                                "    Base mint: {}",
-                                meteora_damm_v2_info.base_mint
-                            );
-                            info!(
-                                "    Quote mint: {}",
-                                meteora_damm_v2_info.quote_mint
-                            );
-                            info!(
-                                "    Base vault: {}",
-                                meteora_damm_v2_info.base_vault
-                            );
-                            info!(
-                                "    Quote vault: {}",
-                                meteora_damm_v2_info.quote_vault
-                            );
+                            info!("    Base mint: {}", meteora_damm_v2_info.base_mint);
+                            info!("    Quote mint: {}", meteora_damm_v2_info.quote_mint);
+                            info!("    Base vault: {}", meteora_damm_v2_info.base_vault);
+                            info!("    Quote vault: {}", meteora_damm_v2_info.quote_vault);
                             info!("");
                             let sol = sol_mint();
                             let token_x_vault = if sol == meteora_damm_v2_info.base_mint {
@@ -1251,10 +1267,17 @@ pub async fn initialize_pool_data(
                                 meteora_damm_v2_info.quote_vault
                             };
                             // Determine token_mint and base_mint
-                            let (token_mint, base_mint) = if mint == meteora_damm_v2_info.base_mint {
-                                (meteora_damm_v2_info.base_mint, meteora_damm_v2_info.quote_mint)
+                            let (token_mint, base_mint) = if mint == meteora_damm_v2_info.base_mint
+                            {
+                                (
+                                    meteora_damm_v2_info.base_mint,
+                                    meteora_damm_v2_info.quote_mint,
+                                )
                             } else {
-                                (meteora_damm_v2_info.quote_mint, meteora_damm_v2_info.base_mint)
+                                (
+                                    meteora_damm_v2_info.quote_mint,
+                                    meteora_damm_v2_info.base_mint,
+                                )
                             };
 
                             pool_data.add_meteora_damm_v2_pool(
@@ -1388,12 +1411,11 @@ pub async fn initialize_pool_data(
                             info!("    Reserve B: {}", heaven_info.reserve_b);
 
                             // Determine which vault corresponds to token and base
-                            let (token_x_vault, token_base_vault) =
-                                if mint == heaven_info.mint_a {
-                                    (heaven_info.vault_a, heaven_info.vault_b)
-                                } else {
-                                    (heaven_info.vault_b, heaven_info.vault_a)
-                                };
+                            let (token_x_vault, token_base_vault) = if mint == heaven_info.mint_a {
+                                (heaven_info.vault_a, heaven_info.vault_b)
+                            } else {
+                                (heaven_info.vault_b, heaven_info.vault_a)
+                            };
 
                             // Determine token_mint and base_mint
                             let (token_mint, base_mint) = if mint == heaven_info.mint_a {
@@ -1403,7 +1425,9 @@ pub async fn initialize_pool_data(
                             };
 
                             // Validate that the base mint is either SOL or USDC
-                            let usdc_mint: Pubkey = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().unwrap();
+                            let usdc_mint: Pubkey = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+                                .parse()
+                                .unwrap();
                             if base_mint != sol_mint() && base_mint != usdc_mint {
                                 error!(
                                     "Invalid Heaven pool: Expected SOL or USDC as base mint, but found {}",
@@ -1427,10 +1451,7 @@ pub async fn initialize_pool_data(
                             info!("    Initialized Heaven pool: {}\n", pool_pubkey);
                         }
                         None => {
-                            error!(
-                                "Error parsing Heaven pool data from pool {}",
-                                pool_pubkey
-                            );
+                            error!("Error parsing Heaven pool data from pool {}", pool_pubkey);
                             return Err(anyhow::anyhow!("Failed to parse Heaven pool data"));
                         }
                     }
@@ -1541,7 +1562,8 @@ pub async fn initialize_pool_data(
                             info!("    Quote vault: {}", humidifi_info.quote_vault);
 
                             let sol = sol_mint();
-                            let (token_x_vault, token_sol_vault) = if sol == humidifi_info.base_mint {
+                            let (token_x_vault, token_sol_vault) = if sol == humidifi_info.base_mint
+                            {
                                 (humidifi_info.quote_vault, humidifi_info.base_vault)
                             } else {
                                 (humidifi_info.base_vault, humidifi_info.quote_vault)
@@ -1620,10 +1642,7 @@ pub async fn initialize_pool_data(
                             };
 
                             let bitmap_extension = Pubkey::find_program_address(
-                                &[
-                                    POOL_TICK_ARRAY_BITMAP_SEED.as_bytes(),
-                                    pool_pubkey.as_ref(),
-                                ],
+                                &[POOL_TICK_ARRAY_BITMAP_SEED.as_bytes(), pool_pubkey.as_ref()],
                                 &pancakeswap_prog_id,
                             )
                             .0;
@@ -1735,10 +1754,7 @@ pub async fn initialize_pool_data(
                             };
 
                             let bitmap_extension = Pubkey::find_program_address(
-                                &[
-                                    POOL_TICK_ARRAY_BITMAP_SEED.as_bytes(),
-                                    pool_pubkey.as_ref(),
-                                ],
+                                &[POOL_TICK_ARRAY_BITMAP_SEED.as_bytes(), pool_pubkey.as_ref()],
                                 &byreal_prog_id,
                             )
                             .0;

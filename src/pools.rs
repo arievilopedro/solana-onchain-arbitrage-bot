@@ -359,10 +359,7 @@ impl MintPoolData {
         base_mint: Pubkey,
     ) {
         let bitmap_extension = Pubkey::find_program_address(
-            &[
-                POOL_TICK_ARRAY_BITMAP_SEED.as_bytes(),
-                pool.as_ref(),
-            ],
+            &[POOL_TICK_ARRAY_BITMAP_SEED.as_bytes(), pool.as_ref()],
             &raydium_clmm_program_id(),
         )
         .0;

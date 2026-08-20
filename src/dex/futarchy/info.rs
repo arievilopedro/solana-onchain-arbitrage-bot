@@ -37,7 +37,10 @@ impl FutarchyInfo {
 
 fn read_pubkey(data: &[u8], offset: usize) -> Result<Pubkey> {
     if data.len() < offset + 32 {
-        return Err(anyhow::anyhow!("Data too short to read pubkey at offset {}", offset));
+        return Err(anyhow::anyhow!(
+            "Data too short to read pubkey at offset {}",
+            offset
+        ));
     }
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&data[offset..offset + 32]);

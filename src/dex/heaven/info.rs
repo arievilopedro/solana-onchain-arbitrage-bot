@@ -32,7 +32,8 @@ impl HeavenPoolState {
         const OFFSET_TOKEN_A: usize = OFFSET_VAULTS + 128;
         const OFFSET_TOKEN_B: usize = OFFSET_TOKEN_A + 65;
 
-        let reserve_a = u64::from_le_bytes(data[OFFSET_RESERVE..OFFSET_RESERVE + 8].try_into().ok()?);
+        let reserve_a =
+            u64::from_le_bytes(data[OFFSET_RESERVE..OFFSET_RESERVE + 8].try_into().ok()?);
         let reserve_b = u64::from_le_bytes(
             data[OFFSET_RESERVE + 8..OFFSET_RESERVE + 16]
                 .try_into()

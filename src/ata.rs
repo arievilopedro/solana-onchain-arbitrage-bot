@@ -1,16 +1,12 @@
-use crate::constants::{sol_mint, usdc_mint, usd1_mint};
+use crate::constants::{sol_mint, usd1_mint, usdc_mint};
 use anyhow::{Context, Result};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
-    compute_budget::ComputeBudgetInstruction,
-    pubkey::Pubkey,
-    signature::Keypair,
-    signer::Signer,
+    compute_budget::ComputeBudgetInstruction, pubkey::Pubkey, signature::Keypair, signer::Signer,
     transaction::Transaction,
 };
 use spl_associated_token_account::{
-    get_associated_token_address,
-    instruction::create_associated_token_account_idempotent,
+    get_associated_token_address, instruction::create_associated_token_account_idempotent,
 };
 use tracing::info;
 

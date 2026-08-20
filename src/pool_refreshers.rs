@@ -46,32 +46,28 @@ pub fn refresh_dlmm_pools(
 ) -> Result<()> {
     for pool in pool_data.dlmm_pairs.iter_mut() {
         match rpc_client.get_account(&pool.pair) {
-            Ok(account) => {
-                match DlmmInfo::load_checked(&account.data) {
-                    Ok(dlmm_info) => {
-                        match dlmm_info.calculate_bin_arrays(&pool.pair) {
-                            Ok(new_bin_arrays) => {
-                                pool.bin_arrays = new_bin_arrays;
-                                if !suppress_logs {
-                                    info!(
-                                        "DLMM pool {} bin arrays refreshed, active_id: {}",
-                                        pool.pair, dlmm_info.active_id
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to calculate bin arrays for DLMM pool {}: {}",
-                                    pool.pair, e
-                                );
-                            }
+            Ok(account) => match DlmmInfo::load_checked(&account.data) {
+                Ok(dlmm_info) => match dlmm_info.calculate_bin_arrays(&pool.pair) {
+                    Ok(new_bin_arrays) => {
+                        pool.bin_arrays = new_bin_arrays;
+                        if !suppress_logs {
+                            info!(
+                                "DLMM pool {} bin arrays refreshed, active_id: {}",
+                                pool.pair, dlmm_info.active_id
+                            );
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to parse DLMM pool {}: {}", pool.pair, e);
+                        warn!(
+                            "Failed to calculate bin arrays for DLMM pool {}: {}",
+                            pool.pair, e
+                        );
                     }
+                },
+                Err(e) => {
+                    warn!("Failed to parse DLMM pool {}: {}", pool.pair, e);
                 }
-            }
+            },
             Err(e) => {
                 warn!("Failed to fetch DLMM pool {}: {}", pool.pair, e);
             }
@@ -89,27 +85,22 @@ pub fn refresh_whirlpool_pools(
 ) -> Result<()> {
     for pool in pool_data.whirlpool_pools.iter_mut() {
         match rpc_client.get_account(&pool.pool) {
-            Ok(account) => {
-                match Whirlpool::try_deserialize(&account.data) {
-                    Ok(whirlpool) => {
-                        let tick_array_metas = update_tick_array_accounts_for_onchain(
-                            &whirlpool,
-                            &pool.pool,
-                            program_id,
+            Ok(account) => match Whirlpool::try_deserialize(&account.data) {
+                Ok(whirlpool) => {
+                    let tick_array_metas =
+                        update_tick_array_accounts_for_onchain(&whirlpool, &pool.pool, program_id);
+                    pool.tick_arrays = tick_array_metas.iter().map(|m| m.pubkey).collect();
+                    if !suppress_logs {
+                        info!(
+                            "Whirlpool {} tick arrays refreshed at tick {}",
+                            pool.pool, whirlpool.tick_current_index
                         );
-                        pool.tick_arrays = tick_array_metas.iter().map(|m| m.pubkey).collect();
-                        if !suppress_logs {
-                            info!(
-                                "Whirlpool {} tick arrays refreshed at tick {}",
-                                pool.pool, whirlpool.tick_current_index
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse Whirlpool {}: {}", pool.pool, e);
                     }
                 }
-            }
+                Err(e) => {
+                    warn!("Failed to parse Whirlpool {}: {}", pool.pool, e);
+                }
+            },
             Err(e) => {
                 warn!("Failed to fetch Whirlpool pool {}: {}", pool.pool, e);
             }

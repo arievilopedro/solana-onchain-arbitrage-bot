@@ -9,8 +9,6 @@ pub fn raydium_authority() -> Pubkey {
     Pubkey::from_str("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1").unwrap()
 }
 
-
-
 pub fn raydium_cp_program_id() -> Pubkey {
     Pubkey::from_str("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C").unwrap()
 }

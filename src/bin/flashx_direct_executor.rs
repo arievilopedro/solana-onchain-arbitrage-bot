@@ -123,6 +123,7 @@ struct ExecutorState {
     pump_reserves_mtime: Option<SystemTime>,
     pump_reserves_max_age_ms: u128,
     max_dlmm: usize,
+    max_dlmm_per_tx: usize,
     pools_by_mint: HashMap<String, MintPools>,
     pump_reserves_by_pool: HashMap<String, PumpReserve>,
     route_cache: HashMap<String, RouteState>,
@@ -131,6 +132,18 @@ struct ExecutorState {
     last_signal_by_mint_slot: HashMap<String, Instant>,
     last_pool_touch_by_mint: HashMap<String, Instant>,
     pool_refresher: PoolDataRefresher,
+}
+
+fn route_cache_key(mint: &str, pump: &str, dlmms: &[String]) -> String {
+    format!("{}|{}|{}", mint, pump, dlmms.join(","))
+}
+
+fn fixed_dlmm_route_groups(dlmms: &[String], max_dlmm_per_tx: usize) -> Vec<Vec<String>> {
+    let chunk_size = max_dlmm_per_tx.max(1);
+    dlmms
+        .chunks(chunk_size)
+        .map(|chunk| chunk.to_vec())
+        .collect()
 }
 
 fn load_keypair(private_key: &str) -> anyhow::Result<Keypair> {
@@ -286,7 +299,11 @@ fn load_pump_reserves(path: &str) -> anyhow::Result<HashMap<String, PumpReserve>
             .get("updated_ms")
             .and_then(Value::as_str)
             .and_then(|s| s.parse::<u128>().ok())
-            .or_else(|| rec.get("updated_ms").and_then(Value::as_u64).map(u128::from))
+            .or_else(|| {
+                rec.get("updated_ms")
+                    .and_then(Value::as_u64)
+                    .map(u128::from)
+            })
             .unwrap_or(0);
         if token_reserve > 0 && sol_reserve > 0 && updated_ms > 0 {
             out.insert(
@@ -555,7 +572,11 @@ fn token_balance_mints(
     meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    for b in meta.pre_token_balances.iter().chain(meta.post_token_balances.iter()) {
+    for b in meta
+        .pre_token_balances
+        .iter()
+        .chain(meta.post_token_balances.iter())
+    {
         if !b.mint.is_empty() && !is_excluded_mint(&b.mint) && !out.contains(&b.mint) {
             out.push(b.mint.clone());
         }
@@ -858,11 +879,7 @@ fn signal_candidates_from_keys(
     let keyset = keys.iter().cloned().collect::<HashSet<_>>();
     let mut out = Vec::new();
     for (mint, pools) in pools_by_mint {
-        let pump = pools
-            .pump
-            .iter()
-            .find(|p| keyset.contains(*p))
-            .cloned();
+        let pump = pools.pump.iter().find(|p| keyset.contains(*p)).cloned();
         let Some(pump) = pump else {
             continue;
         };
@@ -877,7 +894,15 @@ fn signal_candidates_from_keys(
 fn signal_candidates_from_axiom_swaps(
     pools_by_mint: &HashMap<String, MintPools>,
     swaps: &[AxiomSwapSignal],
-) -> Vec<(String, String, Vec<String>, f64, &'static str, f64, &'static str)> {
+) -> Vec<(
+    String,
+    String,
+    Vec<String>,
+    f64,
+    &'static str,
+    f64,
+    &'static str,
+)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for swap in swaps {
@@ -1003,13 +1028,13 @@ fn build_versioned_transaction(
 ) -> anyhow::Result<VersionedTransaction> {
     let enable_flashloan = config.flashloan.as_ref().map_or(false, |k| k.enabled);
     let compute_unit_limit = config.bot.compute_unit_limit;
-    let mut instructions = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(
-            compute_unit_limit + rand::random::<u32>() % 1000,
-        ),
-    ];
+    let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(
+        compute_unit_limit + rand::random::<u32>() % 1000,
+    )];
     let compute_unit_price = config.spam.as_ref().map_or(1000, |s| s.compute_unit_price);
-    instructions.push(ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price));
+    instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+        compute_unit_price,
+    ));
 
     if let Some(sender) = fast_sender {
         if let Some(tip_account) = random_tip_account(&sender.tip_accounts) {
@@ -1162,7 +1187,10 @@ async fn send_signed_transaction(
         }
     }
     if tasks.is_empty() {
-        return vec![("none", Err(anyhow::anyhow!("no transaction senders configured")))];
+        return vec![(
+            "none",
+            Err(anyhow::anyhow!("no transaction senders configured")),
+        )];
     }
 
     let mut out = Vec::new();
@@ -1179,21 +1207,26 @@ async fn route_for(
     state: &mut ExecutorState,
     mint: &str,
     pump: &str,
-    dlmm: &str,
+    dlmms: &[String],
     process_delay_ms: u64,
 ) -> anyhow::Result<RouteState> {
-    let key = format!("{}|{}|{}", mint, pump, dlmm);
+    let key = route_cache_key(mint, pump, dlmms);
     if let Some(route) = state.route_cache.get(&key) {
         return Ok(route.clone());
     }
 
     let mut cfg = state.base_config.clone();
-    cfg.routing.markets.markets = vec![pump.to_string(), dlmm.to_string()];
+    cfg.routing.markets.markets = Vec::with_capacity(1 + dlmms.len());
+    cfg.routing.markets.markets.push(pump.to_string());
+    cfg.routing.markets.markets.extend(dlmms.iter().cloned());
     cfg.routing.markets.process_delay = process_delay_ms;
 
-    let mut map =
-        initialize_pools_from_markets(&cfg.routing.markets, &state.wallet.pubkey(), state.rpc_client.clone())
-            .await?;
+    let mut map = initialize_pools_from_markets(
+        &cfg.routing.markets,
+        &state.wallet.pubkey(),
+        state.rpc_client.clone(),
+    )
+    .await?;
     let (_, pool_data) = map.drain().next().context("no pool data initialized")?;
     let route = RouteState {
         config: cfg,
@@ -1206,15 +1239,17 @@ async fn route_for(
 async fn prewarm_routes(state: Arc<Mutex<ExecutorState>>, limit: usize, process_delay_ms: u64) {
     let routes = {
         let guard = state.lock().await;
+        let max_dlmm_per_tx = guard.max_dlmm_per_tx;
         guard
             .pools_by_mint
             .iter()
             .flat_map(|(mint, pools)| {
+                let groups = fixed_dlmm_route_groups(&pools.dlmm, max_dlmm_per_tx);
                 pools.pump.iter().flat_map(move |pump| {
-                    pools
-                        .dlmm
-                        .iter()
-                        .map(move |dlmm| (mint.clone(), pump.clone(), dlmm.clone()))
+                    groups
+                        .clone()
+                        .into_iter()
+                        .map(move |dlmms| (mint.clone(), pump.clone(), dlmms))
                 })
             })
             .take(limit)
@@ -1223,15 +1258,18 @@ async fn prewarm_routes(state: Arc<Mutex<ExecutorState>>, limit: usize, process_
     info!("prewarming {} routes", routes.len());
     let mut ok = 0usize;
     let mut failed = 0usize;
-    for (mint, pump, dlmm) in routes {
+    for (mint, pump, dlmms) in routes {
         let mut guard = state.lock().await;
-        match route_for(&mut guard, &mint, &pump, &dlmm, process_delay_ms).await {
+        match route_for(&mut guard, &mint, &pump, &dlmms, process_delay_ms).await {
             Ok(_) => ok += 1,
             Err(e) => {
                 failed += 1;
                 warn!(
-                    "prewarm route failed mint={} pump={} dlmm={}: {}",
-                    mint, pump, dlmm, e
+                    "prewarm route failed mint={} pump={} dlmms={}: {}",
+                    mint,
+                    pump,
+                    dlmms.join(","),
+                    e
                 );
             }
         }
@@ -1248,19 +1286,35 @@ async fn fire_route(
     src_slot: u64,
     volume_usd: f64,
     max_txs: u64,
+    max_dlmm_per_tx: usize,
     delay_ms: u64,
     refresh_on_send: bool,
     no_failure_mode: bool,
     parallel_sends: bool,
 ) {
-    for i in 0..max_txs {
-        let dlmm = dlmms[(i as usize) % dlmms.len()].clone();
-        let (wallet, rpc_client, sending_rpc_clients, send_config, lookup_tables, route_config, mut pool_data, blockhash) = {
+    let route_groups = fixed_dlmm_route_groups(&dlmms, max_dlmm_per_tx);
+    let selected_groups = route_groups.into_iter().take(max_txs as usize);
+    for (i, group_dlmms) in selected_groups.enumerate() {
+        let (
+            wallet,
+            rpc_client,
+            sending_rpc_clients,
+            send_config,
+            lookup_tables,
+            route_config,
+            mut pool_data,
+            blockhash,
+        ) = {
             let mut guard = state.lock().await;
-            let route = match route_for(&mut guard, &mint, &pump, &dlmm, delay_ms).await {
+            let route = match route_for(&mut guard, &mint, &pump, &group_dlmms, delay_ms).await {
                 Ok(r) => r,
                 Err(e) => {
-                    error!("route init failed mint={} dlmm={}: {}", mint, dlmm, e);
+                    error!(
+                        "route init failed mint={} dlmms={}: {}",
+                        mint,
+                        group_dlmms.join(","),
+                        e
+                    );
                     return;
                 }
             };
@@ -1279,19 +1333,24 @@ async fn fire_route(
         if refresh_on_send {
             let pool_refresher = PoolDataRefresher::new();
             if let Err(e) = pool_refresher.refresh_all_pools(&mut pool_data, &rpc_client, false) {
-                error!("pool refresh failed mint={} dlmm={}: {}", mint, dlmm, e);
+                error!(
+                    "pool refresh failed mint={} dlmms={}: {}",
+                    mint,
+                    group_dlmms.join(","),
+                    e
+                );
                 return;
             }
         }
         info!(
-            "SEND attempt={} mint={} vol=${:.0} src_slot={} src_sig={} pump={} dlmm={}",
+            "SEND group={} mint={} vol=${:.0} src_slot={} src_sig={} pump={} dlmms={}",
             i + 1,
             mint,
             volume_usd,
             src_slot,
             src_sig,
             pump,
-            dlmm
+            group_dlmms.join(",")
         );
         let tx = match build_versioned_transaction(
             &wallet,
@@ -1347,7 +1406,6 @@ async fn fire_route(
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 }
 
@@ -1359,48 +1417,212 @@ async fn main() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(subscriber).ok();
 
     let matches = App::new("FLASHX direct Rust executor")
-        .arg(Arg::with_name("base-config").long("base-config").takes_value(true).required(true))
-        .arg(Arg::with_name("geyser-url").long("geyser-url").takes_value(true).required(true))
-        .arg(Arg::with_name("geyser-token").long("geyser-token").takes_value(true).default_value(""))
-        .arg(Arg::with_name("pools-by-mint-file").long("pools-by-mint-file").takes_value(true).required(true))
-        .arg(Arg::with_name("pump-reserves-file").long("pump-reserves-file").takes_value(true).default_value(""))
-        .arg(Arg::with_name("pump-reserves-max-age-ms").long("pump-reserves-max-age-ms").takes_value(true).default_value("30000"))
-        .arg(Arg::with_name("sol-usd").long("sol-usd").takes_value(true).default_value("180"))
-        .arg(Arg::with_name("axiom-min-sol").long("axiom-min-sol").takes_value(true).default_value("0.01"))
-        .arg(Arg::with_name("min-usd").long("min-usd").takes_value(true).default_value("50"))
-        .arg(Arg::with_name("cluster-window-ms").long("cluster-window-ms").takes_value(true).default_value("10000"))
-        .arg(Arg::with_name("cluster-min-usd").long("cluster-min-usd").takes_value(true).default_value("400"))
-        .arg(Arg::with_name("cluster-min-count").long("cluster-min-count").takes_value(true).default_value("2"))
-        .arg(Arg::with_name("cooldown-ms").long("cooldown-ms").takes_value(true).default_value("0"))
-        .arg(Arg::with_name("max-dlmm").long("max-dlmm").takes_value(true).default_value("1"))
-        .arg(Arg::with_name("max-txs").long("max-txs").takes_value(true).default_value("3"))
-        .arg(Arg::with_name("delay-ms").long("delay-ms").takes_value(true).default_value("10"))
+        .arg(
+            Arg::with_name("base-config")
+                .long("base-config")
+                .takes_value(true)
+                .required(true),
+        )
+        .arg(
+            Arg::with_name("geyser-url")
+                .long("geyser-url")
+                .takes_value(true)
+                .required(true),
+        )
+        .arg(
+            Arg::with_name("geyser-token")
+                .long("geyser-token")
+                .takes_value(true)
+                .default_value(""),
+        )
+        .arg(
+            Arg::with_name("pools-by-mint-file")
+                .long("pools-by-mint-file")
+                .takes_value(true)
+                .required(true),
+        )
+        .arg(
+            Arg::with_name("pump-reserves-file")
+                .long("pump-reserves-file")
+                .takes_value(true)
+                .default_value(""),
+        )
+        .arg(
+            Arg::with_name("pump-reserves-max-age-ms")
+                .long("pump-reserves-max-age-ms")
+                .takes_value(true)
+                .default_value("30000"),
+        )
+        .arg(
+            Arg::with_name("sol-usd")
+                .long("sol-usd")
+                .takes_value(true)
+                .default_value("180"),
+        )
+        .arg(
+            Arg::with_name("axiom-min-sol")
+                .long("axiom-min-sol")
+                .takes_value(true)
+                .default_value("0.01"),
+        )
+        .arg(
+            Arg::with_name("min-usd")
+                .long("min-usd")
+                .takes_value(true)
+                .default_value("50"),
+        )
+        .arg(
+            Arg::with_name("cluster-window-ms")
+                .long("cluster-window-ms")
+                .takes_value(true)
+                .default_value("10000"),
+        )
+        .arg(
+            Arg::with_name("cluster-min-usd")
+                .long("cluster-min-usd")
+                .takes_value(true)
+                .default_value("400"),
+        )
+        .arg(
+            Arg::with_name("cluster-min-count")
+                .long("cluster-min-count")
+                .takes_value(true)
+                .default_value("2"),
+        )
+        .arg(
+            Arg::with_name("cooldown-ms")
+                .long("cooldown-ms")
+                .takes_value(true)
+                .default_value("0"),
+        )
+        .arg(
+            Arg::with_name("max-dlmm")
+                .long("max-dlmm")
+                .takes_value(true)
+                .default_value("1"),
+        )
+        .arg(
+            Arg::with_name("max-dlmm-per-tx")
+                .long("max-dlmm-per-tx")
+                .takes_value(true)
+                .default_value("3"),
+        )
+        .arg(
+            Arg::with_name("max-txs")
+                .long("max-txs")
+                .takes_value(true)
+                .default_value("3"),
+        )
+        .arg(
+            Arg::with_name("delay-ms")
+                .long("delay-ms")
+                .takes_value(true)
+                .default_value("10"),
+        )
         .arg(Arg::with_name("parallel-sends").long("parallel-sends"))
         .arg(Arg::with_name("refresh-on-send").long("refresh-on-send"))
         .arg(Arg::with_name("no-failure-mode").long("no-failure-mode"))
         .arg(Arg::with_name("prewarm-routes").long("prewarm-routes"))
-        .arg(Arg::with_name("prewarm-limit").long("prewarm-limit").takes_value(true).default_value("0"))
+        .arg(
+            Arg::with_name("prewarm-limit")
+                .long("prewarm-limit")
+                .takes_value(true)
+                .default_value("0"),
+        )
         .arg(Arg::with_name("rabbit-pool-filter").long("rabbit-pool-filter"))
         .arg(Arg::with_name("pump-program-filter").long("pump-program-filter"))
         .arg(Arg::with_name("trigger-on-pump-swap").long("trigger-on-pump-swap"))
-        .arg(Arg::with_name("pump-swap-min-sol").long("pump-swap-min-sol").takes_value(true).default_value("2"))
+        .arg(
+            Arg::with_name("pump-swap-min-sol")
+                .long("pump-swap-min-sol")
+                .takes_value(true)
+                .default_value("2"),
+        )
         .arg(Arg::with_name("trigger-on-pool-touch").long("trigger-on-pool-touch"))
-        .arg(Arg::with_name("pool-touch-require-pump-program").long("pool-touch-require-pump-program"))
-        .arg(Arg::with_name("pool-touch-cooldown-ms").long("pool-touch-cooldown-ms").takes_value(true).default_value("1000"))
-        .arg(Arg::with_name("pool-touch-min-keys").long("pool-touch-min-keys").takes_value(true).default_value("0"))
-        .arg(Arg::with_name("pool-touch-max-keys").long("pool-touch-max-keys").takes_value(true).default_value("0"))
-        .arg(Arg::with_name("pool-touch-required-accounts").long("pool-touch-required-accounts").takes_value(true).default_value(""))
-        .arg(Arg::with_name("pool-touch-reject-accounts").long("pool-touch-reject-accounts").takes_value(true).default_value(""))
+        .arg(
+            Arg::with_name("pool-touch-require-pump-program")
+                .long("pool-touch-require-pump-program"),
+        )
+        .arg(
+            Arg::with_name("pool-touch-cooldown-ms")
+                .long("pool-touch-cooldown-ms")
+                .takes_value(true)
+                .default_value("1000"),
+        )
+        .arg(
+            Arg::with_name("pool-touch-min-keys")
+                .long("pool-touch-min-keys")
+                .takes_value(true)
+                .default_value("0"),
+        )
+        .arg(
+            Arg::with_name("pool-touch-max-keys")
+                .long("pool-touch-max-keys")
+                .takes_value(true)
+                .default_value("0"),
+        )
+        .arg(
+            Arg::with_name("pool-touch-required-accounts")
+                .long("pool-touch-required-accounts")
+                .takes_value(true)
+                .default_value(""),
+        )
+        .arg(
+            Arg::with_name("pool-touch-reject-accounts")
+                .long("pool-touch-reject-accounts")
+                .takes_value(true)
+                .default_value(""),
+        )
         .arg(Arg::with_name("log-actionable-keys").long("log-actionable-keys"))
-        .arg(Arg::with_name("max-filter-accounts").long("max-filter-accounts").takes_value(true).default_value("200"))
+        .arg(
+            Arg::with_name("max-filter-accounts")
+                .long("max-filter-accounts")
+                .takes_value(true)
+                .default_value("200"),
+        )
         .arg(Arg::with_name("send-rpc").long("send-rpc"))
-        .arg(Arg::with_name("sender-provider").long("sender-provider").takes_value(true).default_value("circular"))
-        .arg(Arg::with_name("fast-url").long("fast-url").takes_value(true).default_value(DEFAULT_FAST_URL))
-        .arg(Arg::with_name("fast-api-key").long("fast-api-key").takes_value(true).default_value(""))
-        .arg(Arg::with_name("cashback-address").long("cashback-address").takes_value(true).default_value(""))
-        .arg(Arg::with_name("fast-tip-from").long("fast-tip-from").takes_value(true).default_value("1000000"))
-        .arg(Arg::with_name("fast-tip-to").long("fast-tip-to").takes_value(true).default_value("1000000"))
-        .arg(Arg::with_name("fast-timeout-ms").long("fast-timeout-ms").takes_value(true).default_value("700"))
+        .arg(
+            Arg::with_name("sender-provider")
+                .long("sender-provider")
+                .takes_value(true)
+                .default_value("circular"),
+        )
+        .arg(
+            Arg::with_name("fast-url")
+                .long("fast-url")
+                .takes_value(true)
+                .default_value(DEFAULT_FAST_URL),
+        )
+        .arg(
+            Arg::with_name("fast-api-key")
+                .long("fast-api-key")
+                .takes_value(true)
+                .default_value(""),
+        )
+        .arg(
+            Arg::with_name("cashback-address")
+                .long("cashback-address")
+                .takes_value(true)
+                .default_value(""),
+        )
+        .arg(
+            Arg::with_name("fast-tip-from")
+                .long("fast-tip-from")
+                .takes_value(true)
+                .default_value("1000000"),
+        )
+        .arg(
+            Arg::with_name("fast-tip-to")
+                .long("fast-tip-to")
+                .takes_value(true)
+                .default_value("1000000"),
+        )
+        .arg(
+            Arg::with_name("fast-timeout-ms")
+                .long("fast-timeout-ms")
+                .takes_value(true)
+                .default_value("700"),
+        )
         .arg(
             Arg::with_name("fast-tip-accounts")
                 .long("fast-tip-accounts")
@@ -1414,7 +1636,10 @@ async fn main() -> anyhow::Result<()> {
     let geyser_token = matches.value_of("geyser-token").unwrap();
     let pools_file = matches.value_of("pools-by-mint-file").unwrap();
     let pump_reserves_file = matches.value_of("pump-reserves-file").unwrap();
-    let pump_reserves_max_age_ms: u128 = matches.value_of("pump-reserves-max-age-ms").unwrap().parse()?;
+    let pump_reserves_max_age_ms: u128 = matches
+        .value_of("pump-reserves-max-age-ms")
+        .unwrap()
+        .parse()?;
     let sol_usd: f64 = matches.value_of("sol-usd").unwrap().parse()?;
     let axiom_min_sol: f64 = matches.value_of("axiom-min-sol").unwrap().parse()?;
     let min_usd: f64 = matches.value_of("min-usd").unwrap().parse()?;
@@ -1423,6 +1648,7 @@ async fn main() -> anyhow::Result<()> {
     let cluster_min_count: usize = matches.value_of("cluster-min-count").unwrap().parse()?;
     let cooldown_ms: u64 = matches.value_of("cooldown-ms").unwrap().parse()?;
     let max_dlmm: usize = matches.value_of("max-dlmm").unwrap().parse()?;
+    let max_dlmm_per_tx: usize = matches.value_of("max-dlmm-per-tx").unwrap().parse()?;
     let max_txs: u64 = matches.value_of("max-txs").unwrap().parse()?;
     let delay_ms: u64 = matches.value_of("delay-ms").unwrap().parse()?;
     let parallel_sends = matches.is_present("parallel-sends");
@@ -1436,7 +1662,10 @@ async fn main() -> anyhow::Result<()> {
     let pump_swap_min_sol: f64 = matches.value_of("pump-swap-min-sol").unwrap().parse()?;
     let trigger_on_pool_touch = matches.is_present("trigger-on-pool-touch");
     let pool_touch_require_pump_program = matches.is_present("pool-touch-require-pump-program");
-    let pool_touch_cooldown_ms: u64 = matches.value_of("pool-touch-cooldown-ms").unwrap().parse()?;
+    let pool_touch_cooldown_ms: u64 = matches
+        .value_of("pool-touch-cooldown-ms")
+        .unwrap()
+        .parse()?;
     let pool_touch_min_keys: usize = matches.value_of("pool-touch-min-keys").unwrap().parse()?;
     let pool_touch_max_keys: usize = matches.value_of("pool-touch-max-keys").unwrap().parse()?;
     let pool_touch_required_accounts =
@@ -1449,17 +1678,19 @@ async fn main() -> anyhow::Result<()> {
     let sender_provider = match matches.value_of("sender-provider").unwrap() {
         "circular" => FastSenderProvider::Circular,
         "helius" => FastSenderProvider::Helius,
-        other => anyhow::bail!("unsupported sender-provider {}; use circular or helius", other),
+        other => anyhow::bail!(
+            "unsupported sender-provider {}; use circular or helius",
+            other
+        ),
     };
     let fast_url_arg = matches.value_of("fast-url").unwrap();
     let fast_api_key = matches.value_of("fast-api-key").unwrap();
-    let mut fast_url = if sender_provider == FastSenderProvider::Helius
-        && fast_url_arg == DEFAULT_FAST_URL
-    {
-        DEFAULT_HELIUS_SENDER_URL.to_string()
-    } else {
-        fast_url_arg.to_string()
-    };
+    let mut fast_url =
+        if sender_provider == FastSenderProvider::Helius && fast_url_arg == DEFAULT_FAST_URL {
+            DEFAULT_HELIUS_SENDER_URL.to_string()
+        } else {
+            fast_url_arg.to_string()
+        };
     if sender_provider == FastSenderProvider::Helius
         && !fast_api_key.is_empty()
         && !fast_url.contains("api-key=")
@@ -1556,10 +1787,19 @@ async fn main() -> anyhow::Result<()> {
 
     let pools_by_mint = load_pools_by_mint(pools_file, max_dlmm)?;
     let pools_mtime = file_mtime(pools_file);
-    info!("loaded {} actionable mints from {}", pools_by_mint.len(), pools_file);
+    info!(
+        "loaded {} actionable mints from {} max_dlmm={} max_dlmm_per_tx={}",
+        pools_by_mint.len(),
+        pools_file,
+        max_dlmm,
+        max_dlmm_per_tx
+    );
     let pump_reserves_by_pool = load_pump_reserves(pump_reserves_file).unwrap_or_else(|e| {
         if !pump_reserves_file.is_empty() {
-            warn!("failed to load pump reserves from {}: {}", pump_reserves_file, e);
+            warn!(
+                "failed to load pump reserves from {}: {}",
+                pump_reserves_file, e
+            );
         }
         HashMap::new()
     });
@@ -1572,8 +1812,12 @@ async fn main() -> anyhow::Result<()> {
             pump_reserves_max_age_ms
         );
     }
-    let subscribe_account_include =
-        subscription_accounts(&pools_by_mint, rabbit_pool_filter, pump_program_filter, max_filter_accounts);
+    let subscribe_account_include = subscription_accounts(
+        &pools_by_mint,
+        rabbit_pool_filter,
+        pump_program_filter,
+        max_filter_accounts,
+    );
     info!(
         "stream filter accounts={} rabbit_pool_filter={} pump_program_filter={} trigger_on_pump_swap={} pump_swap_min_sol={:.6} trigger_on_pool_touch={}",
         subscribe_account_include.len(),
@@ -1598,6 +1842,7 @@ async fn main() -> anyhow::Result<()> {
         pump_reserves_mtime,
         pump_reserves_max_age_ms,
         max_dlmm,
+        max_dlmm_per_tx,
         pools_by_mint,
         pump_reserves_by_pool,
         route_cache: HashMap::new(),
@@ -1707,7 +1952,8 @@ async fn main() -> anyhow::Result<()> {
             let keys = account_keys(&txn, meta);
             let has_flashx = keys.iter().any(|k| k == FLASHX);
             let has_pump_program = keys.iter().any(|k| k == PUMP_AMM_PROGRAM);
-            if !has_flashx && !(trigger_on_pump_swap && has_pump_program) && !trigger_on_pool_touch {
+            if !has_flashx && !(trigger_on_pump_swap && has_pump_program) && !trigger_on_pool_touch
+            {
                 continue;
             }
             let is_pool_touch_candidate = trigger_on_pool_touch && !has_flashx;
@@ -1722,11 +1968,16 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 if !pool_touch_required_accounts.is_empty()
-                    && !pool_touch_required_accounts.iter().all(|required| keys.contains(required))
+                    && !pool_touch_required_accounts
+                        .iter()
+                        .all(|required| keys.contains(required))
                 {
                     continue;
                 }
-                if pool_touch_reject_accounts.iter().any(|rejected| keys.contains(rejected)) {
+                if pool_touch_reject_accounts
+                    .iter()
+                    .any(|rejected| keys.contains(rejected))
+                {
                     continue;
                 }
             }
@@ -1779,11 +2030,22 @@ async fn main() -> anyhow::Result<()> {
                     (volume_usd, mints, candidates)
                 } else if trigger_on_pool_touch {
                     let candidates = signal_candidates_from_keys(&guard.pools_by_mint, &keys);
-                    let mints = candidates.iter().map(|(mint, _, _)| mint.clone()).collect::<Vec<_>>();
+                    let mints = candidates
+                        .iter()
+                        .map(|(mint, _, _)| mint.clone())
+                        .collect::<Vec<_>>();
                     let candidates = candidates
                         .into_iter()
                         .map(|(mint, pump, dlmms)| {
-                            (mint, pump, dlmms, min_usd.max(1.0), "pool_touch", 0.0, "pool_touch")
+                            (
+                                mint,
+                                pump,
+                                dlmms,
+                                min_usd.max(1.0),
+                                "pool_touch",
+                                0.0,
+                                "pool_touch",
+                            )
                         })
                         .collect::<Vec<_>>();
                     (min_usd.max(1.0), mints, candidates)
@@ -1803,7 +2065,10 @@ async fn main() -> anyhow::Result<()> {
                     (volume_usd, mints, candidates)
                 } else {
                     let candidates = signal_candidates_from_keys(&guard.pools_by_mint, &keys);
-                    let mints = candidates.iter().map(|(mint, _, _)| mint.clone()).collect::<Vec<_>>();
+                    let mints = candidates
+                        .iter()
+                        .map(|(mint, _, _)| mint.clone())
+                        .collect::<Vec<_>>();
                     let candidates = candidates
                         .into_iter()
                         .map(|(mint, pump, dlmms)| {
@@ -1827,7 +2092,9 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            for (mint, pump, dlmms, candidate_volume_usd, source, sol_amount, volume_source) in candidates {
+            for (mint, pump, dlmms, candidate_volume_usd, source, sol_amount, volume_source) in
+                candidates
+            {
                 if source == "sell" && sol_amount > 0.0 && sol_amount < axiom_min_sol {
                     info!(
                         "AXIOM_FILTERED_LATE mint={} signal={} sol={:.6} vol=${:.0} volume_source={} min_sol={:.6} sig={}",
@@ -1849,7 +2116,9 @@ async fn main() -> anyhow::Result<()> {
                         .retain(|_, at| now.duration_since(*at) <= Duration::from_secs(3));
 
                     let rows = guard.flash_by_mint.entry(mint.clone()).or_default();
-                    rows.retain(|r| now.duration_since(r.at) <= Duration::from_millis(cluster_window_ms));
+                    rows.retain(|r| {
+                        now.duration_since(r.at) <= Duration::from_millis(cluster_window_ms)
+                    });
                     rows.push(FlashEvent {
                         at: now,
                         volume_usd: candidate_volume_usd,
@@ -1874,8 +2143,12 @@ async fn main() -> anyhow::Result<()> {
                             false
                         } else {
                             if is_pool_touch_candidate {
-                                if let Some(last) = guard.last_pool_touch_by_mint.get(&mint).copied() {
-                                    if now.duration_since(last) < Duration::from_millis(pool_touch_cooldown_ms) {
+                                if let Some(last) =
+                                    guard.last_pool_touch_by_mint.get(&mint).copied()
+                                {
+                                    if now.duration_since(last)
+                                        < Duration::from_millis(pool_touch_cooldown_ms)
+                                    {
                                         false
                                     } else {
                                         guard.last_pool_touch_by_mint.insert(mint.clone(), now);
@@ -1890,20 +2163,21 @@ async fn main() -> anyhow::Result<()> {
                                     true
                                 }
                             } else {
-                            let last = guard.last_signal_by_mint.get(&mint).copied();
-                            if let Some(last) = last {
-                                if now.duration_since(last) < Duration::from_millis(cooldown_ms) {
-                                    false
+                                let last = guard.last_signal_by_mint.get(&mint).copied();
+                                if let Some(last) = last {
+                                    if now.duration_since(last) < Duration::from_millis(cooldown_ms)
+                                    {
+                                        false
+                                    } else {
+                                        guard.last_signal_by_mint.insert(mint.clone(), now);
+                                        guard.last_signal_by_mint_slot.insert(mint_slot_key, now);
+                                        true
+                                    }
                                 } else {
                                     guard.last_signal_by_mint.insert(mint.clone(), now);
                                     guard.last_signal_by_mint_slot.insert(mint_slot_key, now);
                                     true
                                 }
-                            } else {
-                                guard.last_signal_by_mint.insert(mint.clone(), now);
-                                guard.last_signal_by_mint_slot.insert(mint_slot_key, now);
-                                true
-                            }
                             }
                         }
                     }
@@ -1928,9 +2202,7 @@ async fn main() -> anyhow::Result<()> {
                 if log_actionable_keys {
                     info!(
                         "ACTIONABLE_KEYS mint={} slot={} keys={:?}",
-                        mint,
-                        tx_update.slot,
-                        keys
+                        mint, tx_update.slot, keys
                     );
                 }
                 tokio::spawn(fire_route(
@@ -1942,6 +2214,7 @@ async fn main() -> anyhow::Result<()> {
                     tx_update.slot,
                     volume_usd,
                     max_txs,
+                    max_dlmm_per_tx,
                     delay_ms,
                     refresh_on_send,
                     no_failure_mode,

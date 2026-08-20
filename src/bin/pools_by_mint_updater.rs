@@ -427,23 +427,80 @@ async fn main() -> anyhow::Result<()> {
     let _ = tracing::subscriber::set_global_default(subscriber);
 
     let matches = App::new("pools_by_mint_updater")
-        .arg(Arg::with_name("geyser-url").long("geyser-url").takes_value(true).required(true))
-        .arg(Arg::with_name("geyser-token").long("geyser-token").takes_value(true).default_value(""))
-        .arg(Arg::with_name("rpc-url").long("rpc-url").takes_value(true).required(true))
-        .arg(Arg::with_name("pools-by-mint-file").long("pools-by-mint-file").takes_value(true).required(true))
-        .arg(Arg::with_name("pump-reserves-file").long("pump-reserves-file").takes_value(true).default_value(""))
-        .arg(Arg::with_name("include-accounts").long("include-accounts").takes_value(true).default_value(""))
-        .arg(Arg::with_name("max-candidate-accounts").long("max-candidate-accounts").takes_value(true).default_value("80"))
-        .arg(Arg::with_name("write-interval-ms").long("write-interval-ms").takes_value(true).default_value("500"))
-        .arg(Arg::with_name("dlmm-discovery-interval-ms").long("dlmm-discovery-interval-ms").takes_value(true).default_value("60000"))
-        .arg(Arg::with_name("dlmm-discovery-max-mints").long("dlmm-discovery-max-mints").takes_value(true).default_value("300"))
-        .arg(Arg::with_name("dlmm-discovery-max-per-mint").long("dlmm-discovery-max-per-mint").takes_value(true).default_value("8"))
+        .arg(
+            Arg::with_name("geyser-url")
+                .long("geyser-url")
+                .takes_value(true)
+                .required(true),
+        )
+        .arg(
+            Arg::with_name("geyser-token")
+                .long("geyser-token")
+                .takes_value(true)
+                .default_value(""),
+        )
+        .arg(
+            Arg::with_name("rpc-url")
+                .long("rpc-url")
+                .takes_value(true)
+                .required(true),
+        )
+        .arg(
+            Arg::with_name("pools-by-mint-file")
+                .long("pools-by-mint-file")
+                .takes_value(true)
+                .required(true),
+        )
+        .arg(
+            Arg::with_name("pump-reserves-file")
+                .long("pump-reserves-file")
+                .takes_value(true)
+                .default_value(""),
+        )
+        .arg(
+            Arg::with_name("include-accounts")
+                .long("include-accounts")
+                .takes_value(true)
+                .default_value(""),
+        )
+        .arg(
+            Arg::with_name("max-candidate-accounts")
+                .long("max-candidate-accounts")
+                .takes_value(true)
+                .default_value("80"),
+        )
+        .arg(
+            Arg::with_name("write-interval-ms")
+                .long("write-interval-ms")
+                .takes_value(true)
+                .default_value("500"),
+        )
+        .arg(
+            Arg::with_name("dlmm-discovery-interval-ms")
+                .long("dlmm-discovery-interval-ms")
+                .takes_value(true)
+                .default_value("60000"),
+        )
+        .arg(
+            Arg::with_name("dlmm-discovery-max-mints")
+                .long("dlmm-discovery-max-mints")
+                .takes_value(true)
+                .default_value("300"),
+        )
+        .arg(
+            Arg::with_name("dlmm-discovery-max-per-mint")
+                .long("dlmm-discovery-max-per-mint")
+                .takes_value(true)
+                .default_value("8"),
+        )
         .arg(Arg::with_name("full-scan").long("full-scan"))
         .get_matches();
 
     let geyser_url = matches.value_of("geyser-url").unwrap();
     let geyser_token = matches.value_of("geyser-token").unwrap();
-    let rpc = Arc::new(RpcClient::new(matches.value_of("rpc-url").unwrap().to_string()));
+    let rpc = Arc::new(RpcClient::new(
+        matches.value_of("rpc-url").unwrap().to_string(),
+    ));
     let pools_file = matches.value_of("pools-by-mint-file").unwrap().to_string();
     let pump_reserves_file = matches.value_of("pump-reserves-file").unwrap().to_string();
     let max_candidate_accounts = matches
@@ -510,8 +567,7 @@ async fn main() -> anyhow::Result<()> {
                     info!("updated {}", pools_file);
                 }
                 if !pump_reserves_file.is_empty() {
-                    if let Err(e) =
-                        atomic_write_json(&pump_reserves_file, &pump_reserves_snapshot)
+                    if let Err(e) = atomic_write_json(&pump_reserves_file, &pump_reserves_snapshot)
                     {
                         error!("failed writing {}: {}", pump_reserves_file, e);
                     } else {

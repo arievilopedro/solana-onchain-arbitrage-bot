@@ -483,7 +483,10 @@ pub fn get_initialized_tick_array_pubkeys(
     program_id: &Pubkey,
 ) -> Result<Vec<Pubkey>> {
     if pool_state.tick_spacing == 0 {
-        return Err(anyhow::anyhow!("tick_spacing is zero for pool {}", pool_pubkey));
+        return Err(anyhow::anyhow!(
+            "tick_spacing is zero for pool {}",
+            pool_pubkey
+        ));
     }
 
     if let Some(ext) = extension {
