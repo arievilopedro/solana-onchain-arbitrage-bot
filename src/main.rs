@@ -3,9 +3,10 @@ use clap::{App, Arg};
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSimulateTransactionConfig;
 use solana_onchain_arbitrage_bot::alt::{
-    execute_route_shard_plan, load_lookup_table_account, PendingRouteShardOperation,
-    PlannedRouteShardExtension, RouteShardLookupResolver, RouteShardPlanFile, RouteShardPlanner,
-    RouteShardStore, StableMintRouteAccounts,
+    execute_route_shard_plan, execute_route_shard_plan_with_recent_slots,
+    load_lookup_table_account, PendingRouteShardOperation, PlannedRouteShardExtension,
+    RouteShardLookupResolver, RouteShardPlanFile, RouteShardPlanner, RouteShardStore,
+    StableMintRouteAccounts,
 };
 use solana_onchain_arbitrage_bot::config::AppConfig;
 use solana_onchain_arbitrage_bot::discovery::{ControlledRpcBootstrap, RpcBootstrapConfig};
@@ -555,6 +556,21 @@ async fn run_geyser_account_worker(
                                 dry_run.missing_route_shard,
                                 dry_run.compile_failed
                             );
+                            if dry_run.missing_route_shard > 0 {
+                                if let Err(error) = maintain_live_route_shards(
+                                    config,
+                                    rpc_client.as_ref(),
+                                    wallet.as_ref(),
+                                    &registry,
+                                    &slot_tracker.recent_slot_candidates(),
+                                ) {
+                                    tracing::error!(
+                                        "route shard live maintenance failed: mint={} error={}",
+                                        mint,
+                                        error
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -591,6 +607,65 @@ async fn run_geyser_account_worker(
         Ok(())
     })
     .await
+}
+
+#[cfg(feature = "geyser")]
+fn maintain_live_route_shards(
+    config: &AppConfig,
+    rpc_client: &RpcClient,
+    wallet: &solana_sdk::signature::Keypair,
+    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    recent_slot_candidates: &[u64],
+) -> anyhow::Result<()> {
+    if !config.lookup_tables.route_shards.enabled {
+        return Ok(());
+    }
+
+    let allowed_mints = parse_allowed_mints(config)?;
+    let store = RouteShardStore::load(&config.lookup_tables.route_shards.state_file)
+        .context("failed to load route shard state for live maintenance")?;
+    let planner = RouteShardPlanner::new(
+        store,
+        allowed_mints.iter().copied(),
+        config.lookup_tables.route_shards.max_addresses,
+    )?;
+    let summary = plan_route_shards(config, &planner, registry)?;
+    RouteShardPlanFile::new(summary.operations.clone())
+        .save(&config.lookup_tables.route_shards.plan_file)
+        .context("failed to write live route shard plan file")?;
+
+    info!(
+        "route shard live maintenance planned: mint_blocks={} create_shard={} extend_shard={} skipped_unready={} skipped_disabled={} plan_file={}",
+        summary.mint_blocks,
+        summary.create_shard,
+        summary.extend_shard,
+        summary.skipped_unready,
+        summary.skipped_disabled,
+        config.lookup_tables.route_shards.plan_file
+    );
+
+    if summary.operations.is_empty() {
+        return Ok(());
+    }
+
+    let maintenance = execute_route_shard_plan_with_recent_slots(
+        rpc_client,
+        wallet,
+        &config.lookup_tables.route_shards.state_file,
+        &config.lookup_tables.route_shards.plan_file,
+        allowed_mints.iter().copied(),
+        config.lookup_tables.route_shards.max_addresses,
+        recent_slot_candidates,
+    )
+    .context("live route shard maintenance failed")?;
+
+    info!(
+        "route shard live maintenance OK: attempted={} confirmed={}",
+        maintenance.attempted,
+        maintenance.confirmed.len()
+    );
+
+    Ok(())
 }
 
 #[cfg(not(feature = "geyser"))]
