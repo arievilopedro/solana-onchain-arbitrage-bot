@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcSimulateTransactionConfig;
 use solana_program::instruction::Instruction;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::address_lookup_table::instruction::{create_lookup_table, extend_lookup_table};
@@ -388,6 +389,7 @@ pub fn execute_route_shard_plan(
             &[wallet],
             blockhash,
         );
+        ensure_route_shard_transaction_simulates(rpc_client, &tx, built.shard)?;
         let signature = rpc_client.send_and_confirm_transaction(&tx)?;
         let confirmed_slot = rpc_client.get_slot()?;
 
@@ -401,6 +403,37 @@ pub fn execute_route_shard_plan(
     }
 
     Ok(report)
+}
+
+fn ensure_route_shard_transaction_simulates(
+    rpc_client: &RpcClient,
+    tx: &Transaction,
+    shard: Pubkey,
+) -> anyhow::Result<()> {
+    let simulation = rpc_client.simulate_transaction_with_config(
+        tx,
+        RpcSimulateTransactionConfig {
+            sig_verify: true,
+            replace_recent_blockhash: false,
+            ..RpcSimulateTransactionConfig::default()
+        },
+    )?;
+
+    if let Some(err) = simulation.value.err {
+        let logs = simulation
+            .value
+            .logs
+            .unwrap_or_default()
+            .join(" | ");
+        anyhow::bail!(
+            "route shard transaction simulation failed: shard={} err={:?} logs={}",
+            shard,
+            err,
+            logs
+        );
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
