@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     let rabbitstream_plan = RabbitStreamPlan::controlled_v1(&config.rabbitstream)?;
     let helius_sender_plan = HeliusSenderPlan::from_config(&config.sender.helius)?;
     info!(
-        "config OK: wallet={} mints={} sol_only={} route_shards={} auto_create={} auto_extend={} compile_dry_run={} grpc={} rabbitstream={}",
+        "config OK: wallet={} mints={} sol_only={} route_shards={} auto_create={} auto_extend={} compile_dry_run={} send_live_transactions={} grpc={} rabbitstream={}",
         wallet.pubkey(),
         config.runtime.allowed_mints.len(),
         config.execution.sol_only,
@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         config.lookup_tables.route_shards.auto_create,
         config.lookup_tables.route_shards.auto_extend,
         config.execution.compile_dry_run_on_startup,
+        config.execution.send_live_transactions,
         config.grpc.enabled,
         config.rabbitstream.enabled
     );
@@ -333,6 +334,19 @@ async fn run_geyser_account_worker(
                                 dry_run.missing_route_shard,
                                 dry_run.compile_failed
                             );
+                            if dry_run.compiled > 0 {
+                                if config.execution.send_live_transactions {
+                                    info!(
+                                        "live transaction send blocked: mint={} reason=sender_not_connected_yet compiled={}",
+                                        mint, dry_run.compiled
+                                    );
+                                } else {
+                                    info!(
+                                        "would_send live transaction: mint={} compiled={} sender={} reason=send_live_transactions_false",
+                                        mint, dry_run.compiled, config.sender.primary
+                                    );
+                                }
+                            }
                         }
                     }
                 }

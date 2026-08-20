@@ -115,6 +115,8 @@ pub struct ExecutionConfig {
     pub min_pool_base_liquidity_lamports: u64,
     pub max_pool_state_age_ms: u64,
     pub compile_dry_run_on_startup: bool,
+    #[serde(default)]
+    pub send_live_transactions: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
