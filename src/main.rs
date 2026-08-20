@@ -20,7 +20,7 @@ use solana_program::pubkey::Pubkey;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::signer::Signer;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{info, Level};
 
 #[cfg(feature = "geyser")]
@@ -152,13 +152,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let wallet = Arc::new(wallet);
+    let registry = Arc::new(Mutex::new(registry));
     info!("supervisor bootstrap complete; starting configured stream workers");
     run_stream_workers(
         &config,
         rpc_client.clone(),
-        &wallet,
+        wallet.clone(),
         allowed_mints.clone(),
-        &mut registry,
+        registry.clone(),
         grpc_plan,
         rabbitstream_plan,
     )
@@ -224,20 +226,30 @@ fn log_stream_plans(
 async fn run_stream_workers(
     config: &AppConfig,
     rpc_client: Arc<RpcClient>,
-    wallet: &solana_sdk::signature::Keypair,
+    wallet: Arc<solana_sdk::signature::Keypair>,
     allowed_mints: Vec<Pubkey>,
-    registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     grpc_plan: Option<GeyserAccountStreamPlan>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
 ) -> anyhow::Result<()> {
-    run_rabbitstream_trigger_worker(config, rabbitstream_plan, allowed_mints)?;
+    run_rabbitstream_trigger_worker(
+        config.clone(),
+        rpc_client.clone(),
+        wallet.clone(),
+        registry.clone(),
+        rabbitstream_plan,
+        allowed_mints,
+    )?;
 
     run_geyser_account_worker(config, rpc_client, wallet, registry, grpc_plan).await
 }
 
 #[cfg(feature = "geyser")]
 fn run_rabbitstream_trigger_worker(
-    config: &AppConfig,
+    config: AppConfig,
+    rpc_client: Arc<RpcClient>,
+    wallet: Arc<solana_sdk::signature::Keypair>,
+    registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
     allowed_mints: Vec<Pubkey>,
 ) -> anyhow::Result<()> {
@@ -271,6 +283,50 @@ fn run_rabbitstream_trigger_worker(
                     "rabbitstream axion trigger: mint={} slot={} sig={}",
                     signal.mint, signal.slot, signal.signature
                 );
+                if !config.lookup_tables.route_shards.enabled {
+                    info!(
+                        "trigger controlled tx dry-run skipped: mint={} sig={} reason=route_shards_disabled",
+                        signal.mint, signal.signature
+                    );
+                    return Ok(());
+                }
+                let dry_run = {
+                    let registry = registry
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
+                    dry_run_controlled_mint_routes(
+                        &config,
+                        rpc_client.as_ref(),
+                        wallet.as_ref(),
+                        &registry,
+                        signal.mint,
+                    )?
+                };
+                info!(
+                    "trigger controlled tx dry-run: mint={} sig={} routes={} compiled={} missing_route_shard={} compile_failed={}",
+                    signal.mint,
+                    signal.signature,
+                    dry_run.routes,
+                    dry_run.compiled,
+                    dry_run.missing_route_shard,
+                    dry_run.compile_failed
+                );
+                if dry_run.compiled > 0 {
+                    if config.execution.send_live_transactions {
+                        info!(
+                            "trigger transaction send blocked: mint={} sig={} reason=sender_not_connected_yet compiled={}",
+                            signal.mint, signal.signature, dry_run.compiled
+                        );
+                    } else {
+                        info!(
+                            "would_send trigger transaction: mint={} sig={} compiled={} sender={} reason=send_live_transactions_false",
+                            signal.mint,
+                            signal.signature,
+                            dry_run.compiled,
+                            config.sender.primary
+                        );
+                    }
+                }
                 Ok(())
             })
             .await;
@@ -288,7 +344,10 @@ fn run_rabbitstream_trigger_worker(
 
 #[cfg(not(feature = "geyser"))]
 fn run_rabbitstream_trigger_worker(
-    _config: &AppConfig,
+    _config: AppConfig,
+    _rpc_client: Arc<RpcClient>,
+    _wallet: Arc<solana_sdk::signature::Keypair>,
+    _registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
     _allowed_mints: Vec<Pubkey>,
 ) -> anyhow::Result<()> {
@@ -308,8 +367,8 @@ fn run_rabbitstream_trigger_worker(
 async fn run_geyser_account_worker(
     config: &AppConfig,
     rpc_client: Arc<RpcClient>,
-    wallet: &solana_sdk::signature::Keypair,
-    registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    wallet: Arc<solana_sdk::signature::Keypair>,
+    registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     grpc_plan: Option<GeyserAccountStreamPlan>,
 ) -> anyhow::Result<()> {
     use solana_onchain_arbitrage_bot::streams::grpc::yellowstone::{
@@ -335,8 +394,11 @@ async fn run_geyser_account_worker(
             }
         };
 
+        let mut registry = registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
         let report = apply_pool_account_update(
-            registry,
+            &mut registry,
             update,
             |base_vault| enricher.base_vault_liquidity(base_vault),
             |mint| enricher.mint_uses_token_2022(mint),
@@ -388,8 +450,8 @@ async fn run_geyser_account_worker(
                             let dry_run = dry_run_controlled_mint_routes(
                                 config,
                                 rpc_client.as_ref(),
-                                wallet,
-                                registry,
+                                wallet.as_ref(),
+                                &registry,
                                 mint,
                             )?;
                             info!(
@@ -455,8 +517,8 @@ async fn run_geyser_account_worker(
 async fn run_geyser_account_worker(
     _config: &AppConfig,
     _rpc_client: Arc<RpcClient>,
-    _wallet: &solana_sdk::signature::Keypair,
-    _registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    _wallet: Arc<solana_sdk::signature::Keypair>,
+    _registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     grpc_plan: Option<GeyserAccountStreamPlan>,
 ) -> anyhow::Result<()> {
     if let Some(plan) = grpc_plan {
