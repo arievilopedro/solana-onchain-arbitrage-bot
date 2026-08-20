@@ -7,11 +7,13 @@
 use solana_program::pubkey::Pubkey;
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AxionTriggerSignal {
     pub signature: String,
     pub slot: u64,
     pub mint: Pubkey,
+    pub sol_amount: f64,
+    pub volume_source: &'static str,
     pub axion_program_seen: bool,
 }
 
@@ -46,6 +48,8 @@ pub mod yellowstone {
     use yellowstone_grpc_proto::solana::storage::confirmed_block::{
         Transaction, TransactionStatusMeta,
     };
+
+    const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
     pub fn account_keys(tx: &Transaction, meta: Option<&TransactionStatusMeta>) -> Vec<Pubkey> {
         let mut keys = Vec::new();
@@ -91,6 +95,68 @@ pub mod yellowstone {
         out
     }
 
+    pub fn sol_volume(meta: Option<&TransactionStatusMeta>) -> (f64, &'static str) {
+        let Some(meta) = meta else {
+            return (0.0, "missing_meta");
+        };
+
+        let wsol = wsol_volume(meta);
+        if wsol > 0.0 {
+            return (wsol, "meta_wsol_delta");
+        }
+
+        let native = native_sol_volume(meta);
+        if native > 0.0 {
+            return (native, "meta_native_delta");
+        }
+
+        (0.0, "none")
+    }
+
+    fn token_amount(amount: &str, decimals: u32) -> f64 {
+        let raw = amount.parse::<f64>().unwrap_or(0.0);
+        raw / 10f64.powi(decimals as i32)
+    }
+
+    fn wsol_volume(meta: &TransactionStatusMeta) -> f64 {
+        let mut pre = std::collections::HashMap::new();
+        let mut post = std::collections::HashMap::new();
+        for balance in &meta.pre_token_balances {
+            if balance.mint == WSOL_MINT {
+                if let Some(ui) = &balance.ui_token_amount {
+                    pre.insert(balance.account_index, token_amount(&ui.amount, ui.decimals));
+                }
+            }
+        }
+        for balance in &meta.post_token_balances {
+            if balance.mint == WSOL_MINT {
+                if let Some(ui) = &balance.ui_token_amount {
+                    post.insert(balance.account_index, token_amount(&ui.amount, ui.decimals));
+                }
+            }
+        }
+
+        pre.keys()
+            .chain(post.keys())
+            .map(|idx| {
+                let before = pre.get(idx).copied().unwrap_or(0.0);
+                let after = post.get(idx).copied().unwrap_or(0.0);
+                (after - before).abs()
+            })
+            .fold(0.0, f64::max)
+    }
+
+    fn native_sol_volume(meta: &TransactionStatusMeta) -> f64 {
+        let len = meta.pre_balances.len().min(meta.post_balances.len());
+        (0..len)
+            .map(|idx| {
+                let before = meta.pre_balances[idx] as i128;
+                let after = meta.post_balances[idx] as i128;
+                (after - before).abs() as f64 / 1_000_000_000.0
+            })
+            .fold(0.0, f64::max)
+    }
+
     pub fn axion_trigger_signals(
         signature: String,
         slot: u64,
@@ -106,6 +172,7 @@ pub mod yellowstone {
         }
 
         let token_balance_mints = token_balance_mints(meta);
+        let (sol_amount, volume_source) = sol_volume(meta);
         collect_allowlisted_mints_from_strings(
             keys.iter(),
             token_balance_mints.iter(),
@@ -116,6 +183,8 @@ pub mod yellowstone {
             signature: signature.clone(),
             slot,
             mint,
+            sol_amount,
+            volume_source,
             axion_program_seen,
         })
         .collect()

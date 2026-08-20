@@ -278,9 +278,10 @@ fn run_rabbitstream_trigger_worker(
         None
     };
     info!(
-        "starting RabbitStream Axion trigger worker: url={} allowed_mints={}",
+        "starting RabbitStream Axion trigger worker: url={} allowed_mints={} min_sol={:.6}",
         plan.url,
-        allowed_mints.len()
+        allowed_mints.len(),
+        config.axion.min_sol
     );
 
     tokio::spawn(async move {
@@ -298,9 +299,26 @@ fn run_rabbitstream_trigger_worker(
                         seen_signatures.remove(&old_signature);
                     }
                 }
+                if signal.sol_amount < config.axion.min_sol {
+                    info!(
+                        "rabbitstream axion trigger filtered: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={}",
+                        signal.mint,
+                        signal.slot,
+                        signal.signature,
+                        signal.sol_amount,
+                        config.axion.min_sol,
+                        signal.volume_source
+                    );
+                    return Ok(());
+                }
                 info!(
-                    "rabbitstream axion trigger: mint={} slot={} sig={}",
-                    signal.mint, signal.slot, signal.signature
+                    "rabbitstream axion trigger: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={}",
+                    signal.mint,
+                    signal.slot,
+                    signal.signature,
+                    signal.sol_amount,
+                    config.axion.min_sol,
+                    signal.volume_source
                 );
                 if !config.lookup_tables.route_shards.enabled {
                     info!(
