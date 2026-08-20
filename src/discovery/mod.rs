@@ -3,7 +3,7 @@
 //! Bootstrap may use RPC. Runtime updates should come from Geyser/account streams.
 
 use crate::constants::sol_mint;
-use crate::dex::meteora::constants::{dlmm_event_authority, dlmm_program_id};
+use crate::dex::meteora::constants::{dlmm_event_authority, dlmm_program_id, memo_program_v2};
 use crate::dex::meteora::dlmm_info::DlmmInfo;
 use crate::dex::pump::amm_info::{
     PumpAmmInfo, PUMP_BASE_MINT_GPA_OFFSET, PUMP_QUOTE_MINT_GPA_OFFSET,
@@ -281,7 +281,7 @@ pub fn dlmm_route_state_from_account(
         program_id: dlmm_program_id(),
         base_mint,
         event_authority: dlmm_event_authority(),
-        memo_program: mint_uses_token_2022(mint)?.then_some(token_2022_program_id()),
+        memo_program: dlmm_memo_program_for_mint(mint, mint_uses_token_2022)?,
         lb_pair: pair,
         token_vault,
         base_vault,
@@ -302,6 +302,13 @@ fn pool_contains_mint_and_sol(a: Pubkey, b: Pubkey, mint: Pubkey) -> bool {
 
 fn mint_uses_token_2022(rpc: &RpcClient, mint: Pubkey) -> anyhow::Result<bool> {
     Ok(rpc.get_account(&mint)?.owner == token_2022_program_id())
+}
+
+fn dlmm_memo_program_for_mint(
+    mint: Pubkey,
+    mint_uses_token_2022: impl FnOnce(Pubkey) -> anyhow::Result<bool>,
+) -> anyhow::Result<Option<Pubkey>> {
+    Ok(mint_uses_token_2022(mint)?.then_some(memo_program_v2()))
 }
 
 fn token_2022_program_id() -> Pubkey {
@@ -348,5 +355,17 @@ mod tests {
             DlmmInfo::token_y_mint_gpa_offset(),
             DlmmInfo::token_x_mint_gpa_offset() + 32
         );
+    }
+
+    #[test]
+    fn dlmm_token_2022_uses_memo_program_v2_not_token_program() {
+        let mint = pk(10);
+
+        let memo = dlmm_memo_program_for_mint(mint, |_| Ok(true)).unwrap();
+        let no_memo = dlmm_memo_program_for_mint(mint, |_| Ok(false)).unwrap();
+
+        assert_eq!(memo, Some(memo_program_v2()));
+        assert_ne!(memo, Some(token_2022_program_id()));
+        assert_eq!(no_memo, None);
     }
 }

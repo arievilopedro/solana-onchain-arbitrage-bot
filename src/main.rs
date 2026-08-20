@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::{App, Arg};
 use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcSimulateTransactionConfig;
 use solana_onchain_arbitrage_bot::alt::{
     execute_route_shard_plan, load_lookup_table_account, PendingRouteShardOperation,
     PlannedRouteShardExtension, RouteShardLookupResolver, RouteShardPlanFile, RouteShardPlanner,
@@ -366,6 +367,18 @@ fn run_rabbitstream_trigger_worker(
                         };
                         let trigger_signature = signal.signature.clone();
                         let trigger_mint = signal.mint;
+                        if let Err(error) = ensure_trigger_transaction_simulates(
+                            rpc_client.as_ref(),
+                            &tx,
+                        ) {
+                            tracing::error!(
+                                "trigger transaction simulation failed: mint={} trigger_sig={} error={}",
+                                trigger_mint,
+                                trigger_signature,
+                                error
+                            );
+                            return Ok(());
+                        }
                         tokio::spawn(async move {
                             match sender.send_transaction(&tx).await {
                                 Ok(signature) => info!(
@@ -400,6 +413,25 @@ fn run_rabbitstream_trigger_worker(
         }
     });
 
+    Ok(())
+}
+
+fn ensure_trigger_transaction_simulates(
+    rpc_client: &RpcClient,
+    tx: &VersionedTransaction,
+) -> anyhow::Result<()> {
+    let simulation = rpc_client.simulate_transaction_with_config(
+        tx,
+        RpcSimulateTransactionConfig {
+            sig_verify: false,
+            replace_recent_blockhash: false,
+            ..Default::default()
+        },
+    )?;
+    if let Some(err) = simulation.value.err {
+        let logs = simulation.value.logs.unwrap_or_default().join(" | ");
+        anyhow::bail!("err={:?} logs={}", err, logs);
+    }
     Ok(())
 }
 
