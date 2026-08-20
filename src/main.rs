@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
         report.discovered_dlmm,
         report.skipped_low_liquidity
     );
-    let mut registry = report.registry;
+    let registry = report.registry;
 
     if config.lookup_tables.route_shards.enabled {
         let store = RouteShardStore::load(&config.lookup_tables.route_shards.state_file)
@@ -278,7 +278,7 @@ fn run_rabbitstream_trigger_worker(
     tokio::spawn(async move {
         let url = plan.url.clone();
         let result =
-            run_axion_trigger_stream(plan, axion_program, allowed_mints, |signal| {
+            run_axion_trigger_stream(plan, axion_program, allowed_mints, move |signal| {
                 info!(
                     "rabbitstream axion trigger: mint={} slot={} sig={}",
                     signal.mint, signal.slot, signal.signature
