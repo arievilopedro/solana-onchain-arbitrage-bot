@@ -12,6 +12,7 @@ use solana_onchain_arbitrage_bot::execution::{
     build_controlled_transaction, ControlledExecutionParams,
 };
 use solana_onchain_arbitrage_bot::routes::FixedDlmmRoutePacker;
+use solana_onchain_arbitrage_bot::sender::{HeliusSenderPlan, SenderTipConfig};
 use solana_onchain_arbitrage_bot::streams::grpc::GeyserAccountStreamPlan;
 use solana_onchain_arbitrage_bot::streams::rabbitstream::RabbitStreamPlan;
 use solana_onchain_arbitrage_bot::wallet::load_keypair;
@@ -57,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
     let wallet = load_keypair(&config.wallet.private_key).context("failed to load wallet")?;
     let grpc_plan = GeyserAccountStreamPlan::controlled_v1(&config.grpc)?;
     let rabbitstream_plan = RabbitStreamPlan::controlled_v1(&config.rabbitstream)?;
+    let helius_sender_plan = HeliusSenderPlan::from_config(&config.sender.helius)?;
     info!(
         "config OK: wallet={} mints={} sol_only={} route_shards={} auto_create={} auto_extend={} compile_dry_run={} grpc={} rabbitstream={}",
         wallet.pubkey(),
@@ -70,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         config.rabbitstream.enabled
     );
     log_stream_plans(grpc_plan.as_ref(), rabbitstream_plan.as_ref());
+    log_sender_plan(&config, helius_sender_plan.as_ref());
 
     let allowed_mints = parse_allowed_mints(&config)?;
     let rpc_client = Arc::new(RpcClient::new(config.rpc.http.clone()));
@@ -154,6 +157,35 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+fn log_sender_plan(config: &AppConfig, helius_sender_plan: Option<&HeliusSenderPlan>) {
+    if config.sender.primary == "helius" {
+        if let Some(plan) = helius_sender_plan {
+            info!(
+                "Helius sender planned: endpoint={} tip_lamports={} tip_accounts={} max_tps={} burst={} timeout_ms={}",
+                redacted_endpoint(&plan.endpoint),
+                plan.tip.lamports,
+                plan.tip.accounts.len(),
+                plan.max_tps,
+                plan.burst,
+                plan.timeout_ms
+            );
+        }
+    } else {
+        info!(
+            "primary sender is RPC: send_rpc={} helius_enabled={}",
+            config.sender.send_rpc, config.sender.helius.enabled
+        );
+    }
+}
+
+fn redacted_endpoint(endpoint: &str) -> String {
+    if let Some((prefix, _)) = endpoint.split_once("api-key=") {
+        format!("{}api-key=<redacted>", prefix)
+    } else {
+        endpoint.to_string()
+    }
 }
 
 fn log_stream_plans(
@@ -335,6 +367,7 @@ fn dry_run_controlled_routes(
         compute_unit_price: config.compute.unit_price,
         use_flashloan: config.execution.use_flashloan,
         no_failure_mode: config.execution.no_failure_mode,
+        sender_tip: sender_tip_config(config)?,
     };
     let now_ms = now_ms();
     let mut summary = ControlledTxDryRunSummary::default();
@@ -361,7 +394,7 @@ fn dry_run_controlled_routes(
                 mint_state.token_program,
                 recent_blockhash,
                 &lookup_tables,
-                params,
+                params.clone(),
             )
             .is_ok()
             {
@@ -373,6 +406,14 @@ fn dry_run_controlled_routes(
     }
 
     Ok(summary)
+}
+
+fn sender_tip_config(config: &AppConfig) -> anyhow::Result<Option<SenderTipConfig>> {
+    if config.sender.primary != "helius" {
+        return Ok(None);
+    }
+
+    Ok(HeliusSenderPlan::from_config(&config.sender.helius)?.map(|plan| plan.tip))
 }
 
 fn lookup_tables_for_route(

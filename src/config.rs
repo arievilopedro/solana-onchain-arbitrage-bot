@@ -152,9 +152,15 @@ pub struct HeliusSenderConfig {
     pub enabled: bool,
     #[serde(default, deserialize_with = "serde_string_or_env_default")]
     pub endpoint: String,
+    #[serde(default, deserialize_with = "serde_string_or_env_default")]
+    pub api_key: String,
     pub max_tps: u64,
     pub burst: u64,
     pub timeout_ms: u64,
+    #[serde(default = "default_helius_tip_lamports")]
+    pub tip_lamports: u64,
+    #[serde(default = "crate::sender::default_helius_tip_accounts_csv")]
+    pub tip_accounts: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -289,11 +295,34 @@ impl AppConfig {
         validate_stream_endpoint("grpc", &self.grpc)?;
         validate_stream_endpoint("rabbitstream", &self.rabbitstream)?;
 
-        if self.sender.primary == "helius"
-            && self.sender.helius.enabled
-            && self.sender.helius.endpoint.trim().is_empty()
-        {
-            anyhow::bail!("sender.helius.endpoint is required when Helius is enabled");
+        match self.sender.primary.as_str() {
+            "rpc" | "helius" => {}
+            other => anyhow::bail!("sender.primary must be `rpc` or `helius`, got `{}`", other),
+        }
+
+        if self.sender.primary == "helius" {
+            if !self.sender.helius.enabled {
+                anyhow::bail!("sender.helius.enabled must be true when sender.primary=helius");
+            }
+
+            if self.sender.helius.endpoint.trim().is_empty() {
+                anyhow::bail!("sender.helius.endpoint is required when Helius is enabled");
+            }
+
+            if self.sender.helius.tip_lamports == 0 {
+                anyhow::bail!(
+                    "sender.helius.tip_lamports must be greater than zero for Helius Sender"
+                );
+            }
+
+            if self.compute.unit_price == 0 {
+                anyhow::bail!("compute.unit_price must be greater than zero for Helius Sender");
+            }
+
+            validate_pubkey_csv(
+                "sender.helius.tip_accounts",
+                &self.sender.helius.tip_accounts,
+            )?;
         }
 
         Ok(())
@@ -306,6 +335,20 @@ fn validate_pubkey(field: &str, value: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid {} pubkey `{}`: {}", field, value, e))
 }
 
+fn validate_pubkey_csv(field: &str, value: &str) -> anyhow::Result<()> {
+    let mut count = 0usize;
+    for pubkey in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        validate_pubkey(field, pubkey)?;
+        count += 1;
+    }
+
+    if count == 0 {
+        anyhow::bail!("{} must not be empty", field);
+    }
+
+    Ok(())
+}
+
 fn validate_stream_endpoint(name: &str, endpoint: &StreamEndpointConfig) -> anyhow::Result<()> {
     if endpoint.enabled {
         if endpoint.url.trim().is_empty() {
@@ -316,6 +359,10 @@ fn validate_stream_endpoint(name: &str, endpoint: &StreamEndpointConfig) -> anyh
         }
     }
     Ok(())
+}
+
+fn default_helius_tip_lamports() -> u64 {
+    1_000_000
 }
 
 fn ensure_parent_dir(field: &str, path: &str) -> anyhow::Result<()> {
