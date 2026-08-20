@@ -12,6 +12,85 @@ pub struct RabbitStreamPlan {
     pub x_token: String,
 }
 
+#[cfg(feature = "geyser")]
+pub mod yellowstone {
+    use super::RabbitStreamPlan;
+    use crate::axion::yellowstone::axion_trigger_signals;
+    use crate::axion::AxionTriggerSignal;
+    use futures::{SinkExt, StreamExt};
+    use solana_program::pubkey::Pubkey;
+    use std::collections::{HashMap, HashSet};
+    use yellowstone_grpc_client::GeyserGrpcClient;
+    use yellowstone_grpc_proto::prelude::{
+        subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
+        SubscribeRequestFilterTransactions,
+    };
+
+    pub async fn run_axion_trigger_stream(
+        plan: RabbitStreamPlan,
+        axion_program: Pubkey,
+        allowed_mints: HashSet<Pubkey>,
+        mut on_trigger: impl FnMut(AxionTriggerSignal) -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let mut client = GeyserGrpcClient::build_from_shared(plan.url.clone())?
+            .x_token(Some(plan.x_token.clone()))?
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .connect()
+            .await?;
+
+        let (mut tx, mut stream) = client.subscribe().await?;
+        let mut transactions = HashMap::new();
+        transactions.insert(
+            "axion-triggers".to_string(),
+            SubscribeRequestFilterTransactions {
+                vote: Some(false),
+                failed: Some(false),
+                signature: None,
+                account_include: vec![axion_program.to_string()],
+                account_exclude: vec![],
+                account_required: vec![],
+                ..Default::default()
+            },
+        );
+
+        tx.send(SubscribeRequest {
+            transactions,
+            commitment: Some(CommitmentLevel::Processed as i32),
+            ..Default::default()
+        })
+        .await?;
+
+        while let Some(update) = stream.next().await {
+            let update = update?;
+            let Some(UpdateOneof::Transaction(transaction_update)) = update.update_oneof else {
+                continue;
+            };
+            let Some(info_tx) = transaction_update.transaction else {
+                continue;
+            };
+            if info_tx.meta.as_ref().is_some_and(|meta| meta.err.is_some()) {
+                continue;
+            }
+            let Some(txn) = info_tx.transaction.as_ref() else {
+                continue;
+            };
+            let signature = bs58::encode(info_tx.signature.as_slice()).into_string();
+            for signal in axion_trigger_signals(
+                signature.clone(),
+                transaction_update.slot,
+                txn,
+                info_tx.meta.as_ref(),
+                axion_program,
+                &allowed_mints,
+            ) {
+                on_trigger(signal)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl RabbitStreamPlan {
     pub fn controlled_v1(endpoint: &StreamEndpointConfig) -> anyhow::Result<Option<Self>> {
         if !endpoint.enabled {

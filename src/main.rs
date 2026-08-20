@@ -157,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         &config,
         rpc_client.clone(),
         &wallet,
+        allowed_mints.clone(),
         &mut registry,
         grpc_plan,
         rabbitstream_plan,
@@ -224,18 +225,83 @@ async fn run_stream_workers(
     config: &AppConfig,
     rpc_client: Arc<RpcClient>,
     wallet: &solana_sdk::signature::Keypair,
+    allowed_mints: Vec<Pubkey>,
     registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     grpc_plan: Option<GeyserAccountStreamPlan>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
 ) -> anyhow::Result<()> {
-    if let Some(plan) = rabbitstream_plan {
-        info!(
-            "RabbitStream worker not started yet: url={} reason=trigger_parser_pending",
-            plan.url
-        );
-    }
+    run_rabbitstream_trigger_worker(config, rabbitstream_plan, allowed_mints)?;
 
     run_geyser_account_worker(config, rpc_client, wallet, registry, grpc_plan).await
+}
+
+#[cfg(feature = "geyser")]
+fn run_rabbitstream_trigger_worker(
+    config: &AppConfig,
+    rabbitstream_plan: Option<RabbitStreamPlan>,
+    allowed_mints: Vec<Pubkey>,
+) -> anyhow::Result<()> {
+    use solana_onchain_arbitrage_bot::streams::rabbitstream::yellowstone::run_axion_trigger_stream;
+    use std::collections::HashSet;
+
+    let Some(plan) = rabbitstream_plan else {
+        info!("RabbitStream worker not started: rabbitstream.enabled=false");
+        return Ok(());
+    };
+    if !config.axion.enabled {
+        info!(
+            "RabbitStream Axion trigger worker not started: url={} reason=axion_disabled",
+            plan.url
+        );
+        return Ok(());
+    }
+    let axion_program = Pubkey::from_str(&config.axion.program_id)?;
+    let allowed_mints = allowed_mints.into_iter().collect::<HashSet<_>>();
+    info!(
+        "starting RabbitStream Axion trigger worker: url={} allowed_mints={}",
+        plan.url,
+        allowed_mints.len()
+    );
+
+    tokio::spawn(async move {
+        let url = plan.url.clone();
+        let result =
+            run_axion_trigger_stream(plan, axion_program, allowed_mints, |signal| {
+                info!(
+                    "rabbitstream axion trigger: mint={} slot={} sig={}",
+                    signal.mint, signal.slot, signal.signature
+                );
+                Ok(())
+            })
+            .await;
+        if let Err(error) = result {
+            tracing::error!(
+                "RabbitStream Axion trigger worker stopped: url={} error={}",
+                url,
+                error
+            );
+        }
+    });
+
+    Ok(())
+}
+
+#[cfg(not(feature = "geyser"))]
+fn run_rabbitstream_trigger_worker(
+    _config: &AppConfig,
+    rabbitstream_plan: Option<RabbitStreamPlan>,
+    _allowed_mints: Vec<Pubkey>,
+) -> anyhow::Result<()> {
+    if let Some(plan) = rabbitstream_plan {
+        info!(
+            "RabbitStream worker not started: url={} reason=build_without_geyser_feature",
+            plan.url
+        );
+    } else {
+        info!("RabbitStream worker not started: rabbitstream.enabled=false");
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "geyser")]
