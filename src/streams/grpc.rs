@@ -6,6 +6,8 @@
 
 use crate::config::StreamEndpointConfig;
 use crate::dex::meteora::constants::dlmm_program_id;
+use crate::dex::meteora::dlmm_info::DlmmInfo;
+use crate::dex::pump::amm_info::{PUMP_BASE_MINT_GPA_OFFSET, PUMP_QUOTE_MINT_GPA_OFFSET};
 use crate::dex::pump::pump_program_id;
 use solana_program::pubkey::Pubkey;
 
@@ -13,11 +15,22 @@ use solana_program::pubkey::Pubkey;
 pub struct GeyserAccountStreamPlan {
     pub url: String,
     pub x_token: String,
-    pub owner_programs: Vec<Pubkey>,
+    pub subscriptions: Vec<GeyserAccountSubscription>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct GeyserAccountSubscription {
+    pub label: String,
+    pub owner_program: Pubkey,
+    pub memcmp_offset: usize,
+    pub memcmp_pubkey: Pubkey,
 }
 
 impl GeyserAccountStreamPlan {
-    pub fn controlled_v1(endpoint: &StreamEndpointConfig) -> anyhow::Result<Option<Self>> {
+    pub fn controlled_v1(
+        endpoint: &StreamEndpointConfig,
+        allowed_mints: &[Pubkey],
+    ) -> anyhow::Result<Option<Self>> {
         if !endpoint.enabled {
             return Ok(None);
         }
@@ -30,19 +43,58 @@ impl GeyserAccountStreamPlan {
             anyhow::bail!("grpc.x_token is required when grpc.enabled=true");
         }
 
+        if allowed_mints.is_empty() {
+            anyhow::bail!("allowed_mints must not be empty when grpc.enabled=true");
+        }
+
         Ok(Some(Self {
             url: endpoint.url.clone(),
             x_token: endpoint.x_token.clone(),
-            owner_programs: vec![pump_program_id(), dlmm_program_id()],
+            subscriptions: controlled_v1_subscriptions(allowed_mints),
         }))
     }
 
     pub fn owner_program_strings(&self) -> Vec<String> {
-        self.owner_programs
-            .iter()
-            .map(|program| program.to_string())
-            .collect()
+        let mut programs = Vec::new();
+        for subscription in &self.subscriptions {
+            let program = subscription.owner_program.to_string();
+            if !programs.contains(&program) {
+                programs.push(program);
+            }
+        }
+        programs
     }
+}
+
+fn controlled_v1_subscriptions(allowed_mints: &[Pubkey]) -> Vec<GeyserAccountSubscription> {
+    let mut subscriptions = Vec::with_capacity(allowed_mints.len() * 4);
+    for mint in allowed_mints {
+        subscriptions.push(GeyserAccountSubscription {
+            label: format!("pump-base-{}", mint),
+            owner_program: pump_program_id(),
+            memcmp_offset: PUMP_BASE_MINT_GPA_OFFSET,
+            memcmp_pubkey: *mint,
+        });
+        subscriptions.push(GeyserAccountSubscription {
+            label: format!("pump-quote-{}", mint),
+            owner_program: pump_program_id(),
+            memcmp_offset: PUMP_QUOTE_MINT_GPA_OFFSET,
+            memcmp_pubkey: *mint,
+        });
+        subscriptions.push(GeyserAccountSubscription {
+            label: format!("dlmm-x-{}", mint),
+            owner_program: dlmm_program_id(),
+            memcmp_offset: DlmmInfo::token_x_mint_gpa_offset(),
+            memcmp_pubkey: *mint,
+        });
+        subscriptions.push(GeyserAccountSubscription {
+            label: format!("dlmm-y-{}", mint),
+            owner_program: dlmm_program_id(),
+            memcmp_offset: DlmmInfo::token_y_mint_gpa_offset(),
+            memcmp_pubkey: *mint,
+        });
+    }
+    subscriptions
 }
 
 #[cfg(feature = "geyser")]
@@ -55,8 +107,10 @@ pub mod yellowstone {
     use std::collections::HashMap;
     use yellowstone_grpc_client::GeyserGrpcClient;
     use yellowstone_grpc_proto::prelude::{
-        subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-        SubscribeRequestFilterAccounts,
+        subscribe_request_filter_accounts_filter::Filter,
+        subscribe_request_filter_accounts_filter_memcmp::Data, subscribe_update::UpdateOneof,
+        CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
+        SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterMemcmp,
     };
 
     pub async fn run_account_stream(
@@ -71,14 +125,25 @@ pub mod yellowstone {
 
         let (mut tx, mut stream) = client.subscribe().await?;
         let mut accounts = HashMap::new();
-        accounts.insert(
-            "controlled-pools".to_string(),
-            SubscribeRequestFilterAccounts {
-                account: vec![],
-                owner: plan.owner_program_strings(),
-                filters: vec![],
-            },
-        );
+        for subscription in &plan.subscriptions {
+            accounts.insert(
+                subscription.label.clone(),
+                SubscribeRequestFilterAccounts {
+                    account: vec![],
+                    owner: vec![subscription.owner_program.to_string()],
+                    filters: vec![SubscribeRequestFilterAccountsFilter {
+                        filter: Some(Filter::Memcmp(SubscribeRequestFilterAccountsFilterMemcmp {
+                            offset: subscription.memcmp_offset as u64,
+                            data: Some(Data::Bytes(subscription.memcmp_pubkey.to_bytes().to_vec())),
+                        })),
+                    }],
+                },
+            );
+        }
+
+        if accounts.is_empty() {
+            anyhow::bail!("gRPC account stream has no account filters");
+        }
 
         tx.send(SubscribeRequest {
             accounts,
@@ -123,6 +188,33 @@ pub mod yellowstone {
     }
 }
 
+#[cfg(all(test, feature = "geyser"))]
+mod geyser_tests {
+    use super::*;
+    use yellowstone_grpc_proto::prelude::SubscribeRequestFilterAccounts;
+
+    #[test]
+    fn account_subscription_filters_are_expressible_for_yellowstone() {
+        let mint = Pubkey::new_from_array([7; 32]);
+        let plan = GeyserAccountStreamPlan {
+            url: "https://geyser.example".to_string(),
+            x_token: "token".to_string(),
+            subscriptions: controlled_v1_subscriptions(&[mint]),
+        };
+        let filters = plan
+            .subscriptions
+            .iter()
+            .map(|subscription| SubscribeRequestFilterAccounts {
+                account: vec![],
+                owner: vec![subscription.owner_program.to_string()],
+                filters: vec![],
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(filters.len(), 4);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,7 +227,7 @@ mod tests {
             x_token: String::new(),
         };
 
-        assert!(GeyserAccountStreamPlan::controlled_v1(&endpoint)
+        assert!(GeyserAccountStreamPlan::controlled_v1(&endpoint, &[])
             .unwrap()
             .is_none());
     }
@@ -148,16 +240,15 @@ mod tests {
             x_token: "token".to_string(),
         };
 
-        let plan = GeyserAccountStreamPlan::controlled_v1(&endpoint)
+        let plan = GeyserAccountStreamPlan::controlled_v1(&endpoint, &[Pubkey::new_unique()])
             .unwrap()
             .unwrap();
 
         assert_eq!(plan.url, endpoint.url);
         assert_eq!(plan.x_token, endpoint.x_token);
-        assert_eq!(
-            plan.owner_programs,
-            vec![pump_program_id(), dlmm_program_id()]
-        );
+        assert_eq!(plan.subscriptions.len(), 4);
+        assert_eq!(plan.subscriptions[0].owner_program, pump_program_id());
+        assert_eq!(plan.subscriptions[2].owner_program, dlmm_program_id());
     }
 
     #[test]
@@ -167,13 +258,28 @@ mod tests {
             url: String::new(),
             x_token: "token".to_string(),
         };
-        assert!(GeyserAccountStreamPlan::controlled_v1(&endpoint).is_err());
+        assert!(
+            GeyserAccountStreamPlan::controlled_v1(&endpoint, &[Pubkey::new_unique()]).is_err()
+        );
 
         let endpoint = StreamEndpointConfig {
             enabled: true,
             url: "https://geyser.example".to_string(),
             x_token: String::new(),
         };
-        assert!(GeyserAccountStreamPlan::controlled_v1(&endpoint).is_err());
+        assert!(
+            GeyserAccountStreamPlan::controlled_v1(&endpoint, &[Pubkey::new_unique()]).is_err()
+        );
+    }
+
+    #[test]
+    fn controlled_plan_requires_allowed_mints_when_enabled() {
+        let endpoint = StreamEndpointConfig {
+            enabled: true,
+            url: "https://geyser.example".to_string(),
+            x_token: "token".to_string(),
+        };
+
+        assert!(GeyserAccountStreamPlan::controlled_v1(&endpoint, &[]).is_err());
     }
 }

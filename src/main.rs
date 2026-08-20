@@ -56,7 +56,8 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::load(config_path)?;
     let wallet = load_keypair(&config.wallet.private_key).context("failed to load wallet")?;
-    let grpc_plan = GeyserAccountStreamPlan::controlled_v1(&config.grpc)?;
+    let allowed_mints = parse_allowed_mints(&config)?;
+    let grpc_plan = GeyserAccountStreamPlan::controlled_v1(&config.grpc, &allowed_mints)?;
     let rabbitstream_plan = RabbitStreamPlan::controlled_v1(&config.rabbitstream)?;
     let helius_sender_plan = HeliusSenderPlan::from_config(&config.sender.helius)?;
     info!(
@@ -74,7 +75,6 @@ async fn main() -> anyhow::Result<()> {
     log_stream_plans(grpc_plan.as_ref(), rabbitstream_plan.as_ref());
     log_sender_plan(&config, helius_sender_plan.as_ref());
 
-    let allowed_mints = parse_allowed_mints(&config)?;
     let rpc_client = Arc::new(RpcClient::new(config.rpc.http.clone()));
     let bootstrap = ControlledRpcBootstrap::new(
         rpc_client.clone(),
@@ -197,6 +197,10 @@ fn log_stream_plans(
             "gRPC account stream planned: url={} owner_programs={:?}",
             plan.url,
             plan.owner_program_strings()
+        );
+        info!(
+            "gRPC account stream filters planned: subscriptions={}",
+            plan.subscriptions.len()
         );
     } else {
         info!("gRPC account stream disabled");
