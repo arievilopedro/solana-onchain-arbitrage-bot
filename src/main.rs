@@ -12,13 +12,16 @@ use solana_onchain_arbitrage_bot::execution::{
     build_controlled_transaction, ControlledExecutionParams,
 };
 use solana_onchain_arbitrage_bot::routes::FixedDlmmRoutePacker;
-use solana_onchain_arbitrage_bot::sender::{HeliusSenderPlan, SenderTipConfig};
+use solana_onchain_arbitrage_bot::sender::{
+    HeliusSenderClient, HeliusSenderPlan, SenderTipConfig,
+};
 use solana_onchain_arbitrage_bot::streams::grpc::GeyserAccountStreamPlan;
 use solana_onchain_arbitrage_bot::streams::rabbitstream::RabbitStreamPlan;
 use solana_onchain_arbitrage_bot::wallet::load_keypair;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::signer::Signer;
+use solana_sdk::transaction::VersionedTransaction;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tracing::{info, Level};
@@ -267,6 +270,13 @@ fn run_rabbitstream_trigger_worker(
     }
     let axion_program = Pubkey::from_str(&config.axion.program_id)?;
     let allowed_mints = allowed_mints.into_iter().collect::<HashSet<_>>();
+    let helius_sender = if config.sender.primary == "helius" {
+        HeliusSenderPlan::from_config(&config.sender.helius)?
+            .map(HeliusSenderClient::new)
+            .transpose()?
+    } else {
+        None
+    };
     info!(
         "starting RabbitStream Axion trigger worker: url={} allowed_mints={}",
         plan.url,
@@ -299,11 +309,11 @@ fn run_rabbitstream_trigger_worker(
                     );
                     return Ok(());
                 }
-                let dry_run = {
+                let compilation = {
                     let registry = registry
                         .lock()
                         .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
-                    dry_run_controlled_mint_routes(
+                    compile_controlled_mint_routes(
                         &config,
                         rpc_client.as_ref(),
                         wallet.as_ref(),
@@ -315,23 +325,47 @@ fn run_rabbitstream_trigger_worker(
                     "trigger controlled tx dry-run: mint={} sig={} routes={} compiled={} missing_route_shard={} compile_failed={}",
                     signal.mint,
                     signal.signature,
-                    dry_run.routes,
-                    dry_run.compiled,
-                    dry_run.missing_route_shard,
-                    dry_run.compile_failed
+                    compilation.summary.routes,
+                    compilation.summary.compiled,
+                    compilation.summary.missing_route_shard,
+                    compilation.summary.compile_failed
                 );
-                if dry_run.compiled > 0 {
+                if compilation.summary.compiled > 0 {
                     if config.execution.send_live_transactions {
-                        info!(
-                            "trigger transaction send blocked: mint={} sig={} reason=sender_not_connected_yet compiled={}",
-                            signal.mint, signal.signature, dry_run.compiled
-                        );
+                        let Some(tx) = compilation.first_transaction else {
+                            info!(
+                                "trigger transaction send skipped: mint={} sig={} reason=missing_compiled_transaction",
+                                signal.mint, signal.signature
+                            );
+                            return Ok(());
+                        };
+                        let Some(sender) = helius_sender.clone() else {
+                            info!(
+                                "trigger transaction send skipped: mint={} sig={} reason=helius_sender_disabled",
+                                signal.mint, signal.signature
+                            );
+                            return Ok(());
+                        };
+                        let trigger_signature = signal.signature.clone();
+                        let trigger_mint = signal.mint;
+                        tokio::spawn(async move {
+                            match sender.send_transaction(&tx).await {
+                                Ok(signature) => info!(
+                                    "trigger transaction sent: mint={} trigger_sig={} tx_sig={}",
+                                    trigger_mint, trigger_signature, signature
+                                ),
+                                Err(error) => tracing::error!(
+                                    "trigger transaction send failed: mint={} trigger_sig={} error={}",
+                                    trigger_mint, trigger_signature, error
+                                ),
+                            }
+                        });
                     } else {
                         info!(
                             "would_send trigger transaction: mint={} sig={} compiled={} sender={} reason=send_live_transactions_false",
                             signal.mint,
                             signal.signature,
-                            dry_run.compiled,
+                            compilation.summary.compiled,
                             config.sender.primary
                         );
                     }
@@ -547,6 +581,12 @@ struct ControlledTxDryRunSummary {
     compile_failed: usize,
 }
 
+#[derive(Debug, Default)]
+struct ControlledMintCompilation {
+    summary: ControlledTxDryRunSummary,
+    first_transaction: Option<VersionedTransaction>,
+}
+
 fn plan_route_shards(
     config: &AppConfig,
     planner: &RouteShardPlanner,
@@ -660,8 +700,18 @@ fn dry_run_controlled_mint_routes(
     registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     mint: Pubkey,
 ) -> anyhow::Result<ControlledTxDryRunSummary> {
+    Ok(compile_controlled_mint_routes(config, rpc_client, wallet, registry, mint)?.summary)
+}
+
+fn compile_controlled_mint_routes(
+    config: &AppConfig,
+    rpc_client: &RpcClient,
+    wallet: &solana_sdk::signature::Keypair,
+    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    mint: Pubkey,
+) -> anyhow::Result<ControlledMintCompilation> {
     let Some(mint_state) = registry.get(&mint) else {
-        return Ok(ControlledTxDryRunSummary::default());
+        return Ok(ControlledMintCompilation::default());
     };
 
     let protocol_alt = load_lookup_table_account(
@@ -682,7 +732,7 @@ fn dry_run_controlled_mint_routes(
         sender_tip: sender_tip_config(config)?,
     };
     let now_ms = now_ms();
-    let mut summary = ControlledTxDryRunSummary::default();
+    let mut compilation = ControlledMintCompilation::default();
     let route_groups = packer.pack_mint_state(
         mint_state,
         config.execution.min_pool_base_liquidity_lamports,
@@ -691,29 +741,33 @@ fn dry_run_controlled_mint_routes(
     );
 
     for route in route_groups {
-        summary.routes += 1;
+        compilation.summary.routes += 1;
         let Some(route_alt) = route_resolver.load_lookup_for_mint(rpc_client, route.mint)? else {
-            summary.missing_route_shard += 1;
+            compilation.summary.missing_route_shard += 1;
             continue;
         };
         let lookup_tables = lookup_tables_for_route(&protocol_alt, &route_alt);
-        if build_controlled_transaction(
+        match build_controlled_transaction(
             wallet,
             &route,
             mint_state.token_program,
             recent_blockhash,
             &lookup_tables,
             params.clone(),
-        )
-        .is_ok()
-        {
-            summary.compiled += 1;
-        } else {
-            summary.compile_failed += 1;
+        ) {
+            Ok(tx) => {
+                compilation.summary.compiled += 1;
+                if compilation.first_transaction.is_none() {
+                    compilation.first_transaction = Some(tx);
+                }
+            }
+            Err(_) => {
+                compilation.summary.compile_failed += 1;
+            }
         }
     }
 
-    Ok(summary)
+    Ok(compilation)
 }
 
 fn sender_tip_config(config: &AppConfig) -> anyhow::Result<Option<SenderTipConfig>> {

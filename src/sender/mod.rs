@@ -1,8 +1,12 @@
 //! Transaction sender abstractions and rate limiting.
 
 use crate::config::HeliusSenderConfig;
+use reqwest::Client;
+use serde_json::{json, Value};
 use solana_program::pubkey::Pubkey;
+use solana_sdk::transaction::VersionedTransaction;
 use std::str::FromStr;
+use std::time::Duration;
 
 pub const HELIUS_TIP_ACCOUNTS: &[&str] = &[
     "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
@@ -64,6 +68,73 @@ impl HeliusSenderPlan {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct HeliusSenderClient {
+    plan: HeliusSenderPlan,
+    client: Client,
+}
+
+impl HeliusSenderClient {
+    pub fn new(plan: HeliusSenderPlan) -> anyhow::Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(plan.timeout_ms))
+            .build()?;
+        Ok(Self { plan, client })
+    }
+
+    pub async fn send_transaction(&self, tx: &VersionedTransaction) -> anyhow::Result<String> {
+        let bytes = bincode::serialize(tx)?;
+        let tx64 = base64::encode(bytes);
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                tx64,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": true,
+                    "maxRetries": 0
+                }
+            ]
+        });
+        let response = self
+            .client
+            .post(&self.plan.endpoint)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let value = response.json::<Value>().await?;
+
+        if !status.is_success() || value.get("error").is_some() {
+            anyhow::bail!("Helius sender status={} body={}", status, value);
+        }
+
+        extract_signature_from_response(&value)
+            .ok_or_else(|| anyhow::anyhow!("Helius sender missing signature body={}", value))
+    }
+}
+
+fn extract_signature_from_response(value: &Value) -> Option<String> {
+    if let Some(signature) = value.get("result").and_then(Value::as_str) {
+        return Some(signature.to_string());
+    }
+    if let Some(result) = value.get("result").and_then(Value::as_array) {
+        if let Some(signature) = result.first().and_then(Value::as_str) {
+            return Some(signature.to_string());
+        }
+    }
+    let result = value.get("result").unwrap_or(value);
+    for key in ["signature", "txid", "txId", "transactionSignature", "hash"] {
+        if let Some(signature) = result.get(key).and_then(Value::as_str) {
+            return Some(signature.to_string());
+        }
+    }
+    None
+}
+
 pub fn default_helius_tip_accounts_csv() -> String {
     HELIUS_TIP_ACCOUNTS.join(",")
 }
@@ -123,5 +194,21 @@ mod tests {
         let accounts = parse_tip_accounts(&default_helius_tip_accounts_csv()).unwrap();
 
         assert_eq!(accounts.len(), HELIUS_TIP_ACCOUNTS.len());
+    }
+
+    #[test]
+    fn extracts_sender_signature_from_common_shapes() {
+        assert_eq!(
+            extract_signature_from_response(&json!({"result": "sig1"})),
+            Some("sig1".to_string())
+        );
+        assert_eq!(
+            extract_signature_from_response(&json!({"result": ["sig2"]})),
+            Some("sig2".to_string())
+        );
+        assert_eq!(
+            extract_signature_from_response(&json!({"result": {"signature": "sig3"}})),
+            Some("sig3".to_string())
+        );
     }
 }
