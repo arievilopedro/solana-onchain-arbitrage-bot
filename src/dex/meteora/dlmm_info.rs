@@ -1,7 +1,7 @@
 use crate::dex::meteora::constants::{dlmm_program_id, BIN_ARRAY};
 use anyhow::Result;
 use solana_program::pubkey::Pubkey;
-use std::mem::size_of;
+use std::mem::{offset_of, size_of};
 use tracing::info;
 
 #[repr(C)]
@@ -98,6 +98,14 @@ pub struct DlmmInfo {
 }
 
 impl DlmmInfo {
+    pub fn token_x_mint_gpa_offset() -> usize {
+        8 + offset_of!(LbPair, token_x_mint)
+    }
+
+    pub fn token_y_mint_gpa_offset() -> usize {
+        8 + offset_of!(LbPair, token_y_mint)
+    }
+
     pub fn load_checked(data: &[u8]) -> Result<Self> {
         if data.len() < 8 + size_of::<LbPair>() {
             return Err(anyhow::anyhow!("Invalid data length for DlmmInfo"));

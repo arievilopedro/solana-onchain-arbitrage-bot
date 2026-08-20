@@ -1,43 +1,80 @@
-# Example configuration file for simplified onchain bot
-
-[bot]
-# Max compute unit limit per transaction
-compute_unit_limit = 600000
-
-[routing.markets]
-# List of pool/market addresses - DEX type is auto-detected by checking account owner
-markets = [
-    "Gf7sXMoP8iRw4iiXmJ1nq4vxcRycbGXy5RL8a8LnTd3v",   # Pump pool
-    "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",  # Raydium V4 pool
-    "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6",   # Meteora DLMM pool
-    "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",  # Whirlpool
-    "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv",  # Raydium CLMM pool
-]
-# Lookup tables (shared across all pools)
-lookup_table_accounts = ["8HvgxVyd22Jq9mmoojm4Awqw6sbymbF5pwLr8FtvySHs"]
-# Delay between processing cycles (ms)
-process_delay = 400
+# Controlled SOL-only MEV executor configuration.
+# Run target:
+# cargo run --release -- --config config.toml
 
 [rpc]
-# RPC URL for the Solana network
-url = "https://api.mainnet-beta.solana.com"
+# RPC HTTP may include its API key in the URL.
+http = "${RPC_HTTP_URL}"
 
-[spam]
-# Enable spam transactions
+[grpc]
 enabled = true
-# List of RPC URLs to use for sending transactions
-sending_rpc_urls = [
-  "https://api.mainnet-beta.solana.com",
+url = "${GRPC_URL}"
+x_token = "${GRPC_X_TOKEN}"
+
+[rabbitstream]
+enabled = true
+url = "${RABBITSTREAM_URL}"
+x_token = "${RABBITSTREAM_X_TOKEN}"
+
+[runtime]
+environment = "controlled"
+allowed_mints = [
+  "11111111111111111111111111111111",
 ]
-# Fixed compute unit price
-compute_unit_price = 1000
-# Maximum retries
-max_retries = 3
+
+[axion]
+enabled = true
+program_id = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9"
+min_sol = 1.0
+cooldown_ms = 0
+
+[mev]
+program_id = "MEViEnscUm6tsQRoGd9h6nLQaQspKj7DB2M5FwM3Xvz"
 
 [wallet]
-# Private key (can be path or environment variable)
-private_key = ""
+# Base58 private key, keypair file path, or env var.
+private_key = "${WALLET_PRIVATE_KEY}"
 
-[flashloan]
-# Enable flashloan
+[execution]
+use_flashloan = true
+sol_only = true
+minimum_profit_lamports = 100000
+no_failure_mode = true
+min_pool_base_liquidity_lamports = 1000000000
+max_pool_state_age_ms = 1500
+compile_dry_run_on_startup = true
+
+[routes]
+max_dlmm_per_tx = 3
+
+[lookup_tables]
+protocol_alt = "4sKLJ1Qoudh8PJyqBeuKocYdsZvxTcRShUt9aKqwhgvC"
+
+[lookup_tables.route_shards]
 enabled = true
+auto_create = true
+auto_extend = true
+execute_on_startup = false
+state_file = "state/route_shards.json"
+pending_file = "state/route_shards.pending.json"
+plan_file = "state/route_shards.plan.json"
+max_addresses = 256
+
+[sender]
+primary = "helius"
+send_rpc = false
+
+[sender.helius]
+enabled = true
+endpoint = "${HELIUS_SENDER_URL}"
+max_tps = 50
+burst = 20
+timeout_ms = 700
+
+[compute]
+default_limit = 450000
+unit_price = 1000
+
+[metrics]
+enabled = true
+file = "state/metrics.jsonl"

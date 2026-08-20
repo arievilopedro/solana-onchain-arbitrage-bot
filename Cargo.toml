@@ -10,6 +10,25 @@ license = "MIT"
 name = "solana_onchain_arbitrage_bot"
 path = "src/lib.rs"
 
+[features]
+default = []
+geyser = ["yellowstone-grpc-client", "yellowstone-grpc-proto"]
+
+[[bin]]
+name = "flashx_direct_executor"
+path = "src/bin/flashx_direct_executor.rs"
+required-features = ["geyser"]
+
+[[bin]]
+name = "pools_by_mint_updater"
+path = "src/bin/pools_by_mint_updater.rs"
+required-features = ["geyser"]
+
+[[bin]]
+name = "rabbitstream_probe"
+path = "src/bin/rabbitstream_probe.rs"
+required-features = ["geyser"]
+
 [dependencies]
 # Core Solana dependencies
 solana-sdk = "1.17"
@@ -32,8 +51,8 @@ toml = "0.5"
 # Async runtime
 tokio = { version = "1.32", features = ["full"] }
 futures = "0.3"
-yellowstone-grpc-client = "1.15.4"
-yellowstone-grpc-proto = "1.14.2"
+yellowstone-grpc-client = { version = "1.15.4", optional = true }
+yellowstone-grpc-proto = { version = "1.14.2", optional = true }
 
 # Utilities
 anyhow = "1.0"

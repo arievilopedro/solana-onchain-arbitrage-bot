@@ -4,6 +4,14 @@ use solana_program::pubkey::Pubkey;
 use super::constants::pump_program_id;
 
 const COIN_CREATOR_VAULT_SEED: &[u8] = b"creator_vault";
+const ACCOUNT_DISCRIMINATOR_LEN: usize = 8;
+const BASE_MINT_OFFSET_WITHOUT_DISCRIMINATOR: usize = 1 + 2 + 32;
+const QUOTE_MINT_OFFSET_WITHOUT_DISCRIMINATOR: usize = BASE_MINT_OFFSET_WITHOUT_DISCRIMINATOR + 32;
+
+pub const PUMP_BASE_MINT_GPA_OFFSET: usize =
+    ACCOUNT_DISCRIMINATOR_LEN + BASE_MINT_OFFSET_WITHOUT_DISCRIMINATOR;
+pub const PUMP_QUOTE_MINT_GPA_OFFSET: usize =
+    ACCOUNT_DISCRIMINATOR_LEN + QUOTE_MINT_OFFSET_WITHOUT_DISCRIMINATOR;
 
 #[derive(Debug)]
 pub struct PumpAmmInfo {
@@ -20,7 +28,7 @@ pub struct PumpAmmInfo {
 impl PumpAmmInfo {
     pub fn load_checked(data: &[u8]) -> Result<Self> {
         let data = &data[8..];
-        let base_mint_offset = 1 + 2 + 32; // bump + index + creator
+        let base_mint_offset = BASE_MINT_OFFSET_WITHOUT_DISCRIMINATOR; // bump + index + creator
         let quote_mint_offset = base_mint_offset + 32;
         let pool_base_offset = quote_mint_offset + 32 + 32; // + lp mint
         let pool_quote_offset = pool_base_offset + 32;
@@ -30,12 +38,9 @@ impl PumpAmmInfo {
             return Err(anyhow::anyhow!("Invalid data length for PumpAmmInfo"));
         }
 
-        let base_mint =
-            Pubkey::new(&data[base_mint_offset..base_mint_offset + 32]);
-        let quote_mint =
-            Pubkey::new(&data[quote_mint_offset..quote_mint_offset + 32]);
-        let pool_base_token_account =
-            Pubkey::new(&data[pool_base_offset..pool_base_offset + 32]);
+        let base_mint = Pubkey::new(&data[base_mint_offset..base_mint_offset + 32]);
+        let quote_mint = Pubkey::new(&data[quote_mint_offset..quote_mint_offset + 32]);
+        let pool_base_token_account = Pubkey::new(&data[pool_base_offset..pool_base_offset + 32]);
         let pool_quote_token_account =
             Pubkey::new(&data[pool_quote_offset..pool_quote_offset + 32]);
 

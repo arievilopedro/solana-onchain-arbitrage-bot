@@ -1,7 +1,9 @@
 use crate::config::Config;
 use crate::dex::byreal::byreal_program_id;
 use crate::dex::futarchy::futarchy_program_id;
-use crate::dex::heaven::constants::{heaven_program_id, heaven_protocol_account_1, heaven_protocol_account_2};
+use crate::dex::heaven::constants::{
+    heaven_program_id, heaven_protocol_account_1, heaven_protocol_account_2,
+};
 use crate::dex::humidifi::humidifi_program_id;
 use crate::dex::pancakeswap::pancakeswap_program_id;
 use crate::dex::raydium::{raydium_authority, raydium_cp_authority};
@@ -294,10 +296,8 @@ pub fn create_swap_instruction(
 
     // Step 2: Determine base_mint and wallet_base_account based on flashloan_base_mint
     let (base_mint_pubkey, wallet_base_account) = if flashloan_base_mint == usdc_mint {
-        let wallet_usdc_account = spl_associated_token_account::get_associated_token_address(
-            &wallet,
-            &usdc_mint,
-        );
+        let wallet_usdc_account =
+            spl_associated_token_account::get_associated_token_address(&wallet, &usdc_mint);
         (usdc_mint, wallet_usdc_account)
     } else {
         (sol_mint_pubkey, wallet_sol_account)
@@ -480,7 +480,8 @@ pub fn create_swap_instruction(
         accounts.push(AccountMeta::new_readonly(global_volume_accumulator, false));
         accounts.push(AccountMeta::new(user_volume_accumulator, false));
 
-        let pump_fee_program_id = Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ").unwrap();
+        let pump_fee_program_id =
+            Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ").unwrap();
         let fee_config = Pubkey::from_str("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx").unwrap();
         accounts.push(AccountMeta::new_readonly(fee_config, false));
         accounts.push(AccountMeta::new_readonly(pump_fee_program_id, false));
@@ -690,4 +691,107 @@ pub fn create_swap_instruction(
         accounts,
         data,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pools::MintPoolData;
+
+    fn pk(byte: u8) -> Pubkey {
+        Pubkey::new_from_array([byte; 32])
+    }
+
+    fn token_2022_program_id() -> Pubkey {
+        Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap()
+    }
+
+    #[test]
+    fn create_swap_instruction_data_matches_mevi_abi() {
+        let wallet = Keypair::new();
+        let mut pool_data = MintPoolData::new(pk(10), &wallet.pubkey(), spl_token::ID);
+        pool_data.wallet_wsol_account = pk(11);
+
+        let ix = create_swap_instruction(&wallet, &pool_data, 400_000, false, true).unwrap();
+
+        assert_eq!(
+            ix.data,
+            vec![28, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x1a, 0x06, 0x00, 1, 0, 0, 0,]
+        );
+    }
+
+    #[test]
+    fn create_swap_instruction_keeps_multiple_dlmm_blocks_in_order() {
+        let wallet = Keypair::new();
+        let mint = pk(20);
+        let token_program = token_2022_program_id();
+        let base_mint = sol_mint();
+        let mut pool_data = MintPoolData::new(mint, &wallet.pubkey(), token_program);
+        pool_data.wallet_wsol_account = pk(21);
+
+        pool_data.add_pump_pool(
+            pk(30),
+            pk(31),
+            pk(32),
+            pk(33),
+            pk(34),
+            pk(35),
+            pk(36),
+            pk(37),
+            mint,
+            base_mint,
+            false,
+            false,
+        );
+
+        let dlmm_inputs = [
+            (pk(40), pk(41), pk(42), pk(43), vec![pk(44), pk(45), pk(46)]),
+            (pk(50), pk(51), pk(52), pk(53), vec![pk(54), pk(55), pk(56)]),
+            (pk(60), pk(61), pk(62), pk(63), vec![pk(64), pk(65), pk(66)]),
+        ];
+
+        for (pair, token_vault, base_vault, oracle, bin_arrays) in &dlmm_inputs {
+            pool_data.add_dlmm_pool(
+                *pair,
+                *token_vault,
+                *base_vault,
+                *oracle,
+                None,
+                bin_arrays.clone(),
+                Some(Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr").unwrap()),
+                mint,
+                base_mint,
+            );
+        }
+
+        let ix = create_swap_instruction(&wallet, &pool_data, 400_000, false, true).unwrap();
+        let dlmm_program = dlmm_program_id();
+        let dlmm_positions = ix
+            .accounts
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, meta)| (meta.pubkey == dlmm_program).then_some(idx))
+            .collect::<Vec<_>>();
+
+        assert_eq!(dlmm_positions.len(), 3);
+
+        for (position, (pair, token_vault, base_vault, oracle, bin_arrays)) in
+            dlmm_positions.iter().zip(dlmm_inputs.iter())
+        {
+            let start = *position;
+            assert_eq!(ix.accounts[start + 1].pubkey, base_mint);
+            assert_eq!(ix.accounts[start + 2].pubkey, dlmm_event_authority());
+            assert_eq!(
+                ix.accounts[start + 3].pubkey,
+                Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr").unwrap()
+            );
+            assert_eq!(ix.accounts[start + 4].pubkey, *pair);
+            assert_eq!(ix.accounts[start + 5].pubkey, *token_vault);
+            assert_eq!(ix.accounts[start + 6].pubkey, *base_vault);
+            assert_eq!(ix.accounts[start + 7].pubkey, *oracle);
+            assert_eq!(ix.accounts[start + 8].pubkey, bin_arrays[0]);
+            assert_eq!(ix.accounts[start + 9].pubkey, bin_arrays[1]);
+            assert_eq!(ix.accounts[start + 10].pubkey, bin_arrays[2]);
+        }
+    }
 }
