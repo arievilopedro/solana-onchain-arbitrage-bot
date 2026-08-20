@@ -26,7 +26,9 @@ use tracing::{info, Level};
 #[cfg(feature = "geyser")]
 use std::collections::HashMap;
 #[cfg(feature = "geyser")]
-use solana_onchain_arbitrage_bot::streams::{apply_pool_account_update, rpc::StreamRpcEnricher};
+use solana_onchain_arbitrage_bot::streams::{
+    apply_pool_account_update, rpc::StreamRpcEnricher, SlotTracker,
+};
 use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
@@ -243,7 +245,9 @@ async fn run_geyser_account_worker(
     registry: &mut solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     grpc_plan: Option<GeyserAccountStreamPlan>,
 ) -> anyhow::Result<()> {
-    use solana_onchain_arbitrage_bot::streams::grpc::yellowstone::run_account_stream;
+    use solana_onchain_arbitrage_bot::streams::grpc::yellowstone::{
+        run_account_stream, GeyserStreamUpdate,
+    };
 
     let Some(plan) = grpc_plan else {
         info!("gRPC account worker not started: grpc.enabled=false");
@@ -253,8 +257,17 @@ async fn run_geyser_account_worker(
     let enricher = StreamRpcEnricher::new(rpc_client.clone());
     let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
     let mut last_route_groups_by_mint = HashMap::<Pubkey, usize>::new();
+    let mut slot_tracker = SlotTracker::new(150);
     info!("starting gRPC account worker: url={}", plan.url);
     run_account_stream(plan, |update| {
+        let update = match update {
+            GeyserStreamUpdate::Account(update) => update,
+            GeyserStreamUpdate::Slot(slot_update) => {
+                slot_tracker.record_processed_slot(slot_update.slot);
+                return Ok(());
+            }
+        };
+
         let report = apply_pool_account_update(
             registry,
             update,

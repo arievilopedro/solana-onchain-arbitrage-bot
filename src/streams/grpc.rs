@@ -100,7 +100,7 @@ fn controlled_v1_subscriptions(allowed_mints: &[Pubkey]) -> Vec<GeyserAccountSub
 #[cfg(feature = "geyser")]
 pub mod yellowstone {
     use super::GeyserAccountStreamPlan;
-    use crate::streams::PoolAccountUpdate;
+    use crate::streams::{PoolAccountUpdate, SlotUpdate};
     use futures::{SinkExt, StreamExt};
     use solana_program::pubkey::Pubkey;
     use solana_sdk::account::Account;
@@ -111,11 +111,18 @@ pub mod yellowstone {
         subscribe_request_filter_accounts_filter_memcmp::Data, subscribe_update::UpdateOneof,
         CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
         SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterMemcmp,
+        SubscribeRequestFilterSlots,
     };
+
+    #[derive(Debug, Clone)]
+    pub enum GeyserStreamUpdate {
+        Account(PoolAccountUpdate),
+        Slot(SlotUpdate),
+    }
 
     pub async fn run_account_stream(
         plan: GeyserAccountStreamPlan,
-        mut on_update: impl FnMut(PoolAccountUpdate) -> anyhow::Result<()>,
+        mut on_update: impl FnMut(GeyserStreamUpdate) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let mut client = GeyserGrpcClient::build_from_shared(plan.url.clone())?
             .x_token(Some(plan.x_token.clone()))?
@@ -147,6 +154,12 @@ pub mod yellowstone {
 
         tx.send(SubscribeRequest {
             accounts,
+            slots: HashMap::from([(
+                "processed-slots".to_string(),
+                SubscribeRequestFilterSlots {
+                    filter_by_commitment: Some(true),
+                },
+            )]),
             commitment: Some(CommitmentLevel::Processed as i32),
             ..Default::default()
         })
@@ -154,13 +167,27 @@ pub mod yellowstone {
 
         while let Some(update) = stream.next().await {
             let update = update?;
-            let Some(UpdateOneof::Account(account_update)) = update.update_oneof else {
-                continue;
-            };
-            let Some(pool_update) = pool_account_update_from_yellowstone(account_update)? else {
-                continue;
-            };
-            on_update(pool_update)?;
+            match update.update_oneof {
+                Some(UpdateOneof::Account(account_update)) => {
+                    let Some(pool_update) =
+                        pool_account_update_from_yellowstone(account_update)?
+                    else {
+                        continue;
+                    };
+                    on_update(GeyserStreamUpdate::Account(pool_update))?;
+                }
+                Some(UpdateOneof::Slot(slot_update)) => {
+                    if slot_update.status != CommitmentLevel::Processed as i32 {
+                        continue;
+                    }
+                    on_update(GeyserStreamUpdate::Slot(SlotUpdate {
+                        slot: slot_update.slot,
+                        parent: slot_update.parent,
+                        status: slot_update.status,
+                    }))?;
+                }
+                _ => continue,
+            }
         }
 
         Ok(())

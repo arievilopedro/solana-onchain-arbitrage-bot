@@ -369,6 +369,26 @@ pub fn execute_route_shard_plan(
     allowed_mints: impl IntoIterator<Item = Pubkey>,
     shard_capacity: usize,
 ) -> anyhow::Result<RouteShardMaintenanceReport> {
+    execute_route_shard_plan_with_recent_slots(
+        rpc_client,
+        wallet,
+        state_file,
+        plan_file,
+        allowed_mints,
+        shard_capacity,
+        &[],
+    )
+}
+
+pub fn execute_route_shard_plan_with_recent_slots(
+    rpc_client: &RpcClient,
+    wallet: &Keypair,
+    state_file: impl AsRef<Path>,
+    plan_file: impl AsRef<Path>,
+    allowed_mints: impl IntoIterator<Item = Pubkey>,
+    shard_capacity: usize,
+    recent_slot_candidates: &[u64],
+) -> anyhow::Result<RouteShardMaintenanceReport> {
     let plan = RouteShardPlanFile::load(plan_file)?;
     let mut planner = RouteShardPlanner::new(
         RouteShardStore::load(&state_file)?,
@@ -381,16 +401,14 @@ pub fn execute_route_shard_plan(
     };
 
     for operation in plan.operations {
-        let recent_slot = rpc_client.get_slot_with_commitment(CommitmentConfig::processed())?;
-        let built = operation.build_instructions(wallet.pubkey(), wallet.pubkey(), recent_slot)?;
         let blockhash = rpc_client.get_latest_blockhash()?;
-        let tx = Transaction::new_signed_with_payer(
-            &built.instructions,
-            Some(&wallet.pubkey()),
-            &[wallet],
+        let (built, tx) = build_simulated_route_shard_transaction(
+            rpc_client,
+            &operation,
+            wallet,
             blockhash,
-        );
-        ensure_route_shard_transaction_simulates(rpc_client, &tx, built.shard)?;
+            recent_slot_candidates,
+        )?;
         let signature = rpc_client.send_and_confirm_transaction(&tx)?;
         let confirmed_slot = rpc_client.get_slot()?;
 
@@ -404,6 +422,43 @@ pub fn execute_route_shard_plan(
     }
 
     Ok(report)
+}
+
+fn build_simulated_route_shard_transaction(
+    rpc_client: &RpcClient,
+    operation: &PendingRouteShardOperation,
+    wallet: &Keypair,
+    blockhash: solana_sdk::hash::Hash,
+    recent_slot_candidates: &[u64],
+) -> anyhow::Result<(RouteShardInstructions, Transaction)> {
+    let current_slot = rpc_client.get_slot_with_commitment(CommitmentConfig::processed())?;
+    let mut candidate_slots = recent_slot_candidates.to_vec();
+    candidate_slots.extend((1..=512u64).map(|offset| current_slot.saturating_sub(offset)));
+    let mut last_error = None;
+
+    // AddressLookupTable create requires a slot present in the simulating
+    // bank's SlotHashes sysvar. Current processed slot can be too new, while
+    // finalized/default slots can be too old, so probe stream-observed slots
+    // first and then recent parent slots from RPC.
+    candidate_slots.sort_unstable();
+    candidate_slots.dedup();
+    for recent_slot in candidate_slots.into_iter().rev() {
+        let built =
+            operation.build_instructions(wallet.pubkey(), wallet.pubkey(), recent_slot)?;
+        let tx = Transaction::new_signed_with_payer(
+            &built.instructions,
+            Some(&wallet.pubkey()),
+            &[wallet],
+            blockhash,
+        );
+
+        match ensure_route_shard_transaction_simulates(rpc_client, &tx, built.shard) {
+            Ok(()) => return Ok((built, tx)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no recent route shard slot candidates")))
 }
 
 fn ensure_route_shard_transaction_simulates(

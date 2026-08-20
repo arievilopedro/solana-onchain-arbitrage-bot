@@ -6,6 +6,7 @@ use crate::discovery::{dlmm_route_state_from_account, pump_route_state_from_acco
 use crate::registry::{PoolKind, PoolLiquidity, RuntimeRegistry};
 use solana_program::pubkey::Pubkey;
 use solana_sdk::account::Account;
+use std::collections::VecDeque;
 
 pub mod grpc;
 pub mod rabbitstream;
@@ -17,6 +18,52 @@ pub struct PoolAccountUpdate {
     pub owner: Pubkey,
     pub account: Account,
     pub slot: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SlotUpdate {
+    pub slot: u64,
+    pub parent: Option<u64>,
+    pub status: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlotTracker {
+    recent_slots: VecDeque<u64>,
+    max_slots: usize,
+}
+
+impl Default for SlotTracker {
+    fn default() -> Self {
+        Self::new(150)
+    }
+}
+
+impl SlotTracker {
+    pub fn new(max_slots: usize) -> Self {
+        Self {
+            recent_slots: VecDeque::new(),
+            max_slots: max_slots.max(1),
+        }
+    }
+
+    pub fn record_processed_slot(&mut self, slot: u64) {
+        if self.recent_slots.back().copied() == Some(slot) {
+            return;
+        }
+        self.recent_slots.push_back(slot);
+        while self.recent_slots.len() > self.max_slots {
+            self.recent_slots.pop_front();
+        }
+    }
+
+    pub fn recent_slot_candidates(&self) -> Vec<u64> {
+        self.recent_slots.iter().rev().copied().collect()
+    }
+
+    pub fn latest(&self) -> Option<u64> {
+        self.recent_slots.back().copied()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -259,6 +306,19 @@ mod tests {
                 ..RegistryUpdateReport::default()
             }
         );
+    }
+
+    #[test]
+    fn slot_tracker_keeps_recent_slots_newest_first_for_candidates() {
+        let mut tracker = SlotTracker::new(3);
+        tracker.record_processed_slot(10);
+        tracker.record_processed_slot(11);
+        tracker.record_processed_slot(11);
+        tracker.record_processed_slot(12);
+        tracker.record_processed_slot(13);
+
+        assert_eq!(tracker.latest(), Some(13));
+        assert_eq!(tracker.recent_slot_candidates(), vec![13, 12, 11]);
     }
 
     #[test]
