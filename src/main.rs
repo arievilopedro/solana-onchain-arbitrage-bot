@@ -24,6 +24,8 @@ use std::sync::Arc;
 use tracing::{info, Level};
 
 #[cfg(feature = "geyser")]
+use std::collections::HashMap;
+#[cfg(feature = "geyser")]
 use solana_onchain_arbitrage_bot::streams::{apply_pool_account_update, rpc::StreamRpcEnricher};
 use tracing_subscriber::FmtSubscriber;
 
@@ -247,6 +249,7 @@ async fn run_geyser_account_worker(
 
     let enricher = StreamRpcEnricher::new(rpc_client);
     let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
+    let mut last_route_groups_by_mint = HashMap::<Pubkey, usize>::new();
     info!("starting gRPC account worker: url={}", plan.url);
     run_account_stream(plan, |update| {
         let report = apply_pool_account_update(
@@ -261,61 +264,49 @@ async fn run_geyser_account_worker(
             let route_summary = report
                 .applied_mint
                 .and_then(|mint| registry.get(&mint).map(|state| (mint, state)))
-                .map(|(mint, state)| {
-                    let now_ms = now_ms();
-                    let eligible_pump = state
-                        .eligible_pumps(
-                            config.execution.min_pool_base_liquidity_lamports,
-                            config.execution.max_pool_state_age_ms,
-                            now_ms,
-                        )
-                        .len();
-                    let eligible_dlmm = state
-                        .eligible_dlmms(
-                            config.execution.min_pool_base_liquidity_lamports,
-                            config.execution.max_pool_state_age_ms,
-                            now_ms,
-                        )
-                        .len();
-                    let route_groups = packer
-                        .pack_mint_state(
-                            state,
-                            config.execution.min_pool_base_liquidity_lamports,
-                            config.execution.max_pool_state_age_ms,
-                            now_ms,
-                        )
-                        .len();
+                .map(|(mint, state)| (mint, live_route_candidate_summary(config, &packer, state)));
 
-                    (mint, eligible_pump, eligible_dlmm, route_groups)
-                });
-
-            info!(
-                "gRPC account update applied: kind={:?} mint={} pool={} base_liquidity_lamports={} route_groups={}",
-                report.applied_kind,
-                report
-                    .applied_mint
-                    .map(|mint| mint.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                report
-                    .applied_pool
-                    .map(|pool| pool.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                report
-                    .applied_base_liquidity_lamports
-                    .map(|liquidity| liquidity.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                route_summary
-                    .map(|(_, _, _, route_groups)| route_groups.to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            );
-
-            if let Some((mint, eligible_pump, eligible_dlmm, route_groups)) = route_summary {
-                if route_groups > 0 {
+            if let Some((mint, summary)) = route_summary {
+                let previous_route_groups =
+                    last_route_groups_by_mint.insert(mint, summary.route_groups);
+                if previous_route_groups != Some(summary.route_groups) {
                     info!(
-                        "route candidate ready: mint={} eligible_pump={} eligible_dlmm={} route_groups={}",
-                        mint, eligible_pump, eligible_dlmm, route_groups
+                        "route candidate state: mint={} eligible_pump={} eligible_dlmm={} route_groups={} previous_route_groups={} last_update_kind={:?} last_update_pool={} last_base_liquidity_lamports={}",
+                        mint,
+                        summary.eligible_pump,
+                        summary.eligible_dlmm,
+                        summary.route_groups,
+                        previous_route_groups
+                            .map(|groups| groups.to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        report.applied_kind,
+                        report
+                            .applied_pool
+                            .map(|pool| pool.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        report
+                            .applied_base_liquidity_lamports
+                            .map(|liquidity| liquidity.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
                     );
                 }
+            } else {
+                info!(
+                    "gRPC account update applied: kind={:?} mint={} pool={} base_liquidity_lamports={} route_groups=unknown",
+                    report.applied_kind,
+                    report
+                        .applied_mint
+                        .map(|mint| mint.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    report
+                        .applied_pool
+                        .map(|pool| pool.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    report
+                        .applied_base_liquidity_lamports
+                        .map(|liquidity| liquidity.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
             }
         } else if report.ignored_not_pool_program {
             info!("gRPC account update ignored: not_pool_program");
@@ -493,6 +484,51 @@ fn lookup_tables_for_route(
         vec![protocol_alt.clone()]
     } else {
         vec![protocol_alt.clone(), route_alt.clone()]
+    }
+}
+
+#[cfg(feature = "geyser")]
+#[derive(Debug, Clone, Copy)]
+struct LiveRouteCandidateSummary {
+    eligible_pump: usize,
+    eligible_dlmm: usize,
+    route_groups: usize,
+}
+
+#[cfg(feature = "geyser")]
+fn live_route_candidate_summary(
+    config: &AppConfig,
+    packer: &FixedDlmmRoutePacker,
+    state: &solana_onchain_arbitrage_bot::registry::MintRuntimeState,
+) -> LiveRouteCandidateSummary {
+    let now_ms = now_ms();
+    let eligible_pump = state
+        .eligible_pumps(
+            config.execution.min_pool_base_liquidity_lamports,
+            config.execution.max_pool_state_age_ms,
+            now_ms,
+        )
+        .len();
+    let eligible_dlmm = state
+        .eligible_dlmms(
+            config.execution.min_pool_base_liquidity_lamports,
+            config.execution.max_pool_state_age_ms,
+            now_ms,
+        )
+        .len();
+    let route_groups = packer
+        .pack_mint_state(
+            state,
+            config.execution.min_pool_base_liquidity_lamports,
+            config.execution.max_pool_state_age_ms,
+            now_ms,
+        )
+        .len();
+
+    LiveRouteCandidateSummary {
+        eligible_pump,
+        eligible_dlmm,
+        route_groups,
     }
 }
 
