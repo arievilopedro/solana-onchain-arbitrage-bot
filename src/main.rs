@@ -253,6 +253,8 @@ async fn run_geyser_account_worker(
             info!("gRPC account update applied");
         } else if report.ignored_not_pool_program {
             info!("gRPC account update ignored: not_pool_program");
+        } else if report.ignored_not_pool_account {
+            info!("gRPC account update ignored: not_pool_account");
         } else if report.ignored_not_allowlisted {
             info!("gRPC account update ignored: not_allowlisted");
         } else if report.ignored_missing_mint_state {

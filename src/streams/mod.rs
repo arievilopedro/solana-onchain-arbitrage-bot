@@ -23,6 +23,7 @@ pub struct PoolAccountUpdate {
 pub struct RegistryUpdateReport {
     pub applied: bool,
     pub ignored_not_pool_program: bool,
+    pub ignored_not_pool_account: bool,
     pub ignored_not_allowlisted: bool,
     pub ignored_missing_mint_state: bool,
     pub ignored_non_sol_route: bool,
@@ -61,13 +62,22 @@ fn apply_pump_update(
     liquidity: impl Fn(Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
 ) -> anyhow::Result<RegistryUpdateReport> {
     for mint in registry.allowed_mints().collect::<Vec<_>>() {
-        let Some(mut route) =
-            pump_route_state_from_account(mint, update.pubkey, &update.account, |base_vault| {
-                liquidity(base_vault)
-            })?
-        else {
-            continue;
+        let route = match pump_route_state_from_account(
+            mint,
+            update.pubkey,
+            &update.account,
+            |base_vault| liquidity(base_vault),
+        ) {
+            Ok(Some(route)) => route,
+            Ok(None) => continue,
+            Err(_) => {
+                return Ok(RegistryUpdateReport {
+                    ignored_not_pool_account: true,
+                    ..RegistryUpdateReport::default()
+                });
+            }
         };
+        let mut route = route;
 
         route.last_update_slot = update.slot;
         let Some(state) = registry.get_mut(&mint) else {
@@ -98,17 +108,24 @@ fn apply_dlmm_update(
     dlmm_bitmap_extension: impl Fn(Pubkey) -> anyhow::Result<Option<Pubkey>>,
 ) -> anyhow::Result<RegistryUpdateReport> {
     for mint in registry.allowed_mints().collect::<Vec<_>>() {
-        let Some(mut route) = dlmm_route_state_from_account(
+        let route = match dlmm_route_state_from_account(
             mint,
             update.pubkey,
             &update.account,
             |base_vault| liquidity(base_vault),
             |pair| dlmm_bitmap_extension(pair),
             |mint| mint_uses_token_2022(mint),
-        )?
-        else {
-            continue;
+        ) {
+            Ok(Some(route)) => route,
+            Ok(None) => continue,
+            Err(_) => {
+                return Ok(RegistryUpdateReport {
+                    ignored_not_pool_account: true,
+                    ..RegistryUpdateReport::default()
+                });
+            }
         };
+        let mut route = route;
 
         route.last_update_slot = update.slot;
         let Some(state) = registry.get_mut(&mint) else {
@@ -294,6 +311,37 @@ mod tests {
             report,
             RegistryUpdateReport {
                 ignored_missing_mint_state: true,
+                ..RegistryUpdateReport::default()
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_program_owned_accounts_that_do_not_match_pool_layout() {
+        let mint = pk(30);
+        let mut registry = RuntimeRegistry::new([mint]).unwrap();
+        registry
+            .upsert_mint(MintRuntimeState::new(mint, spl_token::ID))
+            .unwrap();
+
+        let report = apply_pool_account_update(
+            &mut registry,
+            PoolAccountUpdate {
+                pubkey: pk(31),
+                owner: pump_program_id(),
+                account: account(pump_program_id(), vec![0u8; 8]),
+                slot: 100,
+            },
+            fixed_liquidity,
+            no_token_2022,
+            no_bitmap,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report,
+            RegistryUpdateReport {
+                ignored_not_pool_account: true,
                 ..RegistryUpdateReport::default()
             }
         );
