@@ -18,7 +18,6 @@ pub enum PoolRejectReason {
     StaleState,
     MissingLiquidity,
     Disabled,
-    UnsupportedCashback,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -132,10 +131,6 @@ impl PumpRouteState {
         max_state_age_ms: u64,
         now_ms: u128,
     ) -> PoolEligibility {
-        if self.is_cashback_coin {
-            return PoolEligibility::Rejected(PoolRejectReason::UnsupportedCashback);
-        }
-
         pool_eligibility(
             self.enabled,
             self.base_mint,
@@ -346,21 +341,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pump_cashback_pools_are_not_executable_in_v1() {
-        let now_ms = 10_000;
-        let mut pool = pump(
-            sol_mint(),
-            Some(PoolLiquidity {
-                base_lamports: 1_500,
-                updated_at_ms: 9_900,
-            }),
-        );
-        pool.is_cashback_coin = true;
-
-        assert_eq!(
-            pool.eligibility(1_000, 500, now_ms),
-            PoolEligibility::Rejected(PoolRejectReason::UnsupportedCashback)
-        );
-    }
 }
