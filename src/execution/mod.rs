@@ -37,11 +37,63 @@ pub fn build_controlled_transaction(
     lookup_tables: &[AddressLookupTableAccount],
     params: ControlledExecutionParams,
 ) -> anyhow::Result<VersionedTransaction> {
+    build_controlled_transaction_internal(
+        wallet,
+        route,
+        token_program,
+        recent_blockhash,
+        lookup_tables,
+        params,
+        None,
+    )
+}
+
+/// Build a controlled transaction using a durable nonce.
+///
+/// The AdvanceNonceAccount instruction is added as the first instruction.
+pub fn build_controlled_transaction_with_nonce(
+    wallet: &Keypair,
+    route: &RouteGroup<PumpRouteState, DlmmRouteState>,
+    token_program: Pubkey,
+    nonce_hash: Hash,
+    nonce_pubkey: Pubkey,
+    lookup_tables: &[AddressLookupTableAccount],
+    params: ControlledExecutionParams,
+) -> anyhow::Result<VersionedTransaction> {
+    build_controlled_transaction_internal(
+        wallet,
+        route,
+        token_program,
+        nonce_hash,
+        lookup_tables,
+        params,
+        Some(nonce_pubkey),
+    )
+}
+
+fn build_controlled_transaction_internal(
+    wallet: &Keypair,
+    route: &RouteGroup<PumpRouteState, DlmmRouteState>,
+    token_program: Pubkey,
+    blockhash_or_nonce: Hash,
+    lookup_tables: &[AddressLookupTableAccount],
+    params: ControlledExecutionParams,
+    nonce_pubkey: Option<Pubkey>,
+) -> anyhow::Result<VersionedTransaction> {
     let mint_pool_data = route_group_to_mint_pool_data(route, &wallet.pubkey(), token_program);
-    let mut instructions = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(params.compute_unit_limit),
-        ComputeBudgetInstruction::set_compute_unit_price(params.compute_unit_price),
-    ];
+    let mut instructions = Vec::new();
+
+    // Durable nonce: AdvanceNonceAccount MUST be the first instruction
+    if let Some(nonce_account) = nonce_pubkey {
+        instructions.push(system_instruction::advance_nonce_account(
+            &nonce_account,
+            &wallet.pubkey(),
+        ));
+    }
+
+    instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(params.compute_unit_limit));
+    instructions.push(ComputeBudgetInstruction::set_compute_unit_price(params.compute_unit_price));
+
     if let Some(tip) = &params.sender_tip {
         let lamports = tip.random_lamports();
         if lamports > 0 {
@@ -67,7 +119,7 @@ pub fn build_controlled_transaction(
         &wallet.pubkey(),
         &instructions,
         lookup_tables,
-        recent_blockhash,
+        blockhash_or_nonce,
     )?;
 
     Ok(VersionedTransaction::try_new(

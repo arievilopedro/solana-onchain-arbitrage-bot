@@ -29,6 +29,10 @@ name = "rabbitstream_probe"
 path = "src/bin/rabbitstream_probe.rs"
 required-features = ["geyser"]
 
+[[bin]]
+name = "nonce_setup"
+path = "src/bin/nonce_setup.rs"
+
 [dependencies]
 # Core Solana dependencies
 solana-sdk = "1.17"

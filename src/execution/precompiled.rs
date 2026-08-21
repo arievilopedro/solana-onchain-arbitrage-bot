@@ -4,8 +4,15 @@
 //! ready to be sent immediately when a trigger arrives. Transactions are
 //! compiled in the background when pool state changes, respecting the
 //! `max_dlmm_per_tx` limit by creating multiple transaction groups.
+//!
+//! Supports two modes:
+//! - **Blockhash mode**: Transactions use recent blockhash, expire after TTL
+//! - **Nonce mode**: Transactions use durable nonce, never expire
 
-use crate::execution::{build_controlled_transaction, ControlledExecutionParams};
+use crate::execution::{
+    build_controlled_transaction, build_controlled_transaction_with_nonce, ControlledExecutionParams,
+};
+use crate::nonce::NonceManager;
 use crate::registry::{DlmmRouteState, MintRuntimeState, PumpRouteState};
 use crate::routes::{FixedDlmmRoutePacker, RouteGroup};
 use dashmap::DashMap;
@@ -13,8 +20,10 @@ use solana_program::pubkey::Pubkey;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::hash::Hash;
 use solana_sdk::signature::Keypair;
+use solana_sdk::signer::Signer;
 use solana_sdk::transaction::VersionedTransaction;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -45,23 +54,37 @@ pub struct PreCompiledEntry {
     pub dlmm_count: usize,
     /// When this entry was compiled.
     pub compiled_at: Instant,
-    /// The blockhash used for this transaction.
+    /// The blockhash or nonce hash used for this transaction.
     pub blockhash: Hash,
     /// When this entry expires (blockhash becomes invalid).
+    /// For nonce mode, this is set far in the future.
     pub expires_at: Instant,
+    /// If using durable nonce, the nonce account pubkey.
+    pub nonce_pubkey: Option<Pubkey>,
 }
 
 impl PreCompiledEntry {
     /// Check if this entry is still valid (not expired).
+    /// Nonce-based entries never expire by time.
     pub fn is_valid(&self) -> bool {
-        Instant::now() < self.expires_at
+        self.nonce_pubkey.is_some() || Instant::now() < self.expires_at
+    }
+
+    /// Check if this entry uses a durable nonce.
+    pub fn uses_nonce(&self) -> bool {
+        self.nonce_pubkey.is_some()
     }
 
     /// Time until expiration in milliseconds.
+    /// Returns u64::MAX for nonce-based entries.
     pub fn ttl_ms(&self) -> u64 {
-        self.expires_at
-            .saturating_duration_since(Instant::now())
-            .as_millis() as u64
+        if self.nonce_pubkey.is_some() {
+            u64::MAX
+        } else {
+            self.expires_at
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64
+        }
     }
 }
 
@@ -69,13 +92,21 @@ impl PreCompiledEntry {
 ///
 /// Each mint can have multiple pre-compiled transactions, one per route group.
 /// Route groups are created by splitting DLMM pools according to `max_dlmm_per_tx`.
+///
+/// Supports two modes:
+/// - Blockhash mode: TTL-based expiration
+/// - Nonce mode: Never expires, uses durable nonce
 pub struct PreCompiledTxCache {
     /// Pre-compiled transactions indexed by mint.
     cache: DashMap<Pubkey, Vec<PreCompiledEntry>>,
     /// Route packer for splitting DLMM pools into groups.
     packer: FixedDlmmRoutePacker,
-    /// TTL for cached transactions in milliseconds.
+    /// TTL for cached transactions in milliseconds (blockhash mode only).
     ttl_ms: u64,
+    /// Whether nonce mode is enabled.
+    nonce_enabled: AtomicBool,
+    /// Nonce manager for durable nonce mode.
+    nonce_manager: Option<Arc<NonceManager>>,
     /// Statistics counters.
     stats_hits: AtomicU64,
     stats_misses: AtomicU64,
@@ -89,12 +120,14 @@ impl PreCompiledTxCache {
         Self::with_ttl(packer, DEFAULT_TTL_MS)
     }
 
-    /// Create a new cache with a custom TTL.
+    /// Create a new cache with a custom TTL (blockhash mode).
     pub fn with_ttl(packer: FixedDlmmRoutePacker, ttl_ms: u64) -> Self {
         Self {
             cache: DashMap::new(),
             packer,
             ttl_ms,
+            nonce_enabled: AtomicBool::new(false),
+            nonce_manager: None,
             stats_hits: AtomicU64::new(0),
             stats_misses: AtomicU64::new(0),
             stats_expired: AtomicU64::new(0),
@@ -102,10 +135,37 @@ impl PreCompiledTxCache {
         }
     }
 
+    /// Create a new cache with durable nonce support.
+    pub fn with_nonce(packer: FixedDlmmRoutePacker, nonce_manager: Arc<NonceManager>) -> Self {
+        Self {
+            cache: DashMap::new(),
+            packer,
+            ttl_ms: DEFAULT_TTL_MS, // Not used in nonce mode
+            nonce_enabled: AtomicBool::new(true),
+            nonce_manager: Some(nonce_manager),
+            stats_hits: AtomicU64::new(0),
+            stats_misses: AtomicU64::new(0),
+            stats_expired: AtomicU64::new(0),
+            stats_refreshes: AtomicU64::new(0),
+        }
+    }
+
+    /// Check if nonce mode is enabled.
+    pub fn is_nonce_enabled(&self) -> bool {
+        self.nonce_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Get the nonce manager (if in nonce mode).
+    pub fn nonce_manager(&self) -> Option<&Arc<NonceManager>> {
+        self.nonce_manager.as_ref()
+    }
+
     /// Refresh pre-compiled transactions for a mint.
     ///
     /// This compiles transactions for all eligible route groups and stores them
     /// in the cache. Should be called when pool state changes or blockhash updates.
+    ///
+    /// In nonce mode, the blockhash parameter is ignored and nonces are used instead.
     pub fn refresh_mint(
         &self,
         mint: Pubkey,
@@ -142,32 +202,75 @@ impl PreCompiledTxCache {
         }
 
         let now = Instant::now();
-        let expires_at = now + std::time::Duration::from_millis(self.ttl_ms);
+        let use_nonce = self.is_nonce_enabled();
+
+        // For nonce mode, set expiry far in the future (effectively never expires)
+        let expires_at = if use_nonce {
+            now + std::time::Duration::from_secs(365 * 24 * 60 * 60) // 1 year
+        } else {
+            now + std::time::Duration::from_millis(self.ttl_ms)
+        };
+
         let mut entries = Vec::with_capacity(route_groups.len());
 
         for (index, route) in route_groups.iter().enumerate() {
-            match build_controlled_transaction(
-                wallet,
-                route,
-                token_program,
-                blockhash,
-                lookup_tables,
-                params.clone(),
-            ) {
+            let (tx_result, used_hash, nonce_pk) = if use_nonce {
+                // Use durable nonce
+                if let Some(nonce_manager) = &self.nonce_manager {
+                    if let Some((nonce_pubkey, nonce_hash, _authority)) = nonce_manager.next_nonce() {
+                        let result = build_controlled_transaction_with_nonce(
+                            wallet,
+                            route,
+                            token_program,
+                            nonce_hash,
+                            nonce_pubkey,
+                            lookup_tables,
+                            params.clone(),
+                        );
+                        (result, nonce_hash, Some(nonce_pubkey))
+                    } else {
+                        warn!(
+                            "precompiled tx skipped: mint={} group={} reason=no_nonce_available",
+                            mint, index
+                        );
+                        continue;
+                    }
+                } else {
+                    warn!(
+                        "precompiled tx skipped: mint={} group={} reason=nonce_manager_missing",
+                        mint, index
+                    );
+                    continue;
+                }
+            } else {
+                // Use regular blockhash
+                let result = build_controlled_transaction(
+                    wallet,
+                    route,
+                    token_program,
+                    blockhash,
+                    lookup_tables,
+                    params.clone(),
+                );
+                (result, blockhash, None)
+            };
+
+            match tx_result {
                 Ok(tx) => {
                     entries.push(PreCompiledEntry {
                         transaction: tx,
                         route_group_index: index,
                         dlmm_count: route.dlmms.len(),
                         compiled_at: now,
-                        blockhash,
+                        blockhash: used_hash,
                         expires_at,
+                        nonce_pubkey: nonce_pk,
                     });
                 }
                 Err(e) => {
                     warn!(
-                        "precompiled tx compile failed: mint={} group={} error={}",
-                        mint, index, e
+                        "precompiled tx compile failed: mint={} group={} nonce={} error={}",
+                        mint, index, use_nonce, e
                     );
                 }
             }
@@ -177,13 +280,17 @@ impl PreCompiledTxCache {
         self.cache.insert(mint, entries);
         self.stats_refreshes.fetch_add(1, Ordering::Relaxed);
 
-        debug!(
-            "precompiled cache refreshed: mint={} transactions={} ttl_ms={} blockhash={}",
-            mint,
-            tx_count,
-            self.ttl_ms,
-            blockhash
-        );
+        if use_nonce {
+            debug!(
+                "precompiled cache refreshed (nonce): mint={} transactions={} nonce_mode=true",
+                mint, tx_count
+            );
+        } else {
+            debug!(
+                "precompiled cache refreshed: mint={} transactions={} ttl_ms={} blockhash={}",
+                mint, tx_count, self.ttl_ms, blockhash
+            );
+        }
     }
 
     /// Get all valid pre-compiled transactions for a mint.
@@ -411,6 +518,7 @@ mod tests {
                 compiled_at: Instant::now(),
                 blockhash: Hash::new_unique(),
                 expires_at: Instant::now() + std::time::Duration::from_secs(30),
+                nonce_pubkey: None,
             }],
         );
 
@@ -437,6 +545,7 @@ mod tests {
                 compiled_at: Instant::now(),
                 blockhash: Hash::new_unique(),
                 expires_at: Instant::now(), // Already expired
+                nonce_pubkey: None,
             }],
         );
 

@@ -8,6 +8,7 @@ pub mod dex;
 pub mod discovery;
 pub mod execution;
 pub mod metrics;
+pub mod nonce;
 pub mod pool_refreshers;
 pub mod pools;
 pub mod refresh;

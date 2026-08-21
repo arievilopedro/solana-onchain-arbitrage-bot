@@ -72,6 +72,8 @@ pub struct AppConfig {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub precompiled: PrecompiledConfig,
+    #[serde(default)]
+    pub nonce: NonceConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -262,6 +264,39 @@ fn default_precompiled_ttl_ms() -> u64 {
 
 fn default_precompiled_cleanup_interval_ms() -> u64 {
     5_000 // 5 seconds
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct NonceConfig {
+    /// Enable durable nonce for pre-compiled transactions.
+    /// When enabled, transactions never expire due to blockhash.
+    #[serde(default = "default_nonce_enabled")]
+    pub enabled: bool,
+    /// List of pre-created nonce account pubkeys.
+    /// Create these accounts before enabling nonce mode.
+    #[serde(default)]
+    pub accounts: Vec<String>,
+    /// Interval for refreshing nonce values from chain in milliseconds.
+    #[serde(default = "default_nonce_refresh_interval_ms")]
+    pub refresh_interval_ms: u64,
+}
+
+impl Default for NonceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_nonce_enabled(),
+            accounts: Vec::new(),
+            refresh_interval_ms: default_nonce_refresh_interval_ms(),
+        }
+    }
+}
+
+fn default_nonce_enabled() -> bool {
+    false // Disabled by default - requires account setup
+}
+
+fn default_nonce_refresh_interval_ms() -> u64 {
+    10_000 // 10 seconds
 }
 
 pub fn serde_string_or_env<'de, D>(deserializer: D) -> Result<String, D::Error>

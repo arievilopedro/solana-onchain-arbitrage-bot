@@ -16,6 +16,7 @@ use solana_onchain_arbitrage_bot::discovery::{ControlledRpcBootstrap, RpcBootstr
 use solana_onchain_arbitrage_bot::execution::{
     build_controlled_transaction, ControlledExecutionParams, PreCompiledTxCache,
 };
+use solana_onchain_arbitrage_bot::nonce::{parse_nonce_pubkeys, NonceManager};
 use solana_onchain_arbitrage_bot::registry::{DlmmRouteState, PumpRouteState};
 use solana_onchain_arbitrage_bot::routes::{FixedDlmmRoutePacker, RouteGroup};
 use solana_onchain_arbitrage_bot::sender::{HeliusSenderClient, HeliusSenderPlan, SenderTipConfig};
@@ -197,7 +198,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to start blockhash cache")?;
     let route_execution_cache = if config.lookup_tables.route_shards.enabled {
         Some(Arc::new(RwLock::new(
-            RouteExecutionCache::load(&config, rpc_client.as_ref())
+            RouteExecutionCache::load(&config, rpc_client.as_ref(), wallet.as_ref())
                 .context("failed to load route execution cache")?,
         )))
     } else {
@@ -227,6 +228,34 @@ async fn main() -> anyhow::Result<()> {
             info!(
                 "precompiled cache cleanup task started: interval_ms={}",
                 cleanup_interval_ms
+            );
+        }
+    }
+
+    // Start nonce refresh task if nonce mode is enabled
+    if config.nonce.enabled {
+        if let Some(cache) = &route_execution_cache {
+            let cache = cache.clone();
+            let rpc_client = rpc_client.clone();
+            let refresh_interval_ms = config.nonce.refresh_interval_ms;
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(refresh_interval_ms));
+                loop {
+                    interval.tick().await;
+                    if let Ok(cache) = cache.read() {
+                        if let Some(nonce_manager) = &cache.nonce_manager {
+                            let refreshed = nonce_manager.refresh_all(rpc_client.as_ref());
+                            tracing::debug!(
+                                "nonce values refreshed: count={}",
+                                refreshed
+                            );
+                        }
+                    }
+                }
+            });
+            info!(
+                "nonce refresh task started: interval_ms={}",
+                refresh_interval_ms
             );
         }
     }
@@ -365,6 +394,7 @@ struct RouteExecutionCache {
     packer: FixedDlmmRoutePacker,
     params: ControlledExecutionParams,
     precompiled_cache: PreCompiledTxCache,
+    nonce_manager: Option<Arc<NonceManager>>,
 }
 
 #[derive(Debug, Default)]
@@ -385,7 +415,11 @@ struct GeyserRouteAction {
 }
 
 impl RouteExecutionCache {
-    fn load(config: &AppConfig, rpc_client: &RpcClient) -> anyhow::Result<Self> {
+    fn load(
+        config: &AppConfig,
+        rpc_client: &RpcClient,
+        wallet: &solana_sdk::signature::Keypair,
+    ) -> anyhow::Result<Self> {
         let protocol_alt = load_lookup_table_account(
             rpc_client,
             Pubkey::from_str(&config.lookup_tables.protocol_alt)?,
@@ -402,16 +436,46 @@ impl RouteExecutionCache {
             .collect::<HashMap<_, _>>();
         let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
         let params = controlled_execution_params(config)?;
-        let precompiled_cache = PreCompiledTxCache::with_ttl(
-            FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?,
-            config.precompiled.ttl_ms,
-        );
+
+        // Initialize nonce manager if enabled
+        let nonce_manager = if config.nonce.enabled && !config.nonce.accounts.is_empty() {
+            let nonce_pubkeys = parse_nonce_pubkeys(&config.nonce.accounts)
+                .context("failed to parse nonce account pubkeys")?;
+            let manager = NonceManager::load(rpc_client, &nonce_pubkeys, wallet.pubkey())
+                .context("failed to load nonce manager")?;
+            info!(
+                "nonce manager loaded: accounts={} authority={}",
+                manager.account_count(),
+                wallet.pubkey()
+            );
+            Some(Arc::new(manager))
+        } else {
+            None
+        };
+
+        // Create precompiled cache with nonce support if enabled
+        let precompiled_cache = if let Some(ref nonce_mgr) = nonce_manager {
+            info!("precompiled cache using durable nonce mode");
+            PreCompiledTxCache::with_nonce(
+                FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?,
+                nonce_mgr.clone(),
+            )
+        } else {
+            info!(
+                "precompiled cache using blockhash mode: ttl_ms={}",
+                config.precompiled.ttl_ms
+            );
+            PreCompiledTxCache::with_ttl(
+                FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?,
+                config.precompiled.ttl_ms,
+            )
+        };
 
         info!(
-            "route execution cache loaded: protocol_alt={} route_alts={} precompiled_ttl_ms={}",
+            "route execution cache loaded: protocol_alt={} route_alts={} nonce_enabled={}",
             protocol_alt.key,
             route_alts.len(),
-            config.precompiled.ttl_ms
+            nonce_manager.is_some()
         );
 
         Ok(Self {
@@ -421,6 +485,7 @@ impl RouteExecutionCache {
             packer,
             params,
             precompiled_cache,
+            nonce_manager,
         })
     }
 }
@@ -1534,7 +1599,7 @@ fn process_geyser_route_action(
     ) {
         Ok(confirmed) if confirmed > 0 => {
             if let Some(cache) = &route_execution_cache {
-                match RouteExecutionCache::load(&config, rpc_client.as_ref()) {
+                match RouteExecutionCache::load(&config, rpc_client.as_ref(), wallet.as_ref()) {
                     Ok(updated_cache) => {
                         if let Ok(mut cache) = cache.write() {
                             *cache = updated_cache;
