@@ -4,6 +4,7 @@ use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSimulateTransactionConfig;
 use solana_onchain_arbitrage_bot::constants::sol_mint;
 use solana_onchain_arbitrage_bot::dex::pump::pump_program_id;
+use solana_onchain_arbitrage_bot::ata::ensure_base_atas_exist;
 use solana_onchain_arbitrage_bot::alt::{
     execute_route_shard_plan, execute_route_shard_plan_with_recent_slots,
     load_lookup_table_account, PendingRouteShardOperation, PlannedRouteShardExtension,
@@ -25,12 +26,15 @@ use solana_onchain_arbitrage_bot::transaction::derive_vault_token_account;
 use solana_onchain_arbitrage_bot::wallet::load_keypair;
 use solana_program::pubkey::Pubkey;
 use solana_program::program_pack::Pack;
+use solana_sdk::address_lookup_table::state::AddressLookupTable;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
+use solana_sdk::message::VersionedMessage;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 use solana_sdk::transaction::VersionedTransaction;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{info, Level};
 
@@ -92,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
     log_sender_plan(&config, helius_sender_plan.as_ref());
 
     let rpc_client = Arc::new(RpcClient::new(config.rpc.http.clone()));
+    ensure_base_atas_exist(&rpc_client, &wallet).context("failed to verify base token ATAs")?;
     let bootstrap = ControlledRpcBootstrap::new(
         rpc_client.clone(),
         RpcBootstrapConfig {
@@ -461,6 +466,8 @@ fn ensure_trigger_transaction_simulates(
     rpc_client: &RpcClient,
     tx: &VersionedTransaction,
 ) -> anyhow::Result<()> {
+    static DUMPED_SIMULATION_ACCOUNTS: AtomicBool = AtomicBool::new(false);
+
     let simulation = rpc_client.simulate_transaction_with_config(
         tx,
         RpcSimulateTransactionConfig {
@@ -471,9 +478,119 @@ fn ensure_trigger_transaction_simulates(
     )?;
     if let Some(err) = simulation.value.err {
         let logs = simulation.value.logs.unwrap_or_default().join(" | ");
+        if !DUMPED_SIMULATION_ACCOUNTS.swap(true, Ordering::Relaxed) {
+            if let Err(error) = dump_simulation_account_owners(rpc_client, tx) {
+                tracing::error!("simulation account owner dump failed: {}", error);
+            }
+        }
         anyhow::bail!("err={:?} logs={}", err, logs);
     }
     Ok(())
+}
+
+fn dump_simulation_account_owners(
+    rpc_client: &RpcClient,
+    tx: &VersionedTransaction,
+) -> anyhow::Result<()> {
+    let account_keys = resolve_transaction_account_keys(rpc_client, tx)?;
+    info!(
+        "simulation account owner dump: total_accounts={}",
+        account_keys.len()
+    );
+
+    for (index, pubkey) in account_keys.iter().enumerate() {
+        match rpc_client.get_account(pubkey) {
+            Ok(account) => {
+                if account.owner == spl_token::ID {
+                    match spl_token::state::Account::unpack(&account.data) {
+                        Ok(token_account) => info!(
+                            "simulation account: index={} pubkey={} owner={} data_len={} token_mint={} token_owner={} token_amount={}",
+                            index + 1,
+                            pubkey,
+                            account.owner,
+                            account.data.len(),
+                            token_account.mint,
+                            token_account.owner,
+                            token_account.amount
+                        ),
+                        Err(error) => info!(
+                            "simulation account: index={} pubkey={} owner={} data_len={} token_unpack_error={}",
+                            index + 1,
+                            pubkey,
+                            account.owner,
+                            account.data.len(),
+                            error
+                        ),
+                    }
+                } else {
+                    info!(
+                        "simulation account: index={} pubkey={} owner={} data_len={}",
+                        index + 1,
+                        pubkey,
+                        account.owner,
+                        account.data.len()
+                    );
+                }
+            }
+            Err(error) => info!(
+                "simulation account: index={} pubkey={} missing error={}",
+                index + 1,
+                pubkey,
+                error
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_transaction_account_keys(
+    rpc_client: &RpcClient,
+    tx: &VersionedTransaction,
+) -> anyhow::Result<Vec<Pubkey>> {
+    let VersionedMessage::V0(message) = &tx.message else {
+        return match &tx.message {
+            VersionedMessage::Legacy(message) => Ok(message.account_keys.clone()),
+            VersionedMessage::V0(_) => unreachable!(),
+        };
+    };
+
+    let mut account_keys = message.account_keys.clone();
+    for lookup in &message.address_table_lookups {
+        let account = rpc_client
+            .get_account(&lookup.account_key)
+            .with_context(|| format!("failed to load ALT {}", lookup.account_key))?;
+        let table = AddressLookupTable::deserialize(&account.data).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to deserialize ALT {}: {:?}",
+                lookup.account_key,
+                error
+            )
+        })?;
+
+        for index in &lookup.writable_indexes {
+            let Some(address) = table.addresses.get(*index as usize) else {
+                anyhow::bail!(
+                    "ALT {} missing writable index {}",
+                    lookup.account_key,
+                    index
+                );
+            };
+            account_keys.push(*address);
+        }
+        for index in &lookup.readonly_indexes {
+            let Some(address) = table.addresses.get(*index as usize) else {
+                anyhow::bail!(
+                    "ALT {} missing readonly index {}",
+                    lookup.account_key,
+                    index
+                );
+            };
+            account_keys.push(*address);
+        }
+    }
+
+    Ok(account_keys)
 }
 
 fn ensure_pda_ata(
