@@ -25,6 +25,7 @@ use crate::registry::MintRuntimeState;
 
 pub const ROUTE_SHARD_STATE_VERSION: u8 = 1;
 pub const ROUTE_SHARD_MAX_ADDRESSES: usize = 256;
+const ROUTE_SHARD_EXTEND_ADDRESSES_PER_TX: usize = 19;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -238,8 +239,10 @@ impl PendingRouteShardOperation {
                 parse_pubkey(shard)?;
                 parse_pubkey(mint)?;
                 let addresses = parse_pubkeys(addresses)?;
-                if addresses.len() == 3 {
-                    let _ = stable_dlmm_from_addresses(&addresses)?;
+                if !addresses.is_empty() && addresses.len() % 3 == 0 {
+                    for chunk in addresses.chunks(3) {
+                        let _ = stable_dlmm_from_addresses(chunk)?;
+                    }
                 } else {
                     validate_mint_block_addresses(parse_pubkey(mint)?, &addresses)?;
                 }
@@ -420,32 +423,95 @@ pub fn execute_route_shard_plan_with_recent_slots(
         shard_capacity,
     )?;
     let mut report = RouteShardMaintenanceReport {
-        attempted: plan.operations.len(),
+        attempted: 0,
         confirmed: Vec::new(),
     };
 
     for operation in plan.operations {
-        let blockhash = rpc_client.get_latest_blockhash()?;
-        let (built, tx) = build_simulated_route_shard_transaction(
-            rpc_client,
-            &operation,
-            wallet,
-            blockhash,
-            recent_slot_candidates,
-        )?;
-        let signature = rpc_client.send_and_confirm_transaction(&tx)?;
-        let confirmed_slot = rpc_client.get_slot()?;
+        for operation in split_route_shard_operation(operation)? {
+            report.attempted += 1;
+            let blockhash = rpc_client.get_latest_blockhash()?;
+            let (built, tx) = build_simulated_route_shard_transaction(
+                rpc_client,
+                &operation,
+                wallet,
+                blockhash,
+                recent_slot_candidates,
+            )?;
+            let signature = rpc_client.send_and_confirm_transaction(&tx)?;
+            let confirmed_slot = rpc_client.get_slot()?;
 
-        planner.apply_confirmed_operation(&operation, built.shard, confirmed_slot)?;
-        planner.store().save(&state_file)?;
-        report.confirmed.push(ConfirmedRouteShardOperation {
-            shard: built.shard,
-            signature,
-            slot: confirmed_slot,
-        });
+            planner.apply_confirmed_operation(&operation, built.shard, confirmed_slot)?;
+            planner.store().save(&state_file)?;
+            report.confirmed.push(ConfirmedRouteShardOperation {
+                shard: built.shard,
+                signature,
+                slot: confirmed_slot,
+            });
+        }
     }
 
     Ok(report)
+}
+
+fn split_route_shard_operation(
+    operation: PendingRouteShardOperation,
+) -> anyhow::Result<Vec<PendingRouteShardOperation>> {
+    let PendingRouteShardOperationKind::ExtendShard {
+        shard,
+        mint,
+        addresses,
+    } = &operation.operation
+    else {
+        return Ok(vec![operation]);
+    };
+
+    if addresses.len() <= ROUTE_SHARD_EXTEND_ADDRESSES_PER_TX {
+        return Ok(vec![operation]);
+    }
+
+    let mint_pubkey = parse_pubkey(mint)?;
+    let parsed_addresses = parse_pubkeys(addresses)?;
+    let mut split = Vec::new();
+    if parsed_addresses.first() == Some(&mint_pubkey) {
+        validate_mint_block_addresses(mint_pubkey, &parsed_addresses)?;
+        let first_dlmm_capacity = (ROUTE_SHARD_EXTEND_ADDRESSES_PER_TX - 4) / 3;
+        let first_end = 4 + first_dlmm_capacity * 3;
+        split.push(PendingRouteShardOperation {
+            version: operation.version,
+            operation: PendingRouteShardOperationKind::ExtendShard {
+                shard: shard.clone(),
+                mint: mint.clone(),
+                addresses: pubkeys_to_strings(&parsed_addresses[..first_end]),
+            },
+        });
+        for chunk in parsed_addresses[first_end..].chunks(ROUTE_SHARD_EXTEND_ADDRESSES_PER_TX - 1) {
+            split.push(PendingRouteShardOperation {
+                version: operation.version,
+                operation: PendingRouteShardOperationKind::ExtendShard {
+                    shard: shard.clone(),
+                    mint: mint.clone(),
+                    addresses: pubkeys_to_strings(chunk),
+                },
+            });
+        }
+    } else {
+        if parsed_addresses.len() % 3 != 0 {
+            anyhow::bail!("allocated mint extension addresses must be DLMM triples");
+        }
+        for chunk in parsed_addresses.chunks(ROUTE_SHARD_EXTEND_ADDRESSES_PER_TX - 1) {
+            split.push(PendingRouteShardOperation {
+                version: operation.version,
+                operation: PendingRouteShardOperationKind::ExtendShard {
+                    shard: shard.clone(),
+                    mint: mint.clone(),
+                    addresses: pubkeys_to_strings(chunk),
+                },
+            });
+        }
+    }
+
+    Ok(split)
 }
 
 fn build_simulated_route_shard_transaction(
@@ -1131,6 +1197,85 @@ mod tests {
         assert_eq!(block.dlmm.len(), 2);
         assert_eq!(block.dlmm[1].lb_pair, pk(40).to_string());
         assert_eq!(block.dlmm[1].indexes, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn validate_extend_accepts_multiple_dlmm_triples() {
+        let mint = pk(1);
+        let shard = pk(90);
+        let addresses = vec![pk(40), pk(41), pk(42), pk(43), pk(44), pk(45)];
+        let operation = PendingRouteShardOperation {
+            version: ROUTE_SHARD_STATE_VERSION,
+            operation: PendingRouteShardOperationKind::ExtendShard {
+                shard: shard.to_string(),
+                mint: mint.to_string(),
+                addresses: pubkeys_to_strings(&addresses),
+            },
+        };
+
+        operation.validate().unwrap();
+    }
+
+    #[test]
+    fn split_large_mint_block_extend_keeps_first_chunk_as_mint_block() {
+        let mint = pk(1);
+        let shard = pk(90);
+        let route = mint_route(mint, 8);
+        let operation = PlannedRouteShardExtension::ExtendShard {
+            shard,
+            mint,
+            addresses: route.stable_addresses(),
+            start_index: 0,
+        }
+        .pending_operation();
+
+        let split = split_route_shard_operation(operation).unwrap();
+
+        assert_eq!(split.len(), 2);
+        match &split[0].operation {
+            PendingRouteShardOperationKind::ExtendShard { addresses, .. } => {
+                assert_eq!(addresses.len(), 19);
+                assert_eq!(parse_pubkey(&addresses[0]).unwrap(), mint);
+            }
+            _ => panic!("expected extend shard operation"),
+        }
+        match &split[1].operation {
+            PendingRouteShardOperationKind::ExtendShard { addresses, .. } => {
+                assert_eq!(addresses.len(), 9);
+            }
+            _ => panic!("expected extend shard operation"),
+        }
+    }
+
+    #[test]
+    fn split_large_allocated_mint_extend_keeps_dlmm_triples() {
+        let mint = pk(1);
+        let shard = pk(90);
+        let addresses = (0..8)
+            .flat_map(|i| [pk(40 + i * 3), pk(41 + i * 3), pk(42 + i * 3)])
+            .collect::<Vec<_>>();
+        let operation = PendingRouteShardOperation {
+            version: ROUTE_SHARD_STATE_VERSION,
+            operation: PendingRouteShardOperationKind::ExtendShard {
+                shard: shard.to_string(),
+                mint: mint.to_string(),
+                addresses: pubkeys_to_strings(&addresses),
+            },
+        };
+
+        let split = split_route_shard_operation(operation).unwrap();
+
+        assert_eq!(split.len(), 2);
+        for operation in split {
+            operation.validate().unwrap();
+            match operation.operation {
+                PendingRouteShardOperationKind::ExtendShard { addresses, .. } => {
+                    assert_eq!(addresses.len() % 3, 0);
+                    assert!(addresses.len() <= ROUTE_SHARD_EXTEND_ADDRESSES_PER_TX);
+                }
+                _ => panic!("expected extend shard operation"),
+            }
+        }
     }
 
     #[test]
