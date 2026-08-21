@@ -119,6 +119,8 @@ pub struct ExecutionConfig {
     pub send_live_transactions: bool,
     #[serde(default)]
     pub simulate_before_send: bool,
+    #[serde(default = "default_live_route_refresh_cooldown_ms")]
+    pub live_route_refresh_cooldown_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -389,6 +391,10 @@ fn validate_stream_endpoint(name: &str, endpoint: &StreamEndpointConfig) -> anyh
 
 fn default_helius_tip_lamports() -> u64 {
     1_000_000
+}
+
+fn default_live_route_refresh_cooldown_ms() -> u64 {
+    1_000
 }
 
 fn default_helius_max_tps() -> u64 {

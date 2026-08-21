@@ -38,13 +38,14 @@ private_key = "${WALLET_PRIVATE_KEY}"
 [execution]
 use_flashloan = true
 sol_only = true
-minimum_profit_lamports = 100000
+minimum_profit_lamports = 3000000
 no_failure_mode = true
 min_pool_base_liquidity_lamports = 1000000000
 max_pool_state_age_ms = 1500
 compile_dry_run_on_startup = true
 send_live_transactions = false
 simulate_before_send = false
+live_route_refresh_cooldown_ms = 1000
 
 [routes]
 max_dlmm_per_tx = 3

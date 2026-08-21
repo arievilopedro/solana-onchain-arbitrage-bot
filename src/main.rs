@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
     let rabbitstream_plan = RabbitStreamPlan::controlled_v1(&config.rabbitstream)?;
     let helius_sender_plan = HeliusSenderPlan::from_config(&config.sender.helius)?;
     info!(
-        "config OK: wallet={} mints={} sol_only={} minimum_profit_lamports={} route_shards={} auto_create={} auto_extend={} compile_dry_run={} send_live_transactions={} simulate_before_send={} grpc={} rabbitstream={}",
+        "config OK: wallet={} mints={} sol_only={} minimum_profit_lamports={} route_shards={} auto_create={} auto_extend={} compile_dry_run={} send_live_transactions={} simulate_before_send={} live_route_refresh_cooldown_ms={} grpc={} rabbitstream={}",
         wallet.pubkey(),
         config.runtime.allowed_mints.len(),
         config.execution.sol_only,
@@ -94,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         config.execution.compile_dry_run_on_startup,
         config.execution.send_live_transactions,
         config.execution.simulate_before_send,
+        config.execution.live_route_refresh_cooldown_ms,
         config.grpc.enabled,
         config.rabbitstream.enabled
     );
@@ -1123,6 +1124,7 @@ async fn run_single_geyser_account_worker(
     let enricher = StreamRpcEnricher::new(rpc_client.clone());
     let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
     let mut last_route_groups_by_mint = HashMap::<Pubkey, usize>::new();
+    let mut last_route_refresh_by_mint = HashMap::<Pubkey, Instant>::new();
     let mut slot_tracker = SlotTracker::new(150);
     info!(
         "starting gRPC account worker: worker={} url={} subscriptions={}",
@@ -1201,6 +1203,26 @@ async fn run_single_geyser_account_worker(
                     );
 
                     if action.summary.route_groups > 0 {
+                        if config.execution.live_route_refresh_cooldown_ms > 0 {
+                            let now = Instant::now();
+                            if let Some(last_refresh) =
+                                last_route_refresh_by_mint.get(&action.mint)
+                            {
+                                if now.duration_since(*last_refresh)
+                                    < Duration::from_millis(
+                                        config.execution.live_route_refresh_cooldown_ms,
+                                    )
+                                {
+                                    tracing::debug!(
+                                        "route runtime refresh skipped: mint={} reason=cooldown cooldown_ms={}",
+                                        action.mint,
+                                        config.execution.live_route_refresh_cooldown_ms
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                            last_route_refresh_by_mint.insert(action.mint, now);
+                        }
                         let config = config.clone();
                         let rpc_client = rpc_client.clone();
                         let wallet = wallet.clone();
