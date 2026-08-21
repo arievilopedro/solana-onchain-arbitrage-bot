@@ -375,17 +375,18 @@ fn run_rabbitstream_trigger_worker(
                         };
                         let trigger_signature = signal.signature.clone();
                         let trigger_mint = signal.mint;
-                        if let Some(cashback_wsol_ata) = compilation.first_cashback_wsol_ata {
-                            if let Err(error) = ensure_cashback_wsol_ata(
-                                rpc_client.as_ref(),
-                                wallet.as_ref(),
-                                cashback_wsol_ata,
-                            ) {
+                        for ata in &compilation.first_atas_to_prepare {
+                            if let Err(error) =
+                                ensure_pda_ata(rpc_client.as_ref(), wallet.as_ref(), ata)
+                            {
                                 tracing::error!(
-                                    "trigger cashback ATA preparation failed: mint={} trigger_sig={} ata={} error={}",
+                                    "trigger ATA preparation failed: mint={} trigger_sig={} label={} owner={} mint={} ata={} error={}",
                                     trigger_mint,
                                     trigger_signature,
-                                    cashback_wsol_ata,
+                                    ata.label,
+                                    ata.owner,
+                                    ata.mint,
+                                    ata.address,
                                     error
                                 );
                                 return Ok(());
@@ -459,34 +460,37 @@ fn ensure_trigger_transaction_simulates(
     Ok(())
 }
 
-fn ensure_cashback_wsol_ata(
+fn ensure_pda_ata(
     rpc_client: &RpcClient,
     wallet: &solana_sdk::signature::Keypair,
-    cashback_wsol_ata: Pubkey,
+    ata: &AtaPreparation,
 ) -> anyhow::Result<()> {
-    if rpc_client.get_account(&cashback_wsol_ata).is_ok() {
+    if rpc_client.get_account(&ata.address).is_ok() {
+        info!(
+            "route ATA already exists: label={} owner={} mint={} ata={}",
+            ata.label, ata.owner, ata.mint, ata.address
+        );
         return Ok(());
     }
 
-    let owner = user_volume_accumulator(wallet.pubkey());
     let expected_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
-        &owner,
-        &sol_mint(),
+        &ata.owner,
+        &ata.mint,
         &spl_token::ID,
     );
-    if expected_ata != cashback_wsol_ata {
+    if expected_ata != ata.address {
         anyhow::bail!(
-            "cashback WSOL ATA mismatch expected={} got={}",
+            "ATA mismatch expected={} got={}",
             expected_ata,
-            cashback_wsol_ata
+            ata.address
         );
     }
 
     let create_ata_ix =
         spl_associated_token_account::instruction::create_associated_token_account_idempotent(
             &wallet.pubkey(),
-            &owner,
-            &sol_mint(),
+            &ata.owner,
+            &ata.mint,
             &spl_token::ID,
         );
     let blockhash = rpc_client.get_latest_blockhash()?;
@@ -502,8 +506,8 @@ fn ensure_cashback_wsol_ata(
     );
     let signature = rpc_client.send_and_confirm_transaction(&tx)?;
     info!(
-        "cashback WSOL ATA prepared: owner={} ata={} sig={}",
-        owner, cashback_wsol_ata, signature
+        "route ATA prepared: label={} owner={} mint={} ata={} sig={}",
+        ata.label, ata.owner, ata.mint, ata.address, signature
     );
     Ok(())
 }
@@ -798,7 +802,15 @@ struct ControlledTxDryRunSummary {
 struct ControlledMintCompilation {
     summary: ControlledTxDryRunSummary,
     first_transaction: Option<VersionedTransaction>,
-    first_cashback_wsol_ata: Option<Pubkey>,
+    first_atas_to_prepare: Vec<AtaPreparation>,
+}
+
+#[derive(Debug, Clone)]
+struct AtaPreparation {
+    label: &'static str,
+    owner: Pubkey,
+    mint: Pubkey,
+    address: Pubkey,
 }
 
 fn plan_route_shards(
@@ -972,10 +984,8 @@ fn compile_controlled_mint_routes(
             Ok(tx) => {
                 compilation.summary.compiled += 1;
                 if compilation.first_transaction.is_none() {
-                    if route.pump.is_cashback_coin {
-                        compilation.first_cashback_wsol_ata =
-                            Some(user_volume_accumulator_wsol_ata(wallet.pubkey()));
-                    }
+                    compilation.first_atas_to_prepare =
+                        pump_route_atas_to_prepare(wallet.pubkey(), &route.pump);
                     compilation.first_transaction = Some(tx);
                 }
             }
@@ -986,6 +996,31 @@ fn compile_controlled_mint_routes(
     }
 
     Ok(compilation)
+}
+
+fn pump_route_atas_to_prepare(
+    wallet: Pubkey,
+    pump: &solana_onchain_arbitrage_bot::registry::PumpRouteState,
+) -> Vec<AtaPreparation> {
+    let mut atas = Vec::new();
+    if pump.coin_creator != Pubkey::default() {
+        atas.push(AtaPreparation {
+            label: "pump_coin_creator_vault",
+            owner: pump.coin_creator_vault_authority,
+            mint: pump.base_mint,
+            address: pump.coin_creator_vault_ata,
+        });
+    }
+    if pump.is_cashback_coin {
+        let owner = user_volume_accumulator(wallet);
+        atas.push(AtaPreparation {
+            label: "pump_user_volume_accumulator_wsol",
+            owner,
+            mint: sol_mint(),
+            address: user_volume_accumulator_wsol_ata(wallet),
+        });
+    }
+    atas
 }
 
 fn sender_tip_config(config: &AppConfig) -> anyhow::Result<Option<SenderTipConfig>> {
