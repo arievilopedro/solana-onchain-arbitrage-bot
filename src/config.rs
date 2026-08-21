@@ -1,3 +1,4 @@
+use rand::Rng;
 use serde::{Deserialize, Deserializer};
 use solana_program::pubkey::Pubkey;
 use std::{env, fs::File, io::Read, path::Path, str::FromStr};
@@ -191,6 +192,28 @@ impl HeliusSenderConfig {
 pub struct ComputeConfig {
     pub default_limit: u32,
     pub unit_price: u64,
+    #[serde(default)]
+    pub unit_price_min: Option<u64>,
+    #[serde(default)]
+    pub unit_price_max: Option<u64>,
+}
+
+impl ComputeConfig {
+    pub fn unit_price_range(&self) -> (u64, u64) {
+        (
+            self.unit_price_min.unwrap_or(self.unit_price),
+            self.unit_price_max.unwrap_or(self.unit_price),
+        )
+    }
+
+    pub fn random_unit_price(&self) -> u64 {
+        let (min, max) = self.unit_price_range();
+        if min >= max {
+            return min;
+        }
+
+        rand::thread_rng().gen_range(min..=max)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -345,8 +368,14 @@ impl AppConfig {
                 );
             }
 
-            if self.compute.unit_price == 0 {
-                anyhow::bail!("compute.unit_price must be greater than zero for Helius Sender");
+            let (compute_price_min, compute_price_max) = self.compute.unit_price_range();
+            if compute_price_min == 0 || compute_price_max == 0 {
+                anyhow::bail!(
+                    "compute unit price lamports must be greater than zero for Helius Sender"
+                );
+            }
+            if compute_price_min > compute_price_max {
+                anyhow::bail!("compute.unit_price_min must be <= compute.unit_price_max");
             }
 
             validate_pubkey_csv(

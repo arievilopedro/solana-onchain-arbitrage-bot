@@ -371,14 +371,7 @@ impl RouteExecutionCache {
             .map(|alt| (alt.key, alt))
             .collect::<HashMap<_, _>>();
         let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
-        let params = ControlledExecutionParams {
-            compute_unit_limit: config.compute.default_limit,
-            compute_unit_price: config.compute.unit_price,
-            minimum_profit_lamports: config.execution.minimum_profit_lamports,
-            use_flashloan: config.execution.use_flashloan,
-            no_failure_mode: config.execution.no_failure_mode,
-            sender_tip: sender_tip_config(config)?,
-        };
+        let params = controlled_execution_params(config)?;
 
         info!(
             "route execution cache loaded: protocol_alt={} route_alts={}",
@@ -1677,14 +1670,7 @@ fn dry_run_controlled_routes(
             .context("failed to load route shard resolver")?;
     let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
     let recent_blockhash = rpc_client.get_latest_blockhash()?;
-    let params = ControlledExecutionParams {
-        compute_unit_limit: config.compute.default_limit,
-        compute_unit_price: config.compute.unit_price,
-        minimum_profit_lamports: config.execution.minimum_profit_lamports,
-        use_flashloan: config.execution.use_flashloan,
-        no_failure_mode: config.execution.no_failure_mode,
-        sender_tip: sender_tip_config(config)?,
-    };
+    let params = controlled_execution_params(config)?;
     let now_ms = now_ms();
     let mut summary = ControlledTxDryRunSummary::default();
 
@@ -1764,14 +1750,7 @@ fn compile_controlled_mint_routes(
         RouteShardLookupResolver::load(&config.lookup_tables.route_shards.state_file)
             .context("failed to load route shard resolver")?;
     let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
-    let params = ControlledExecutionParams {
-        compute_unit_limit: config.compute.default_limit,
-        compute_unit_price: config.compute.unit_price,
-        minimum_profit_lamports: config.execution.minimum_profit_lamports,
-        use_flashloan: config.execution.use_flashloan,
-        no_failure_mode: config.execution.no_failure_mode,
-        sender_tip: sender_tip_config(config)?,
-    };
+    let params = controlled_execution_params(config)?;
     let now_ms = now_ms();
     let mut compilation = ControlledMintCompilation::default();
     let route_groups = packer.pack_mint_state(
@@ -1851,7 +1830,10 @@ fn compile_controlled_mint_routes_cached(
             mint_state.token_program,
             recent_blockhash,
             &lookup_tables,
-            route_execution_cache.params.clone(),
+            controlled_execution_params_with_tip(
+                config,
+                route_execution_cache.params.sender_tip.clone(),
+            ),
         ) {
             Ok(tx) => {
                 compilation.summary.compiled += 1;
@@ -1897,6 +1879,27 @@ fn sender_tip_config(config: &AppConfig) -> anyhow::Result<Option<SenderTipConfi
     }
 
     Ok(HeliusSenderPlan::from_config(&config.sender.helius)?.map(|plan| plan.tip))
+}
+
+fn controlled_execution_params(config: &AppConfig) -> anyhow::Result<ControlledExecutionParams> {
+    Ok(controlled_execution_params_with_tip(
+        config,
+        sender_tip_config(config)?,
+    ))
+}
+
+fn controlled_execution_params_with_tip(
+    config: &AppConfig,
+    sender_tip: Option<SenderTipConfig>,
+) -> ControlledExecutionParams {
+    ControlledExecutionParams {
+        compute_unit_limit: config.compute.default_limit,
+        compute_unit_price: config.compute.random_unit_price(),
+        minimum_profit_lamports: config.execution.minimum_profit_lamports,
+        use_flashloan: config.execution.use_flashloan,
+        no_failure_mode: config.execution.no_failure_mode,
+        sender_tip,
+    }
 }
 
 fn lookup_tables_for_route(
