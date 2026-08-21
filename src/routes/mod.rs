@@ -78,6 +78,7 @@ mod tests {
     fn liquidity() -> Option<PoolLiquidity> {
         Some(PoolLiquidity {
             base_lamports: 2_000,
+            token_lamports: Some(2_000_000),
             updated_at_ms: 1_000,
         })
     }

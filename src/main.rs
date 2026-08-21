@@ -447,26 +447,45 @@ fn run_rabbitstream_trigger_worker(
                         seen_signatures.remove(&old_signature);
                     }
                 }
-                if signal.sol_amount < config.axion.min_sol {
+                let (sol_amount, volume_source) = adjusted_trigger_sol_amount(
+                    &config,
+                    registry.as_ref(),
+                    signal.mint,
+                    signal.sol_amount,
+                    signal.volume_source,
+                    signal.side,
+                    signal.raw_amount,
+                )?;
+                if sol_amount < config.axion.min_sol {
                     info!(
-                        "rabbitstream axion trigger filtered: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={}",
+                        "rabbitstream axion trigger filtered: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={} side={} raw_amount={}",
                         signal.mint,
                         signal.slot,
                         signal.signature,
-                        signal.sol_amount,
+                        sol_amount,
                         config.axion.min_sol,
-                        signal.volume_source
+                        volume_source,
+                        signal.side.unwrap_or("unknown"),
+                        signal
+                            .raw_amount
+                            .map(|amount| amount.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
                     );
                     return Ok(());
                 }
                 info!(
-                    "rabbitstream axion trigger: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={}",
+                    "rabbitstream axion trigger: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={} side={} raw_amount={}",
                     signal.mint,
                     signal.slot,
                     signal.signature,
-                    signal.sol_amount,
+                    sol_amount,
                     config.axion.min_sol,
-                    signal.volume_source
+                    volume_source,
+                    signal.side.unwrap_or("unknown"),
+                    signal
+                        .raw_amount
+                        .map(|amount| amount.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
                 );
                 if !config.lookup_tables.route_shards.enabled {
                     info!(
@@ -600,6 +619,79 @@ fn run_rabbitstream_trigger_worker(
 enum TriggerSimulationOutcome {
     Ready,
     NoProfit,
+}
+
+fn adjusted_trigger_sol_amount(
+    config: &AppConfig,
+    registry: &Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>,
+    mint: Pubkey,
+    sol_amount: f64,
+    volume_source: &'static str,
+    side: Option<&'static str>,
+    raw_amount: Option<u64>,
+) -> anyhow::Result<(f64, &'static str)> {
+    if side != Some("sell") || volume_source != "axion_instruction_amount" {
+        return Ok((sol_amount, volume_source));
+    }
+
+    let Some(raw_token_amount) = raw_amount else {
+        return Ok((sol_amount, volume_source));
+    };
+    let registry = registry
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
+    let Some(estimated_sol) =
+        estimate_pump_sell_sol_from_registry(config, &registry, mint, raw_token_amount)
+    else {
+        return Ok((sol_amount, volume_source));
+    };
+
+    Ok((estimated_sol, "pump_sell_registry_reserves"))
+}
+
+fn estimate_pump_sell_sol_from_registry(
+    config: &AppConfig,
+    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    mint: Pubkey,
+    raw_token_amount: u64,
+) -> Option<f64> {
+    let mint_state = registry.get(&mint)?;
+    let now_ms = now_ms();
+    mint_state
+        .eligible_pumps(
+            config.execution.min_pool_base_liquidity_lamports,
+            config.execution.max_pool_state_age_ms,
+            now_ms,
+        )
+        .into_iter()
+        .filter_map(|pump| {
+            let liquidity = pump.liquidity?;
+            let token_reserve = liquidity.token_lamports?;
+            estimate_constant_product_sell_sol(
+                raw_token_amount,
+                token_reserve,
+                liquidity.base_lamports,
+            )
+        })
+        .max_by(|left, right| left.total_cmp(right))
+}
+
+fn estimate_constant_product_sell_sol(
+    token_amount_in: u64,
+    token_reserve: u64,
+    sol_reserve_lamports: u64,
+) -> Option<f64> {
+    if token_amount_in == 0 || token_reserve == 0 || sol_reserve_lamports == 0 {
+        return None;
+    }
+
+    let token_amount_in = token_amount_in as u128;
+    let token_reserve = token_reserve as u128;
+    let sol_reserve_lamports = sol_reserve_lamports as u128;
+    let sol_out = sol_reserve_lamports
+        .saturating_mul(token_amount_in)
+        .checked_div(token_reserve.saturating_add(token_amount_in))?;
+    Some(sol_out as f64 / 1_000_000_000.0)
 }
 
 fn ensure_trigger_transaction_simulates(
@@ -901,6 +993,7 @@ async fn run_geyser_account_worker(
         let report = apply_pool_account_update(
             &mut registry,
             update,
+            |token_vault, base_vault| enricher.pump_vault_liquidity(token_vault, base_vault),
             |base_vault| enricher.base_vault_liquidity(base_vault),
             |mint| enricher.mint_uses_token_2022(mint),
             |pair| enricher.dlmm_bitmap_extension(pair),

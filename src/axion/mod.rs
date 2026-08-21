@@ -14,6 +14,8 @@ pub struct AxionTriggerSignal {
     pub mint: Pubkey,
     pub sol_amount: f64,
     pub volume_source: &'static str,
+    pub side: Option<&'static str>,
+    pub raw_amount: Option<u64>,
     pub axion_program_seen: bool,
 }
 
@@ -95,29 +97,53 @@ pub mod yellowstone {
         out
     }
 
+    #[derive(Debug, Clone, Copy)]
+    pub struct AxionVolume {
+        pub sol_amount: f64,
+        pub source: &'static str,
+        pub side: Option<&'static str>,
+        pub raw_amount: Option<u64>,
+    }
+
     pub fn sol_volume(
         tx: &Transaction,
         keys: &[Pubkey],
         meta: Option<&TransactionStatusMeta>,
         axion_program: Pubkey,
-    ) -> (f64, &'static str) {
+    ) -> AxionVolume {
+        let instruction = axion_instruction_volume(tx, keys, axion_program);
         if let Some(meta) = meta {
             let wsol = wsol_volume(meta);
             if wsol > 0.0 {
-                return (wsol, "meta_wsol_delta");
+                return AxionVolume {
+                    sol_amount: wsol,
+                    source: "meta_wsol_delta",
+                    side: instruction.and_then(|volume| volume.side),
+                    raw_amount: instruction.and_then(|volume| volume.raw_amount),
+                };
             }
 
             let native = native_sol_volume(meta);
             if native > 0.0 {
-                return (native, "meta_native_delta");
+                return AxionVolume {
+                    sol_amount: native,
+                    source: "meta_native_delta",
+                    side: instruction.and_then(|volume| volume.side),
+                    raw_amount: instruction.and_then(|volume| volume.raw_amount),
+                };
             }
         }
 
-        if let Some(sol) = axion_instruction_sol_volume(tx, keys, axion_program) {
-            return (sol, "axion_instruction_amount");
+        if let Some(instruction) = instruction {
+            return instruction;
         }
 
-        (0.0, "none")
+        AxionVolume {
+            sol_amount: 0.0,
+            source: "none",
+            side: None,
+            raw_amount: None,
+        }
     }
 
     fn token_amount(amount: &str, decimals: u32) -> f64 {
@@ -164,32 +190,50 @@ pub mod yellowstone {
             .fold(0.0, f64::max)
     }
 
-    fn axion_instruction_sol_volume(
+    fn axion_instruction_volume(
         tx: &Transaction,
         keys: &[Pubkey],
         axion_program: Pubkey,
-    ) -> Option<f64> {
+    ) -> Option<AxionVolume> {
         let msg = tx.message.as_ref()?;
         msg.instructions
             .iter()
             .filter(|ix| keys.get(ix.program_id_index as usize) == Some(&axion_program))
-            .filter_map(|ix| instruction_sol_lamports(&ix.data))
-            .max()
-            .map(|lamports| lamports as f64 / 1_000_000_000.0)
-            .filter(|sol| *sol > 0.0)
+            .filter_map(|ix| instruction_volume(&ix.data))
+            .max_by_key(|volume| volume.raw_amount.unwrap_or(0))
     }
 
-    fn instruction_sol_lamports(data: &[u8]) -> Option<u64> {
+    fn instruction_volume(data: &[u8]) -> Option<AxionVolume> {
         if data.len() < 17 {
             return None;
         }
+        let side = match data[0] {
+            0 => Some("sell"),
+            1 => Some("buy"),
+            _ => None,
+        };
         let amount_0 = read_le_u64(&data[1..9]).unwrap_or(0);
         let amount_1 = read_le_u64(&data[9..17]).unwrap_or(0);
-        [amount_0, amount_1]
-            .iter()
-            .copied()
-            .filter(|amount| *amount > 0)
-            .min()
+        let raw_amount = if amount_0 > 0 { amount_0 } else { amount_1 };
+        let lamports = match side {
+            Some("buy") => amount_0,
+            Some("sell") => amount_1,
+            _ => [amount_0, amount_1]
+                .iter()
+                .copied()
+                .filter(|amount| *amount > 0)
+                .min()
+                .unwrap_or(0),
+        };
+        if raw_amount == 0 {
+            return None;
+        }
+        Some(AxionVolume {
+            sol_amount: lamports as f64 / 1_000_000_000.0,
+            source: "axion_instruction_amount",
+            side,
+            raw_amount: Some(raw_amount),
+        })
     }
 
     fn read_le_u64(bytes: &[u8]) -> Option<u64> {
@@ -216,7 +260,7 @@ pub mod yellowstone {
         }
 
         let token_balance_mints = token_balance_mints(meta);
-        let (sol_amount, volume_source) = sol_volume(tx, &keys, meta, axion_program);
+        let volume = sol_volume(tx, &keys, meta, axion_program);
         collect_allowlisted_mints_from_strings(
             keys.iter(),
             token_balance_mints.iter(),
@@ -227,8 +271,10 @@ pub mod yellowstone {
             signature: signature.clone(),
             slot,
             mint,
-            sol_amount,
-            volume_source,
+            sol_amount: volume.sol_amount,
+            volume_source: volume.source,
+            side: volume.side,
+            raw_amount: volume.raw_amount,
             axion_program_seen,
         })
         .collect()

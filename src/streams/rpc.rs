@@ -26,6 +26,23 @@ impl StreamRpcEnricher {
         let token_account = TokenAccount::unpack(&account.data)?;
         Ok(Some(PoolLiquidity {
             base_lamports: token_account.amount,
+            token_lamports: None,
+            updated_at_ms: now_ms(),
+        }))
+    }
+
+    pub fn pump_vault_liquidity(
+        &self,
+        token_vault: Pubkey,
+        base_vault: Pubkey,
+    ) -> anyhow::Result<Option<PoolLiquidity>> {
+        let token_account = self.rpc.get_account(&token_vault)?;
+        let token_account = TokenAccount::unpack(&token_account.data)?;
+        let base_account = self.rpc.get_account(&base_vault)?;
+        let base_account = TokenAccount::unpack(&base_account.data)?;
+        Ok(Some(PoolLiquidity {
+            base_lamports: base_account.amount,
+            token_lamports: Some(token_account.amount),
             updated_at_ms: now_ms(),
         }))
     }

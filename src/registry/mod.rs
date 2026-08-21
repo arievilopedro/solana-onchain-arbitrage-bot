@@ -35,6 +35,7 @@ impl PoolEligibility {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct PoolLiquidity {
     pub base_lamports: u64,
+    pub token_lamports: Option<u64>,
     pub updated_at_ms: u128,
 }
 
@@ -296,6 +297,7 @@ mod tests {
             sol_mint(),
             Some(PoolLiquidity {
                 base_lamports: 1_500,
+                token_lamports: None,
                 updated_at_ms: 9_900,
             }),
         );
@@ -308,6 +310,7 @@ mod tests {
             usdc_mint(),
             Some(PoolLiquidity {
                 base_lamports: 1_500,
+                token_lamports: None,
                 updated_at_ms: 9_900,
             }),
         );
@@ -320,6 +323,7 @@ mod tests {
             sol_mint(),
             Some(PoolLiquidity {
                 base_lamports: 999,
+                token_lamports: None,
                 updated_at_ms: 9_900,
             }),
         );
@@ -332,6 +336,7 @@ mod tests {
             sol_mint(),
             Some(PoolLiquidity {
                 base_lamports: 1_500,
+                token_lamports: None,
                 updated_at_ms: 9_000,
             }),
         );

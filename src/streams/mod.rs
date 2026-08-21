@@ -83,19 +83,20 @@ pub struct RegistryUpdateReport {
 pub fn apply_pool_account_update(
     registry: &mut RuntimeRegistry,
     update: PoolAccountUpdate,
-    liquidity: impl Fn(Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
+    pump_liquidity: impl Fn(Pubkey, Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
+    base_liquidity: impl Fn(Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
     mint_uses_token_2022: impl Fn(Pubkey) -> anyhow::Result<bool>,
     dlmm_bitmap_extension: impl Fn(Pubkey) -> anyhow::Result<Option<Pubkey>>,
 ) -> anyhow::Result<RegistryUpdateReport> {
     if update.owner == pump_program_id() {
-        return apply_pump_update(registry, update, liquidity);
+        return apply_pump_update(registry, update, pump_liquidity);
     }
 
     if update.owner == dlmm_program_id() {
         return apply_dlmm_update(
             registry,
             update,
-            liquidity,
+            base_liquidity,
             mint_uses_token_2022,
             dlmm_bitmap_extension,
         );
@@ -110,14 +111,14 @@ pub fn apply_pool_account_update(
 fn apply_pump_update(
     registry: &mut RuntimeRegistry,
     update: PoolAccountUpdate,
-    liquidity: impl Fn(Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
+    liquidity: impl Fn(Pubkey, Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
 ) -> anyhow::Result<RegistryUpdateReport> {
     for mint in registry.allowed_mints().collect::<Vec<_>>() {
         let route = match pump_route_state_from_account(
             mint,
             update.pubkey,
             &update.account,
-            |base_vault| liquidity(base_vault),
+            |token_vault, base_vault| liquidity(token_vault, base_vault),
         ) {
             Ok(Some(route)) => route,
             Ok(None) => continue,
@@ -262,9 +263,21 @@ mod tests {
         data
     }
 
-    fn fixed_liquidity(_base_vault: Pubkey) -> anyhow::Result<Option<PoolLiquidity>> {
+    fn fixed_pump_liquidity(
+        _token_vault: Pubkey,
+        _base_vault: Pubkey,
+    ) -> anyhow::Result<Option<PoolLiquidity>> {
         Ok(Some(PoolLiquidity {
             base_lamports: 1_000_000,
+            token_lamports: Some(2_000_000),
+            updated_at_ms: 10,
+        }))
+    }
+
+    fn fixed_base_liquidity(_base_vault: Pubkey) -> anyhow::Result<Option<PoolLiquidity>> {
+        Ok(Some(PoolLiquidity {
+            base_lamports: 1_000_000,
+            token_lamports: None,
             updated_at_ms: 10,
         }))
     }
@@ -293,7 +306,8 @@ mod tests {
                 account: account(pk(3), Vec::new()),
                 slot: 7,
             },
-            fixed_liquidity,
+            fixed_pump_liquidity,
+            fixed_base_liquidity,
             no_token_2022,
             no_bitmap,
         )
@@ -343,7 +357,8 @@ mod tests {
                 ),
                 slot: 42,
             },
-            fixed_liquidity,
+            fixed_pump_liquidity,
+            fixed_base_liquidity,
             no_token_2022,
             no_bitmap,
         )
@@ -383,7 +398,8 @@ mod tests {
                 account: account(pump_program_id(), pump_account_data(mint, pk(22), pk(23))),
                 slot: 99,
             },
-            fixed_liquidity,
+            fixed_pump_liquidity,
+            fixed_base_liquidity,
             no_token_2022,
             no_bitmap,
         )
@@ -414,7 +430,8 @@ mod tests {
                 account: account(pump_program_id(), vec![0u8; 8]),
                 slot: 100,
             },
-            fixed_liquidity,
+            fixed_pump_liquidity,
+            fixed_base_liquidity,
             no_token_2022,
             no_bitmap,
         )

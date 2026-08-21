@@ -61,9 +61,9 @@ impl ControlledRpcBootstrap {
             let pump_accounts = self.discover_pump_pool_accounts(*mint)?;
             for (pool, account) in pump_accounts {
                 let Some(route_state) =
-                    pump_route_state_from_account(*mint, pool, &account, |base_vault| {
-                        self.base_vault_liquidity(base_vault).with_context(|| {
-                            format!("failed to read Pump base vault liquidity for pool {}", pool)
+                    pump_route_state_from_account(*mint, pool, &account, |token_vault, base_vault| {
+                        self.pump_vault_liquidity(token_vault, base_vault).with_context(|| {
+                            format!("failed to read Pump vault liquidity for pool {}", pool)
                         })
                     })?
                 else {
@@ -176,6 +176,23 @@ impl ControlledRpcBootstrap {
         let token_account = TokenAccount::unpack(&account.data)?;
         Ok(Some(PoolLiquidity {
             base_lamports: token_account.amount,
+            token_lamports: None,
+            updated_at_ms: now_ms(),
+        }))
+    }
+
+    fn pump_vault_liquidity(
+        &self,
+        token_vault: Pubkey,
+        base_vault: Pubkey,
+    ) -> anyhow::Result<Option<PoolLiquidity>> {
+        let token_account = self.rpc.get_account(&token_vault)?;
+        let token_account = TokenAccount::unpack(&token_account.data)?;
+        let base_account = self.rpc.get_account(&base_vault)?;
+        let base_account = TokenAccount::unpack(&base_account.data)?;
+        Ok(Some(PoolLiquidity {
+            base_lamports: base_account.amount,
+            token_lamports: Some(token_account.amount),
             updated_at_ms: now_ms(),
         }))
     }
@@ -194,7 +211,7 @@ pub fn pump_route_state_from_account(
     mint: Pubkey,
     pool: Pubkey,
     account: &Account,
-    liquidity: impl FnOnce(Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
+    liquidity: impl FnOnce(Pubkey, Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
 ) -> anyhow::Result<Option<PumpRouteState>> {
     let info = PumpAmmInfo::load_checked(&account.data)?;
     if !pool_contains_mint_and_sol(info.base_mint, info.quote_mint, mint) {
@@ -242,7 +259,7 @@ pub fn pump_route_state_from_account(
         coin_creator_vault_authority: info.coin_creator_vault_authority,
         coin_creator: info.coin_creator,
         is_cashback_coin: info.is_cashback_coin,
-        liquidity: liquidity(base_vault)?,
+        liquidity: liquidity(token_vault, base_vault)?,
         enabled: true,
         last_update_slot: 0,
     }))

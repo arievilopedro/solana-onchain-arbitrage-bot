@@ -1210,6 +1210,7 @@ mod tests {
             is_cashback_coin: false,
             liquidity: Some(PoolLiquidity {
                 base_lamports: 2_000,
+                token_lamports: Some(2_000_000),
                 updated_at_ms: now_ms,
             }),
             enabled: true,
@@ -1229,6 +1230,7 @@ mod tests {
             active_id: 0,
             liquidity: Some(PoolLiquidity {
                 base_lamports: 2_000,
+                token_lamports: None,
                 updated_at_ms: now_ms,
             }),
             enabled: true,
