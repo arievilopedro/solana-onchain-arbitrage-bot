@@ -674,6 +674,15 @@ fn run_rabbitstream_trigger_worker(
                             config.sender.primary
                         );
                     }
+                } else {
+                    info!(
+                        "trigger transaction send skipped: mint={} sig={} reason=no_compiled_route routes={} missing_route_shard={} compile_failed={}",
+                        signal.mint,
+                        signal.signature,
+                        compilation.summary.routes,
+                        compilation.summary.missing_route_shard,
+                        compilation.summary.compile_failed
+                    );
                 }
                 Ok(())
             })
