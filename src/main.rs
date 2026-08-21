@@ -14,7 +14,7 @@ use solana_onchain_arbitrage_bot::constants::sol_mint;
 use solana_onchain_arbitrage_bot::dex::pump::pump_program_id;
 use solana_onchain_arbitrage_bot::discovery::{ControlledRpcBootstrap, RpcBootstrapConfig};
 use solana_onchain_arbitrage_bot::execution::{
-    build_controlled_transaction, ControlledExecutionParams,
+    build_controlled_transaction, ControlledExecutionParams, PreCompiledTxCache,
 };
 use solana_onchain_arbitrage_bot::registry::{DlmmRouteState, PumpRouteState};
 use solana_onchain_arbitrage_bot::routes::{FixedDlmmRoutePacker, RouteGroup};
@@ -203,6 +203,34 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // Start precompiled cache cleanup task if enabled
+    if config.precompiled.enabled {
+        if let Some(cache) = &route_execution_cache {
+            let cache = cache.clone();
+            let cleanup_interval_ms = config.precompiled.cleanup_interval_ms;
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(cleanup_interval_ms));
+                loop {
+                    interval.tick().await;
+                    if let Ok(cache) = cache.read() {
+                        let cleaned = cache.precompiled_cache.cleanup_expired();
+                        if cleaned > 0 {
+                            tracing::debug!(
+                                "precompiled cache cleanup: removed={} mints",
+                                cleaned
+                            );
+                        }
+                    }
+                }
+            });
+            info!(
+                "precompiled cache cleanup task started: interval_ms={}",
+                cleanup_interval_ms
+            );
+        }
+    }
+
     info!("supervisor bootstrap complete; starting configured stream workers");
     run_stream_workers(
         &config,
@@ -336,6 +364,7 @@ struct RouteExecutionCache {
     route_alts: HashMap<Pubkey, AddressLookupTableAccount>,
     packer: FixedDlmmRoutePacker,
     params: ControlledExecutionParams,
+    precompiled_cache: PreCompiledTxCache,
 }
 
 #[derive(Debug, Default)]
@@ -373,11 +402,16 @@ impl RouteExecutionCache {
             .collect::<HashMap<_, _>>();
         let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
         let params = controlled_execution_params(config)?;
+        let precompiled_cache = PreCompiledTxCache::with_ttl(
+            FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?,
+            config.precompiled.ttl_ms,
+        );
 
         info!(
-            "route execution cache loaded: protocol_alt={} route_alts={}",
+            "route execution cache loaded: protocol_alt={} route_alts={} precompiled_ttl_ms={}",
             protocol_alt.key,
-            route_alts.len()
+            route_alts.len(),
+            config.precompiled.ttl_ms
         );
 
         Ok(Self {
@@ -386,6 +420,7 @@ impl RouteExecutionCache {
             route_alts,
             packer,
             params,
+            precompiled_cache,
         })
     }
 }
@@ -618,60 +653,78 @@ async fn process_axion_trigger(
         );
         return Ok(());
     };
-    let compilation = {
-        let registry = registry
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
+    // Try precompiled cache first for lower latency
+    let precompiled_txs = if config.precompiled.enabled {
         let route_execution_cache = route_execution_cache
             .read()
             .map_err(|_| anyhow::anyhow!("route execution cache lock poisoned"))?;
-        compile_controlled_mint_routes_cached(
-            &config,
-            wallet.as_ref(),
-            &registry,
-            signal.mint,
-            recent_blockhash,
-            &route_execution_cache,
-        )?
+        route_execution_cache.precompiled_cache.get_ready_txs(&signal.mint)
+    } else {
+        Vec::new()
     };
-    tracing::debug!(
-        "trigger controlled tx dry-run: mint={} sig={} routes={} compiled={} missing_route_shard={} compile_failed={}",
-        signal.mint,
-        signal.signature,
-        compilation.summary.routes,
-        compilation.summary.compiled,
-        compilation.summary.missing_route_shard,
-        compilation.summary.compile_failed
-    );
-    if compilation.summary.compiled == 0 {
-        info!(
-            "trigger transaction send skipped: mint={} sig={} reason=no_compiled_route routes={} missing_route_shard={} compile_failed={}",
+
+    let txs = if !precompiled_txs.is_empty() {
+        tracing::debug!(
+            "trigger using precompiled tx: mint={} sig={} precompiled_count={}",
+            signal.mint,
+            signal.signature,
+            precompiled_txs.len()
+        );
+        precompiled_txs
+    } else {
+        // Fall back to on-demand compilation
+        let compilation = {
+            let registry = registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
+            let route_execution_cache = route_execution_cache
+                .read()
+                .map_err(|_| anyhow::anyhow!("route execution cache lock poisoned"))?;
+            compile_controlled_mint_routes_cached(
+                &config,
+                wallet.as_ref(),
+                &registry,
+                signal.mint,
+                recent_blockhash,
+                &route_execution_cache,
+            )?
+        };
+        tracing::debug!(
+            "trigger controlled tx compiled on-demand: mint={} sig={} routes={} compiled={} missing_route_shard={} compile_failed={}",
             signal.mint,
             signal.signature,
             compilation.summary.routes,
+            compilation.summary.compiled,
             compilation.summary.missing_route_shard,
             compilation.summary.compile_failed
         );
-        return Ok(());
-    }
+        if compilation.summary.compiled == 0 {
+            info!(
+                "trigger transaction send skipped: mint={} sig={} reason=no_compiled_route routes={} missing_route_shard={} compile_failed={}",
+                signal.mint,
+                signal.signature,
+                compilation.summary.routes,
+                compilation.summary.missing_route_shard,
+                compilation.summary.compile_failed
+            );
+            return Ok(());
+        }
+        compilation.transactions
+    };
 
     if !config.execution.send_live_transactions {
         info!(
             "would_send trigger transaction: mint={} sig={} compiled={} sender={} reason=send_live_transactions_false",
             signal.mint,
             signal.signature,
-            compilation.summary.compiled,
+            txs.len(),
             config.sender.primary
         );
         return Ok(());
     }
 
     let max_transactions = config.execution.trigger_send_max_transactions.max(1);
-    let txs = compilation
-        .transactions
-        .into_iter()
-        .take(max_transactions)
-        .collect::<Vec<_>>();
+    let txs: Vec<_> = txs.into_iter().take(max_transactions).collect();
     if txs.is_empty() {
         info!(
             "trigger transaction send skipped: mint={} sig={} reason=missing_compiled_transaction",
@@ -1398,6 +1451,37 @@ fn process_geyser_route_action(
                 action.mint,
                 error
             ),
+        }
+
+        // Refresh precompiled transaction cache for this mint
+        if config.precompiled.enabled {
+            if let Some(cache) = &route_execution_cache {
+                if let Ok(blockhash) = rpc_client.get_latest_blockhash() {
+                    if let Ok(cache) = cache.read() {
+                        if let Some(shard) = cache.route_resolver.shard_for_mint(action.mint).ok().flatten() {
+                            if let Some(route_alt) = cache.route_alts.get(&shard) {
+                                let lookup_tables = lookup_tables_for_route(&cache.protocol_alt, route_alt);
+                                cache.precompiled_cache.refresh_mint(
+                                    action.mint,
+                                    mint_state,
+                                    wallet.as_ref(),
+                                    blockhash,
+                                    mint_state.token_program,
+                                    &lookup_tables,
+                                    &cache.params,
+                                    config.execution.min_pool_base_liquidity_lamports,
+                                    config.execution.max_pool_state_age_ms,
+                                );
+                                tracing::debug!(
+                                    "precompiled cache refreshed: mint={} valid_txs={}",
+                                    action.mint,
+                                    cache.precompiled_cache.valid_tx_count(&action.mint)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

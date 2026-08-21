@@ -70,6 +70,8 @@ pub struct AppConfig {
     pub sender: SenderConfig,
     pub compute: ComputeConfig,
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub precompiled: PrecompiledConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -224,6 +226,42 @@ impl ComputeConfig {
 pub struct MetricsConfig {
     pub enabled: bool,
     pub file: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PrecompiledConfig {
+    /// Enable pre-compiled transaction cache for lower trigger latency.
+    #[serde(default = "default_precompiled_enabled")]
+    pub enabled: bool,
+    /// TTL for cached transactions in milliseconds.
+    /// Blockhash is valid for ~60s, but we use a shorter TTL for safety.
+    #[serde(default = "default_precompiled_ttl_ms")]
+    pub ttl_ms: u64,
+    /// Interval for cleaning up expired cache entries in milliseconds.
+    #[serde(default = "default_precompiled_cleanup_interval_ms")]
+    pub cleanup_interval_ms: u64,
+}
+
+impl Default for PrecompiledConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_precompiled_enabled(),
+            ttl_ms: default_precompiled_ttl_ms(),
+            cleanup_interval_ms: default_precompiled_cleanup_interval_ms(),
+        }
+    }
+}
+
+fn default_precompiled_enabled() -> bool {
+    true
+}
+
+fn default_precompiled_ttl_ms() -> u64 {
+    25_000 // 25 seconds
+}
+
+fn default_precompiled_cleanup_interval_ms() -> u64 {
+    5_000 // 5 seconds
 }
 
 pub fn serde_string_or_env<'de, D>(deserializer: D) -> Result<String, D::Error>
