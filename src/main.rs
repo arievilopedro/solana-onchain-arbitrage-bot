@@ -524,177 +524,32 @@ fn run_rabbitstream_trigger_worker(
                     }
                     last_trigger_by_mint.insert(signal.mint, now);
                 }
-                tracing::debug!(
-                    "rabbitstream axion trigger: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={} side={} raw_amount={}",
-                    signal.mint,
-                    signal.slot,
-                    signal.signature,
-                    sol_amount,
-                    config.axion.min_sol,
-                    volume_source,
-                    signal.side.unwrap_or("unknown"),
-                    signal
-                        .raw_amount
-                        .map(|amount| amount.to_string())
-                        .unwrap_or_else(|| "unknown".to_string())
-                );
-                if !config.lookup_tables.route_shards.enabled {
-                    info!(
-                        "trigger controlled tx dry-run skipped: mint={} sig={} reason=route_shards_disabled",
-                        signal.mint, signal.signature
-                    );
-                    return Ok(());
-                }
-                let Some(recent_blockhash) = blockhash_cache.current() else {
-                    info!(
-                        "trigger controlled tx skipped: mint={} sig={} reason=blockhash_cache_empty",
-                        signal.mint, signal.signature
-                    );
-                    return Ok(());
-                };
-                let Some(route_execution_cache) = &route_execution_cache else {
-                    info!(
-                        "trigger controlled tx skipped: mint={} sig={} reason=route_execution_cache_unavailable",
-                        signal.mint, signal.signature
-                    );
-                    return Ok(());
-                };
-                let compilation = {
-                    let registry = registry
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
-                    let route_execution_cache = route_execution_cache
-                        .read()
-                        .map_err(|_| anyhow::anyhow!("route execution cache lock poisoned"))?;
-                    compile_controlled_mint_routes_cached(
-                        &config,
-                        wallet.as_ref(),
-                        &registry,
-                        signal.mint,
-                        recent_blockhash,
-                        &route_execution_cache,
-                    )?
-                };
-                tracing::debug!(
-                    "trigger controlled tx dry-run: mint={} sig={} routes={} compiled={} missing_route_shard={} compile_failed={}",
-                    signal.mint,
-                    signal.signature,
-                    compilation.summary.routes,
-                    compilation.summary.compiled,
-                    compilation.summary.missing_route_shard,
-                    compilation.summary.compile_failed
-                );
-                if compilation.summary.compiled > 0 {
-                    if config.execution.send_live_transactions {
-                        let max_transactions =
-                            config.execution.trigger_send_max_transactions.max(1);
-                        let txs = compilation
-                            .transactions
-                            .into_iter()
-                            .take(max_transactions)
-                            .collect::<Vec<_>>();
-                        if txs.is_empty() {
-                            info!(
-                                "trigger transaction send skipped: mint={} sig={} reason=missing_compiled_transaction",
-                                signal.mint, signal.signature
-                            );
-                            return Ok(());
-                        };
-                        let Some(sender) = helius_sender.clone() else {
-                            info!(
-                                "trigger transaction send skipped: mint={} sig={} reason=helius_sender_disabled",
-                                signal.mint, signal.signature
-                            );
-                            return Ok(());
-                        };
-                        let trigger_signature = signal.signature.clone();
-                        let trigger_mint = signal.mint;
-                        let trigger_slot = signal.slot;
-                        let simulate_before_send = config.execution.simulate_before_send;
-                        let rpc_client = rpc_client.clone();
-                        for (tx_index, tx) in txs.into_iter().enumerate() {
-                            if simulate_before_send {
-                                match ensure_trigger_transaction_simulates(rpc_client.as_ref(), &tx)
-                                {
-                                    Ok(TriggerSimulationOutcome::Ready) => {}
-                                    Ok(TriggerSimulationOutcome::NoProfit) => {
-                                        info!(
-                                            "trigger transaction skipped: mint={} trigger_sig={} tx_index={} reason=no_profitable_arbitrage",
-                                            trigger_mint,
-                                            trigger_signature,
-                                            tx_index
-                                        );
-                                        continue;
-                                    }
-                                    Err(error) => {
-                                        tracing::error!(
-                                            "trigger transaction simulation failed: mint={} trigger_sig={} tx_index={} error={}",
-                                            trigger_mint,
-                                            trigger_signature,
-                                            tx_index,
-                                            error
-                                        );
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                tracing::debug!(
-                                    "trigger transaction simulation skipped: mint={} trigger_sig={} tx_index={} reason=simulate_before_send_false",
-                                    trigger_mint,
-                                    trigger_signature,
-                                    tx_index
-                                );
-                            }
-                            let sender = sender.clone();
-                            let trigger_signature = trigger_signature.clone();
-                            let trigger_to_spawn_ms = trigger_received_at.elapsed().as_millis();
-                            tokio::spawn(async move {
-                                let send_started_at = Instant::now();
-                                match sender.send_transaction(&tx).await {
-                                    Ok(signature) => info!(
-                                        "trigger transaction sent: mint={} trigger_slot={} trigger_sig={} tx_index={} tx_sig={} trigger_to_spawn_ms={} sender_ack_ms={} trigger_to_ack_ms={}",
-                                        trigger_mint,
-                                        trigger_slot,
-                                        trigger_signature,
-                                        tx_index,
-                                        signature,
-                                        trigger_to_spawn_ms,
-                                        send_started_at.elapsed().as_millis(),
-                                        trigger_received_at.elapsed().as_millis()
-                                    ),
-                                    Err(error) => tracing::error!(
-                                        "trigger transaction send failed: mint={} trigger_slot={} trigger_sig={} tx_index={} trigger_to_spawn_ms={} sender_ack_ms={} trigger_to_ack_ms={} error={}",
-                                        trigger_mint,
-                                        trigger_slot,
-                                        trigger_signature,
-                                        tx_index,
-                                        trigger_to_spawn_ms,
-                                        send_started_at.elapsed().as_millis(),
-                                        trigger_received_at.elapsed().as_millis(),
-                                        error
-                                    ),
-                                }
-                            });
-                        }
-                    } else {
-                        info!(
-                            "would_send trigger transaction: mint={} sig={} compiled={} sender={} reason=send_live_transactions_false",
-                            signal.mint,
-                            signal.signature,
-                            compilation.summary.compiled,
-                            config.sender.primary
-                        );
+                let config = config.clone();
+                let rpc_client = rpc_client.clone();
+                let blockhash_cache = blockhash_cache.clone();
+                let route_execution_cache = route_execution_cache.clone();
+                let wallet = wallet.clone();
+                let registry = registry.clone();
+                let helius_sender = helius_sender.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = process_axion_trigger(
+                        config,
+                        rpc_client,
+                        blockhash_cache,
+                        route_execution_cache,
+                        wallet,
+                        registry,
+                        helius_sender,
+                        signal,
+                        sol_amount,
+                        volume_source,
+                        trigger_received_at,
+                    )
+                    .await
+                    {
+                        tracing::error!("trigger processing failed: {}", error);
                     }
-                } else {
-                    info!(
-                        "trigger transaction send skipped: mint={} sig={} reason=no_compiled_route routes={} missing_route_shard={} compile_failed={}",
-                        signal.mint,
-                        signal.signature,
-                        compilation.summary.routes,
-                        compilation.summary.missing_route_shard,
-                        compilation.summary.compile_failed
-                    );
-                }
+                });
                 Ok(())
             })
             .await;
@@ -706,6 +561,194 @@ fn run_rabbitstream_trigger_worker(
             );
         }
     });
+
+    Ok(())
+}
+
+#[cfg(feature = "geyser")]
+async fn process_axion_trigger(
+    config: AppConfig,
+    rpc_client: Arc<RpcClient>,
+    blockhash_cache: Arc<BlockhashCache>,
+    route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
+    wallet: Arc<solana_sdk::signature::Keypair>,
+    registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
+    helius_sender: Option<HeliusSenderClient>,
+    signal: solana_onchain_arbitrage_bot::axion::AxionTriggerSignal,
+    sol_amount: f64,
+    volume_source: &'static str,
+    trigger_received_at: Instant,
+) -> anyhow::Result<()> {
+    tracing::debug!(
+        "rabbitstream axion trigger: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={} side={} raw_amount={}",
+        signal.mint,
+        signal.slot,
+        signal.signature,
+        sol_amount,
+        config.axion.min_sol,
+        volume_source,
+        signal.side.unwrap_or("unknown"),
+        signal
+            .raw_amount
+            .map(|amount| amount.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    if !config.lookup_tables.route_shards.enabled {
+        info!(
+            "trigger controlled tx dry-run skipped: mint={} sig={} reason=route_shards_disabled",
+            signal.mint, signal.signature
+        );
+        return Ok(());
+    }
+    let Some(recent_blockhash) = blockhash_cache.current() else {
+        info!(
+            "trigger controlled tx skipped: mint={} sig={} reason=blockhash_cache_empty",
+            signal.mint, signal.signature
+        );
+        return Ok(());
+    };
+    let Some(route_execution_cache) = &route_execution_cache else {
+        info!(
+            "trigger controlled tx skipped: mint={} sig={} reason=route_execution_cache_unavailable",
+            signal.mint, signal.signature
+        );
+        return Ok(());
+    };
+    let compilation = {
+        let registry = registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
+        let route_execution_cache = route_execution_cache
+            .read()
+            .map_err(|_| anyhow::anyhow!("route execution cache lock poisoned"))?;
+        compile_controlled_mint_routes_cached(
+            &config,
+            wallet.as_ref(),
+            &registry,
+            signal.mint,
+            recent_blockhash,
+            &route_execution_cache,
+        )?
+    };
+    tracing::debug!(
+        "trigger controlled tx dry-run: mint={} sig={} routes={} compiled={} missing_route_shard={} compile_failed={}",
+        signal.mint,
+        signal.signature,
+        compilation.summary.routes,
+        compilation.summary.compiled,
+        compilation.summary.missing_route_shard,
+        compilation.summary.compile_failed
+    );
+    if compilation.summary.compiled == 0 {
+        info!(
+            "trigger transaction send skipped: mint={} sig={} reason=no_compiled_route routes={} missing_route_shard={} compile_failed={}",
+            signal.mint,
+            signal.signature,
+            compilation.summary.routes,
+            compilation.summary.missing_route_shard,
+            compilation.summary.compile_failed
+        );
+        return Ok(());
+    }
+
+    if !config.execution.send_live_transactions {
+        info!(
+            "would_send trigger transaction: mint={} sig={} compiled={} sender={} reason=send_live_transactions_false",
+            signal.mint,
+            signal.signature,
+            compilation.summary.compiled,
+            config.sender.primary
+        );
+        return Ok(());
+    }
+
+    let max_transactions = config.execution.trigger_send_max_transactions.max(1);
+    let txs = compilation
+        .transactions
+        .into_iter()
+        .take(max_transactions)
+        .collect::<Vec<_>>();
+    if txs.is_empty() {
+        info!(
+            "trigger transaction send skipped: mint={} sig={} reason=missing_compiled_transaction",
+            signal.mint, signal.signature
+        );
+        return Ok(());
+    };
+    let Some(sender) = helius_sender else {
+        info!(
+            "trigger transaction send skipped: mint={} sig={} reason=helius_sender_disabled",
+            signal.mint, signal.signature
+        );
+        return Ok(());
+    };
+    let trigger_signature = signal.signature.clone();
+    let trigger_mint = signal.mint;
+    let trigger_slot = signal.slot;
+    let simulate_before_send = config.execution.simulate_before_send;
+    for (tx_index, tx) in txs.into_iter().enumerate() {
+        if simulate_before_send {
+            match ensure_trigger_transaction_simulates(rpc_client.as_ref(), &tx) {
+                Ok(TriggerSimulationOutcome::Ready) => {}
+                Ok(TriggerSimulationOutcome::NoProfit) => {
+                    info!(
+                        "trigger transaction skipped: mint={} trigger_sig={} tx_index={} reason=no_profitable_arbitrage",
+                        trigger_mint,
+                        trigger_signature,
+                        tx_index
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        "trigger transaction simulation failed: mint={} trigger_sig={} tx_index={} error={}",
+                        trigger_mint,
+                        trigger_signature,
+                        tx_index,
+                        error
+                    );
+                    continue;
+                }
+            }
+        } else {
+            tracing::debug!(
+                "trigger transaction simulation skipped: mint={} trigger_sig={} tx_index={} reason=simulate_before_send_false",
+                trigger_mint,
+                trigger_signature,
+                tx_index
+            );
+        }
+        let sender = sender.clone();
+        let trigger_signature = trigger_signature.clone();
+        let trigger_to_spawn_ms = trigger_received_at.elapsed().as_millis();
+        tokio::spawn(async move {
+            let send_started_at = Instant::now();
+            match sender.send_transaction(&tx).await {
+                Ok(signature) => info!(
+                    "trigger transaction sent: mint={} trigger_slot={} trigger_sig={} tx_index={} tx_sig={} trigger_to_spawn_ms={} sender_ack_ms={} trigger_to_ack_ms={}",
+                    trigger_mint,
+                    trigger_slot,
+                    trigger_signature,
+                    tx_index,
+                    signature,
+                    trigger_to_spawn_ms,
+                    send_started_at.elapsed().as_millis(),
+                    trigger_received_at.elapsed().as_millis()
+                ),
+                Err(error) => tracing::error!(
+                    "trigger transaction send failed: mint={} trigger_slot={} trigger_sig={} tx_index={} trigger_to_spawn_ms={} sender_ack_ms={} trigger_to_ack_ms={} error={}",
+                    trigger_mint,
+                    trigger_slot,
+                    trigger_signature,
+                    tx_index,
+                    trigger_to_spawn_ms,
+                    send_started_at.elapsed().as_millis(),
+                    trigger_received_at.elapsed().as_millis(),
+                    error
+                ),
+            }
+        });
+    }
 
     Ok(())
 }
