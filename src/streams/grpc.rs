@@ -11,6 +11,8 @@ use crate::dex::pump::amm_info::PUMP_BASE_MINT_GPA_OFFSET;
 use crate::dex::pump::pump_program_id;
 use solana_program::pubkey::Pubkey;
 
+const CONTROLLED_MAX_FILTERS_PER_STREAM: usize = 9;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct GeyserAccountStreamPlan {
     pub url: String,
@@ -30,9 +32,9 @@ impl GeyserAccountStreamPlan {
     pub fn controlled_v1(
         endpoint: &StreamEndpointConfig,
         allowed_mints: &[Pubkey],
-    ) -> anyhow::Result<Option<Self>> {
+    ) -> anyhow::Result<Vec<Self>> {
         if !endpoint.enabled {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         if endpoint.url.trim().is_empty() {
@@ -47,11 +49,14 @@ impl GeyserAccountStreamPlan {
             anyhow::bail!("allowed_mints must not be empty when grpc.enabled=true");
         }
 
-        Ok(Some(Self {
-            url: endpoint.url.clone(),
-            x_token: endpoint.x_token.clone(),
-            subscriptions: controlled_v1_subscriptions(allowed_mints),
-        }))
+        Ok(controlled_v1_subscriptions(allowed_mints)
+            .chunks(CONTROLLED_MAX_FILTERS_PER_STREAM)
+            .map(|subscriptions| Self {
+                url: endpoint.url.clone(),
+                x_token: endpoint.x_token.clone(),
+                subscriptions: subscriptions.to_vec(),
+            })
+            .collect())
     }
 
     pub fn owner_program_strings(&self) -> Vec<String> {
@@ -250,7 +255,7 @@ mod tests {
 
         assert!(GeyserAccountStreamPlan::controlled_v1(&endpoint, &[])
             .unwrap()
-            .is_none());
+            .is_empty());
     }
 
     #[test]
@@ -261,15 +266,36 @@ mod tests {
             x_token: "token".to_string(),
         };
 
-        let plan = GeyserAccountStreamPlan::controlled_v1(&endpoint, &[Pubkey::new_unique()])
-            .unwrap()
+        let plans = GeyserAccountStreamPlan::controlled_v1(&endpoint, &[Pubkey::new_unique()])
             .unwrap();
+        let plan = plans.first().unwrap();
 
         assert_eq!(plan.url, endpoint.url);
         assert_eq!(plan.x_token, endpoint.x_token);
         assert_eq!(plan.subscriptions.len(), 3);
         assert_eq!(plan.subscriptions[0].owner_program, pump_program_id());
         assert_eq!(plan.subscriptions[1].owner_program, dlmm_program_id());
+    }
+
+    #[test]
+    fn controlled_plan_chunks_filters_for_provider_limit() {
+        let endpoint = StreamEndpointConfig {
+            enabled: true,
+            url: "https://geyser.example".to_string(),
+            x_token: "token".to_string(),
+        };
+        let mints = (0..4)
+            .map(|idx| Pubkey::new_from_array([idx; 32]))
+            .collect::<Vec<_>>();
+
+        let plans = GeyserAccountStreamPlan::controlled_v1(&endpoint, &mints).unwrap();
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].subscriptions.len(), 9);
+        assert_eq!(plans[1].subscriptions.len(), 3);
+        assert!(plans
+            .iter()
+            .all(|plan| plan.subscriptions.len() <= CONTROLLED_MAX_FILTERS_PER_STREAM));
     }
 
     #[test]

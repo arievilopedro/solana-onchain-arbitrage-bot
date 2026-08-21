@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::load(config_path)?;
     let wallet = load_keypair(&config.wallet.private_key).context("failed to load wallet")?;
     let allowed_mints = parse_allowed_mints(&config)?;
-    let grpc_plan = GeyserAccountStreamPlan::controlled_v1(&config.grpc, &allowed_mints)?;
+    let grpc_plans = GeyserAccountStreamPlan::controlled_v1(&config.grpc, &allowed_mints)?;
     let rabbitstream_plan = RabbitStreamPlan::controlled_v1(&config.rabbitstream)?;
     let helius_sender_plan = HeliusSenderPlan::from_config(&config.sender.helius)?;
     info!(
@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         config.grpc.enabled,
         config.rabbitstream.enabled
     );
-    log_stream_plans(grpc_plan.as_ref(), rabbitstream_plan.as_ref());
+    log_stream_plans(&grpc_plans, rabbitstream_plan.as_ref());
     log_sender_plan(&config, helius_sender_plan.as_ref());
 
     let rpc_client = Arc::new(RpcClient::new(config.rpc.http.clone()));
@@ -205,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
         wallet.clone(),
         allowed_mints.clone(),
         registry.clone(),
-        grpc_plan,
+        grpc_plans,
         rabbitstream_plan,
     )
     .await?;
@@ -244,18 +244,28 @@ fn redacted_endpoint(endpoint: &str) -> String {
 }
 
 fn log_stream_plans(
-    grpc_plan: Option<&GeyserAccountStreamPlan>,
+    grpc_plans: &[GeyserAccountStreamPlan],
     rabbitstream_plan: Option<&RabbitStreamPlan>,
 ) {
-    if let Some(plan) = grpc_plan {
+    if !grpc_plans.is_empty() {
+        let subscriptions = grpc_plans
+            .iter()
+            .map(|plan| plan.subscriptions.len())
+            .sum::<usize>();
         info!(
-            "gRPC account stream planned: url={} owner_programs={:?}",
-            plan.url,
-            plan.owner_program_strings()
+            "gRPC account streams planned: workers={} url={} owner_programs={:?}",
+            grpc_plans.len(),
+            grpc_plans[0].url,
+            grpc_plans[0].owner_program_strings()
         );
         info!(
-            "gRPC account stream filters planned: subscriptions={}",
-            plan.subscriptions.len()
+            "gRPC account stream filters planned: subscriptions={} max_per_worker={}",
+            subscriptions,
+            grpc_plans
+                .iter()
+                .map(|plan| plan.subscriptions.len())
+                .max()
+                .unwrap_or(0)
         );
     } else {
         info!("gRPC account stream disabled");
@@ -368,7 +378,7 @@ async fn run_stream_workers(
     wallet: Arc<solana_sdk::signature::Keypair>,
     allowed_mints: Vec<Pubkey>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
-    grpc_plan: Option<GeyserAccountStreamPlan>,
+    grpc_plans: Vec<GeyserAccountStreamPlan>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
 ) -> anyhow::Result<()> {
     run_rabbitstream_trigger_worker(
@@ -388,7 +398,7 @@ async fn run_stream_workers(
         route_execution_cache,
         wallet,
         registry,
-        grpc_plan,
+        grpc_plans,
     )
     .await
 }
@@ -962,22 +972,68 @@ async fn run_geyser_account_worker(
     route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
     wallet: Arc<solana_sdk::signature::Keypair>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
-    grpc_plan: Option<GeyserAccountStreamPlan>,
+    grpc_plans: Vec<GeyserAccountStreamPlan>,
+) -> anyhow::Result<()> {
+    if grpc_plans.is_empty() {
+        info!("gRPC account worker not started: grpc.enabled=false");
+        return Ok(());
+    }
+
+    for (worker_index, plan) in grpc_plans.into_iter().enumerate() {
+        let config = config.clone();
+        let rpc_client = rpc_client.clone();
+        let route_execution_cache = route_execution_cache.clone();
+        let wallet = wallet.clone();
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            if let Err(error) = run_single_geyser_account_worker(
+                config,
+                rpc_client,
+                route_execution_cache,
+                wallet,
+                registry,
+                plan,
+                worker_index,
+            )
+            .await
+            {
+                tracing::error!(
+                    "gRPC account worker stopped: worker={} error={}",
+                    worker_index,
+                    error
+                );
+            }
+        });
+    }
+
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+#[cfg(feature = "geyser")]
+async fn run_single_geyser_account_worker(
+    config: AppConfig,
+    rpc_client: Arc<RpcClient>,
+    route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
+    wallet: Arc<solana_sdk::signature::Keypair>,
+    registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
+    plan: GeyserAccountStreamPlan,
+    worker_index: usize,
 ) -> anyhow::Result<()> {
     use solana_onchain_arbitrage_bot::streams::grpc::yellowstone::{
         run_account_stream, GeyserStreamUpdate,
-    };
-
-    let Some(plan) = grpc_plan else {
-        info!("gRPC account worker not started: grpc.enabled=false");
-        return Ok(());
     };
 
     let enricher = StreamRpcEnricher::new(rpc_client.clone());
     let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
     let mut last_route_groups_by_mint = HashMap::<Pubkey, usize>::new();
     let mut slot_tracker = SlotTracker::new(150);
-    info!("starting gRPC account worker: url={}", plan.url);
+    info!(
+        "starting gRPC account worker: worker={} url={} subscriptions={}",
+        worker_index,
+        plan.url,
+        plan.subscriptions.len()
+    );
     run_account_stream(plan, |update| {
         let update = match update {
             GeyserStreamUpdate::Account(update) => update,
@@ -1003,7 +1059,7 @@ async fn run_geyser_account_worker(
             let route_summary = report
                 .applied_mint
                 .and_then(|mint| registry.get(&mint).map(|state| (mint, state)))
-                .map(|(mint, state)| (mint, live_route_candidate_summary(config, &packer, state)));
+                .map(|(mint, state)| (mint, live_route_candidate_summary(&config, &packer, state)));
 
             if let Some((mint, summary)) = route_summary {
                 let previous_route_groups =
@@ -1032,7 +1088,7 @@ async fn run_geyser_account_worker(
                     if summary.route_groups > 0 {
                         if let Some(mint_state) = registry.get(&mint) {
                             match prepare_route_runtime_accounts_for_mint(
-                                config,
+                                &config,
                                 rpc_client.as_ref(),
                                 wallet.as_ref(),
                                 mint_state,
@@ -1061,7 +1117,7 @@ async fn run_geyser_account_worker(
                             );
                         } else {
                             let dry_run = dry_run_controlled_mint_routes(
-                                config,
+                                &config,
                                 rpc_client.as_ref(),
                                 wallet.as_ref(),
                                 &registry,
@@ -1077,7 +1133,7 @@ async fn run_geyser_account_worker(
                             );
                             if dry_run.missing_route_shard > 0 {
                                 match maintain_live_route_shards(
-                                    config,
+                                    &config,
                                     rpc_client.as_ref(),
                                     wallet.as_ref(),
                                     &registry,
@@ -1086,7 +1142,7 @@ async fn run_geyser_account_worker(
                                     Ok(confirmed) if confirmed > 0 => {
                                         if let Some(cache) = &route_execution_cache {
                                             match RouteExecutionCache::load(
-                                                config,
+                                                &config,
                                                 rpc_client.as_ref(),
                                             ) {
                                                 Ok(updated_cache) => {
@@ -1223,12 +1279,12 @@ async fn run_geyser_account_worker(
     _route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
     _wallet: Arc<solana_sdk::signature::Keypair>,
     _registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
-    grpc_plan: Option<GeyserAccountStreamPlan>,
+    grpc_plans: Vec<GeyserAccountStreamPlan>,
 ) -> anyhow::Result<()> {
-    if let Some(plan) = grpc_plan {
+    if !grpc_plans.is_empty() {
         info!(
-            "gRPC account worker not started: url={} reason=build_without_geyser_feature",
-            plan.url
+            "gRPC account workers not started: workers={} reason=build_without_geyser_feature",
+            grpc_plans.len()
         );
     } else {
         info!("gRPC account worker not started: grpc.enabled=false");
