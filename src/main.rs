@@ -664,11 +664,12 @@ async fn process_axion_trigger(
     };
 
     let txs = if !precompiled_txs.is_empty() {
-        tracing::debug!(
-            "trigger using precompiled tx: mint={} sig={} precompiled_count={}",
+        info!(
+            "trigger cache hit: mint={} sig={} precompiled_count={} cache_lookup_ms={}",
             signal.mint,
             signal.signature,
-            precompiled_txs.len()
+            precompiled_txs.len(),
+            trigger_received_at.elapsed().as_millis()
         );
         precompiled_txs
     } else {
@@ -689,14 +690,15 @@ async fn process_axion_trigger(
                 &route_execution_cache,
             )?
         };
-        tracing::debug!(
-            "trigger controlled tx compiled on-demand: mint={} sig={} routes={} compiled={} missing_route_shard={} compile_failed={}",
+        info!(
+            "trigger cache miss: mint={} sig={} routes={} compiled={} missing_route_shard={} compile_failed={} compile_ms={}",
             signal.mint,
             signal.signature,
             compilation.summary.routes,
             compilation.summary.compiled,
             compilation.summary.missing_route_shard,
-            compilation.summary.compile_failed
+            compilation.summary.compile_failed,
+            trigger_received_at.elapsed().as_millis()
         );
         if compilation.summary.compiled == 0 {
             info!(
@@ -1325,6 +1327,30 @@ async fn run_single_geyser_account_worker(
         };
 
         if report.applied {
+            // Refresh precompiled cache on ANY pool update (not just route count changes)
+            if let Some(action) = &route_action {
+                if config.precompiled.enabled && action.summary.route_groups > 0 {
+                    if let Some(mint_state) = &action.mint_state {
+                        let config = config.clone();
+                        let rpc_client = rpc_client.clone();
+                        let wallet = wallet.clone();
+                        let route_execution_cache = route_execution_cache.clone();
+                        let mint = action.mint;
+                        let mint_state = mint_state.clone();
+                        tokio::task::spawn_blocking(move || {
+                            refresh_precompiled_cache_for_mint(
+                                &config,
+                                &rpc_client,
+                                &wallet,
+                                &route_execution_cache,
+                                mint,
+                                &mint_state,
+                            );
+                        });
+                    }
+                }
+            }
+
             if let Some(action) = route_action {
                 if action.previous_route_groups != Some(action.summary.route_groups) {
                     info!(
@@ -1453,36 +1479,6 @@ fn process_geyser_route_action(
             ),
         }
 
-        // Refresh precompiled transaction cache for this mint
-        if config.precompiled.enabled {
-            if let Some(cache) = &route_execution_cache {
-                if let Ok(blockhash) = rpc_client.get_latest_blockhash() {
-                    if let Ok(cache) = cache.read() {
-                        if let Some(shard) = cache.route_resolver.shard_for_mint(action.mint).ok().flatten() {
-                            if let Some(route_alt) = cache.route_alts.get(&shard) {
-                                let lookup_tables = lookup_tables_for_route(&cache.protocol_alt, route_alt);
-                                cache.precompiled_cache.refresh_mint(
-                                    action.mint,
-                                    mint_state,
-                                    wallet.as_ref(),
-                                    blockhash,
-                                    mint_state.token_program,
-                                    &lookup_tables,
-                                    &cache.params,
-                                    config.execution.min_pool_base_liquidity_lamports,
-                                    config.execution.max_pool_state_age_ms,
-                                );
-                                tracing::debug!(
-                                    "precompiled cache refreshed: mint={} valid_txs={}",
-                                    action.mint,
-                                    cache.precompiled_cache.valid_tx_count(&action.mint)
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 
     if !config.execution.compile_dry_run_on_startup {
@@ -2061,6 +2057,63 @@ fn sender_tip_config(config: &AppConfig) -> anyhow::Result<Option<SenderTipConfi
     }
 
     Ok(HeliusSenderPlan::from_config(&config.sender.helius)?.map(|plan| plan.tip))
+}
+
+#[cfg(feature = "geyser")]
+fn refresh_precompiled_cache_for_mint(
+    config: &AppConfig,
+    rpc_client: &RpcClient,
+    wallet: &solana_sdk::signature::Keypair,
+    route_execution_cache: &Option<Arc<RwLock<RouteExecutionCache>>>,
+    mint: Pubkey,
+    mint_state: &solana_onchain_arbitrage_bot::registry::MintRuntimeState,
+) {
+    let Some(cache) = route_execution_cache else {
+        return;
+    };
+
+    let blockhash = match rpc_client.get_latest_blockhash() {
+        Ok(hash) => hash,
+        Err(e) => {
+            tracing::warn!("precompiled cache refresh failed: mint={} error=blockhash_{}", mint, e);
+            return;
+        }
+    };
+
+    let Ok(cache) = cache.read() else {
+        tracing::warn!("precompiled cache refresh failed: mint={} error=lock_poisoned", mint);
+        return;
+    };
+
+    let Some(shard) = cache.route_resolver.shard_for_mint(mint).ok().flatten() else {
+        tracing::debug!("precompiled cache refresh skipped: mint={} reason=no_shard", mint);
+        return;
+    };
+
+    let Some(route_alt) = cache.route_alts.get(&shard) else {
+        tracing::debug!("precompiled cache refresh skipped: mint={} reason=no_route_alt", mint);
+        return;
+    };
+
+    let lookup_tables = lookup_tables_for_route(&cache.protocol_alt, route_alt);
+    cache.precompiled_cache.refresh_mint(
+        mint,
+        mint_state,
+        wallet,
+        blockhash,
+        mint_state.token_program,
+        &lookup_tables,
+        &cache.params,
+        config.execution.min_pool_base_liquidity_lamports,
+        config.execution.max_pool_state_age_ms,
+    );
+
+    info!(
+        "precompiled cache refreshed: mint={} valid_txs={} blockhash={}",
+        mint,
+        cache.precompiled_cache.valid_tx_count(&mint),
+        blockhash
+    );
 }
 
 fn controlled_execution_params(config: &AppConfig) -> anyhow::Result<ControlledExecutionParams> {
