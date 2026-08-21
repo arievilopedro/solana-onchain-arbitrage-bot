@@ -121,6 +121,8 @@ pub struct ExecutionConfig {
     pub simulate_before_send: bool,
     #[serde(default = "default_live_route_refresh_cooldown_ms")]
     pub live_route_refresh_cooldown_ms: u64,
+    #[serde(default = "default_trigger_send_max_transactions")]
+    pub trigger_send_max_transactions: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -395,6 +397,10 @@ fn default_helius_tip_lamports() -> u64 {
 
 fn default_live_route_refresh_cooldown_ms() -> u64 {
     1_000
+}
+
+fn default_trigger_send_max_transactions() -> usize {
+    1
 }
 
 fn default_helius_max_tps() -> u64 {
