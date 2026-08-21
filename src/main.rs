@@ -16,7 +16,8 @@ use solana_onchain_arbitrage_bot::discovery::{ControlledRpcBootstrap, RpcBootstr
 use solana_onchain_arbitrage_bot::execution::{
     build_controlled_transaction, ControlledExecutionParams,
 };
-use solana_onchain_arbitrage_bot::routes::FixedDlmmRoutePacker;
+use solana_onchain_arbitrage_bot::registry::{DlmmRouteState, PumpRouteState};
+use solana_onchain_arbitrage_bot::routes::{FixedDlmmRoutePacker, RouteGroup};
 use solana_onchain_arbitrage_bot::sender::{HeliusSenderClient, HeliusSenderPlan, SenderTipConfig};
 use solana_onchain_arbitrage_bot::streams::grpc::GeyserAccountStreamPlan;
 use solana_onchain_arbitrage_bot::streams::rabbitstream::RabbitStreamPlan;
@@ -799,12 +800,20 @@ fn estimate_pump_sell_sol_from_registry(
 ) -> Option<f64> {
     let mint_state = registry.get(&mint)?;
     let now_ms = now_ms();
-    mint_state
-        .eligible_pumps(
+    let mut pumps = mint_state.eligible_pumps(
+        config.execution.min_pool_base_liquidity_lamports,
+        config.execution.max_pool_state_age_ms,
+        now_ms,
+    );
+    if pumps.is_empty() {
+        pumps = mint_state.eligible_pumps(
             config.execution.min_pool_base_liquidity_lamports,
-            config.execution.max_pool_state_age_ms,
+            u64::MAX,
             now_ms,
-        )
+        );
+    }
+
+    pumps
         .into_iter()
         .filter_map(|pump| {
             let liquidity = pump.liquidity?;
@@ -1688,7 +1697,8 @@ fn prepare_route_runtime_accounts_for_mint(
 ) -> anyhow::Result<usize> {
     let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
     let now_ms = now_ms();
-    let route_groups = packer.pack_mint_state(
+    let route_groups = pack_execution_route_groups(
+        &packer,
         mint_state,
         config.execution.min_pool_base_liquidity_lamports,
         config.execution.max_pool_state_age_ms,
@@ -1819,7 +1829,8 @@ fn compile_controlled_mint_routes(
     let params = controlled_execution_params(config)?;
     let now_ms = now_ms();
     let mut compilation = ControlledMintCompilation::default();
-    let route_groups = packer.pack_mint_state(
+    let route_groups = pack_execution_route_groups(
+        &packer,
         mint_state,
         config.execution.min_pool_base_liquidity_lamports,
         config.execution.max_pool_state_age_ms,
@@ -1868,7 +1879,8 @@ fn compile_controlled_mint_routes_cached(
 
     let now_ms = now_ms();
     let mut compilation = ControlledMintCompilation::default();
-    let route_groups = route_execution_cache.packer.pack_mint_state(
+    let route_groups = pack_execution_route_groups(
+        &route_execution_cache.packer,
         mint_state,
         config.execution.min_pool_base_liquidity_lamports,
         config.execution.max_pool_state_age_ms,
@@ -1911,6 +1923,27 @@ fn compile_controlled_mint_routes_cached(
     }
 
     Ok(compilation)
+}
+
+fn pack_execution_route_groups(
+    packer: &FixedDlmmRoutePacker,
+    mint_state: &solana_onchain_arbitrage_bot::registry::MintRuntimeState,
+    min_base_liquidity_lamports: u64,
+    max_state_age_ms: u64,
+    now_ms: u128,
+) -> Vec<RouteGroup<PumpRouteState, DlmmRouteState>> {
+    let route_groups = packer.pack_mint_state(
+        mint_state,
+        min_base_liquidity_lamports,
+        max_state_age_ms,
+        now_ms,
+    );
+    if !route_groups.is_empty() {
+        return route_groups;
+    }
+
+    // Do not drop a trigger only because one side of a known route missed the short freshness window.
+    packer.pack_mint_state(mint_state, min_base_liquidity_lamports, u64::MAX, now_ms)
 }
 
 fn pump_route_atas_to_prepare(
@@ -1993,28 +2026,52 @@ fn live_route_candidate_summary(
     state: &solana_onchain_arbitrage_bot::registry::MintRuntimeState,
 ) -> LiveRouteCandidateSummary {
     let now_ms = now_ms();
-    let eligible_pump = state
+    let mut eligible_pump = state
         .eligible_pumps(
             config.execution.min_pool_base_liquidity_lamports,
             config.execution.max_pool_state_age_ms,
             now_ms,
         )
         .len();
-    let eligible_dlmm = state
+    let mut eligible_dlmm = state
         .eligible_dlmms(
             config.execution.min_pool_base_liquidity_lamports,
             config.execution.max_pool_state_age_ms,
             now_ms,
         )
         .len();
-    let route_groups = packer
-        .pack_mint_state(
-            state,
-            config.execution.min_pool_base_liquidity_lamports,
-            config.execution.max_pool_state_age_ms,
-            now_ms,
-        )
-        .len();
+    let mut route_groups = pack_execution_route_groups(
+        packer,
+        state,
+        config.execution.min_pool_base_liquidity_lamports,
+        config.execution.max_pool_state_age_ms,
+        now_ms,
+    )
+    .len();
+    if route_groups > 0 && (eligible_pump == 0 || eligible_dlmm == 0) {
+        eligible_pump = state
+            .eligible_pumps(
+                config.execution.min_pool_base_liquidity_lamports,
+                u64::MAX,
+                now_ms,
+            )
+            .len();
+        eligible_dlmm = state
+            .eligible_dlmms(
+                config.execution.min_pool_base_liquidity_lamports,
+                u64::MAX,
+                now_ms,
+            )
+            .len();
+        route_groups = packer
+            .pack_mint_state(
+                state,
+                config.execution.min_pool_base_liquidity_lamports,
+                u64::MAX,
+                now_ms,
+            )
+            .len();
+    }
 
     LiveRouteCandidateSummary {
         eligible_pump,
