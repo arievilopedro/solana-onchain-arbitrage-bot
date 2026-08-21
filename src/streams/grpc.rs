@@ -7,7 +7,7 @@
 use crate::config::StreamEndpointConfig;
 use crate::dex::meteora::constants::dlmm_program_id;
 use crate::dex::meteora::dlmm_info::DlmmInfo;
-use crate::dex::pump::amm_info::{PUMP_BASE_MINT_GPA_OFFSET, PUMP_QUOTE_MINT_GPA_OFFSET};
+use crate::dex::pump::amm_info::PUMP_BASE_MINT_GPA_OFFSET;
 use crate::dex::pump::pump_program_id;
 use solana_program::pubkey::Pubkey;
 
@@ -67,18 +67,12 @@ impl GeyserAccountStreamPlan {
 }
 
 fn controlled_v1_subscriptions(allowed_mints: &[Pubkey]) -> Vec<GeyserAccountSubscription> {
-    let mut subscriptions = Vec::with_capacity(allowed_mints.len() * 4);
+    let mut subscriptions = Vec::with_capacity(allowed_mints.len() * 3);
     for mint in allowed_mints {
         subscriptions.push(GeyserAccountSubscription {
             label: format!("pump-base-{}", mint),
             owner_program: pump_program_id(),
             memcmp_offset: PUMP_BASE_MINT_GPA_OFFSET,
-            memcmp_pubkey: *mint,
-        });
-        subscriptions.push(GeyserAccountSubscription {
-            label: format!("pump-quote-{}", mint),
-            owner_program: pump_program_id(),
-            memcmp_offset: PUMP_QUOTE_MINT_GPA_OFFSET,
             memcmp_pubkey: *mint,
         });
         subscriptions.push(GeyserAccountSubscription {
@@ -238,7 +232,7 @@ mod geyser_tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(filters.len(), 4);
+        assert_eq!(filters.len(), 3);
     }
 }
 
@@ -273,9 +267,9 @@ mod tests {
 
         assert_eq!(plan.url, endpoint.url);
         assert_eq!(plan.x_token, endpoint.x_token);
-        assert_eq!(plan.subscriptions.len(), 4);
+        assert_eq!(plan.subscriptions.len(), 3);
         assert_eq!(plan.subscriptions[0].owner_program, pump_program_id());
-        assert_eq!(plan.subscriptions[2].owner_program, dlmm_program_id());
+        assert_eq!(plan.subscriptions[1].owner_program, dlmm_program_id());
     }
 
     #[test]
