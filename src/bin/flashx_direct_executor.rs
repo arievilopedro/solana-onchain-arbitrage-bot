@@ -1053,6 +1053,7 @@ fn build_versioned_transaction(
         wallet_kp,
         mint_pool_data,
         compute_unit_limit,
+        0,
         enable_flashloan,
         no_failure_mode,
     )?);

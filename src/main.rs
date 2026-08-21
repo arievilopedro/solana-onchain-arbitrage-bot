@@ -80,10 +80,11 @@ async fn main() -> anyhow::Result<()> {
     let rabbitstream_plan = RabbitStreamPlan::controlled_v1(&config.rabbitstream)?;
     let helius_sender_plan = HeliusSenderPlan::from_config(&config.sender.helius)?;
     info!(
-        "config OK: wallet={} mints={} sol_only={} route_shards={} auto_create={} auto_extend={} compile_dry_run={} send_live_transactions={} simulate_before_send={} grpc={} rabbitstream={}",
+        "config OK: wallet={} mints={} sol_only={} minimum_profit_lamports={} route_shards={} auto_create={} auto_extend={} compile_dry_run={} send_live_transactions={} simulate_before_send={} grpc={} rabbitstream={}",
         wallet.pubkey(),
         config.runtime.allowed_mints.len(),
         config.execution.sol_only,
+        config.execution.minimum_profit_lamports,
         config.lookup_tables.route_shards.enabled,
         config.lookup_tables.route_shards.auto_create,
         config.lookup_tables.route_shards.auto_extend,
@@ -1070,6 +1071,7 @@ fn dry_run_controlled_routes(
     let params = ControlledExecutionParams {
         compute_unit_limit: config.compute.default_limit,
         compute_unit_price: config.compute.unit_price,
+        minimum_profit_lamports: config.execution.minimum_profit_lamports,
         use_flashloan: config.execution.use_flashloan,
         no_failure_mode: config.execution.no_failure_mode,
         sender_tip: sender_tip_config(config)?,
@@ -1147,6 +1149,7 @@ fn compile_controlled_mint_routes(
     let params = ControlledExecutionParams {
         compute_unit_limit: config.compute.default_limit,
         compute_unit_price: config.compute.unit_price,
+        minimum_profit_lamports: config.execution.minimum_profit_lamports,
         use_flashloan: config.execution.use_flashloan,
         no_failure_mode: config.execution.no_failure_mode,
         sender_tip: sender_tip_config(config)?,

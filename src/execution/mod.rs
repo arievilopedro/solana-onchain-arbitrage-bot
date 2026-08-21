@@ -19,6 +19,7 @@ use solana_sdk::transaction::VersionedTransaction;
 pub struct ControlledExecutionParams {
     pub compute_unit_limit: u32,
     pub compute_unit_price: u64,
+    pub minimum_profit_lamports: u64,
     pub use_flashloan: bool,
     pub no_failure_mode: bool,
     pub sender_tip: Option<SenderTipConfig>,
@@ -52,6 +53,7 @@ pub fn build_controlled_transaction(
         wallet,
         &mint_pool_data,
         params.compute_unit_limit,
+        params.minimum_profit_lamports,
         params.use_flashloan,
         params.no_failure_mode,
     )?);
@@ -199,6 +201,7 @@ mod tests {
         let params = ControlledExecutionParams {
             compute_unit_limit: 450_000,
             compute_unit_price: 1_000,
+            minimum_profit_lamports: 0,
             use_flashloan: false,
             no_failure_mode: true,
             sender_tip: Some(SenderTipConfig {

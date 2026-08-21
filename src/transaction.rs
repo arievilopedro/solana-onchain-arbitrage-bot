@@ -65,6 +65,7 @@ pub async fn build_and_send_transaction(
         wallet_kp,
         mint_pool_data,
         compute_unit_limit,
+        0,
         enable_flashloan,
         false,
     )?;
@@ -224,6 +225,7 @@ pub fn create_swap_instruction(
     wallet_kp: &Keypair,
     mint_pool_data: &MintPoolData,
     compute_unit_limit: u32,
+    minimum_profit: u64,
     use_flashloan: bool,
     no_failure_mode: bool,
 ) -> anyhow::Result<Instruction> {
@@ -678,8 +680,6 @@ pub fn create_swap_instruction(
     // Create instruction data
     let mut data = vec![28u8];
 
-    let minimum_profit: u64 = 0;
-
     data.extend_from_slice(&minimum_profit.to_le_bytes());
     data.extend_from_slice(&compute_unit_limit.to_le_bytes());
     data.extend_from_slice(if no_failure_mode { &[1] } else { &[0] });
@@ -712,12 +712,27 @@ mod tests {
         let mut pool_data = MintPoolData::new(pk(10), &wallet.pubkey(), spl_token::ID);
         pool_data.wallet_wsol_account = pk(11);
 
-        let ix = create_swap_instruction(&wallet, &pool_data, 400_000, false, true).unwrap();
+        let ix = create_swap_instruction(&wallet, &pool_data, 400_000, 0, false, true).unwrap();
 
         assert_eq!(
             ix.data,
             vec![28, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x1a, 0x06, 0x00, 1, 0, 0, 0,]
         );
+    }
+
+    #[test]
+    fn create_swap_instruction_data_uses_minimum_profit() {
+        let wallet = Keypair::new();
+        let mut pool_data = MintPoolData::new(pk(10), &wallet.pubkey(), spl_token::ID);
+        pool_data.wallet_wsol_account = pk(11);
+        let minimum_profit = 123_456_789u64;
+
+        let ix =
+            create_swap_instruction(&wallet, &pool_data, 400_000, minimum_profit, true, true)
+                .unwrap();
+
+        assert_eq!(&ix.data[1..9], &minimum_profit.to_le_bytes());
+        assert_eq!(ix.data[16], 1);
     }
 
     #[test]
@@ -764,7 +779,7 @@ mod tests {
             );
         }
 
-        let ix = create_swap_instruction(&wallet, &pool_data, 400_000, false, true).unwrap();
+        let ix = create_swap_instruction(&wallet, &pool_data, 400_000, 0, false, true).unwrap();
         let dlmm_program = dlmm_program_id();
         let dlmm_positions = ix
             .accounts
