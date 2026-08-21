@@ -34,6 +34,7 @@ use solana_sdk::message::VersionedMessage;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 use solana_sdk::transaction::VersionedTransaction;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -41,7 +42,7 @@ use std::time::Duration;
 use tracing::{info, Level};
 
 #[cfg(feature = "geyser")]
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 #[cfg(feature = "geyser")]
 use solana_onchain_arbitrage_bot::streams::{
     apply_pool_account_update, rpc::StreamRpcEnricher, SlotTracker,
@@ -175,15 +176,32 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let prepared_accounts =
+        prepare_route_runtime_accounts_for_registry(&config, rpc_client.as_ref(), &wallet, &registry)
+            .context("failed to prepare route runtime accounts")?;
+    info!(
+        "route runtime accounts ready: prepared_checks={}",
+        prepared_accounts
+    );
+
     let wallet = Arc::new(wallet);
     let registry = Arc::new(Mutex::new(registry));
     let blockhash_cache = BlockhashCache::start(rpc_client.clone(), Duration::from_millis(300))
         .context("failed to start blockhash cache")?;
+    let route_execution_cache = if config.lookup_tables.route_shards.enabled {
+        Some(Arc::new(RwLock::new(
+            RouteExecutionCache::load(&config, rpc_client.as_ref())
+                .context("failed to load route execution cache")?,
+        )))
+    } else {
+        None
+    };
     info!("supervisor bootstrap complete; starting configured stream workers");
     run_stream_workers(
         &config,
         rpc_client.clone(),
         blockhash_cache,
+        route_execution_cache,
         wallet.clone(),
         allowed_mints.clone(),
         registry.clone(),
@@ -292,10 +310,61 @@ impl BlockhashCache {
     }
 }
 
+struct RouteExecutionCache {
+    protocol_alt: AddressLookupTableAccount,
+    route_resolver: RouteShardLookupResolver,
+    route_alts: HashMap<Pubkey, AddressLookupTableAccount>,
+    packer: FixedDlmmRoutePacker,
+    params: ControlledExecutionParams,
+}
+
+impl RouteExecutionCache {
+    fn load(config: &AppConfig, rpc_client: &RpcClient) -> anyhow::Result<Self> {
+        let protocol_alt = load_lookup_table_account(
+            rpc_client,
+            Pubkey::from_str(&config.lookup_tables.protocol_alt)?,
+        )
+        .context("failed to load protocol ALT for route execution cache")?;
+        let route_resolver =
+            RouteShardLookupResolver::load(&config.lookup_tables.route_shards.state_file)
+                .context("failed to load route shard resolver for route execution cache")?;
+        let route_alts = route_resolver
+            .load_all_confirmed_shards(rpc_client)
+            .context("failed to load confirmed route shard ALTs")?
+            .into_iter()
+            .map(|alt| (alt.key, alt))
+            .collect::<HashMap<_, _>>();
+        let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
+        let params = ControlledExecutionParams {
+            compute_unit_limit: config.compute.default_limit,
+            compute_unit_price: config.compute.unit_price,
+            minimum_profit_lamports: config.execution.minimum_profit_lamports,
+            use_flashloan: config.execution.use_flashloan,
+            no_failure_mode: config.execution.no_failure_mode,
+            sender_tip: sender_tip_config(config)?,
+        };
+
+        info!(
+            "route execution cache loaded: protocol_alt={} route_alts={}",
+            protocol_alt.key,
+            route_alts.len()
+        );
+
+        Ok(Self {
+            protocol_alt,
+            route_resolver,
+            route_alts,
+            packer,
+            params,
+        })
+    }
+}
+
 async fn run_stream_workers(
     config: &AppConfig,
     rpc_client: Arc<RpcClient>,
     blockhash_cache: Arc<BlockhashCache>,
+    route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
     wallet: Arc<solana_sdk::signature::Keypair>,
     allowed_mints: Vec<Pubkey>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
@@ -306,13 +375,22 @@ async fn run_stream_workers(
         config.clone(),
         rpc_client.clone(),
         blockhash_cache,
+        route_execution_cache.clone(),
         wallet.clone(),
         registry.clone(),
         rabbitstream_plan,
         allowed_mints,
     )?;
 
-    run_geyser_account_worker(config, rpc_client, wallet, registry, grpc_plan).await
+    run_geyser_account_worker(
+        config,
+        rpc_client,
+        route_execution_cache,
+        wallet,
+        registry,
+        grpc_plan,
+    )
+    .await
 }
 
 #[cfg(feature = "geyser")]
@@ -320,6 +398,7 @@ fn run_rabbitstream_trigger_worker(
     config: AppConfig,
     rpc_client: Arc<RpcClient>,
     blockhash_cache: Arc<BlockhashCache>,
+    route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
     wallet: Arc<solana_sdk::signature::Keypair>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
@@ -403,17 +482,27 @@ fn run_rabbitstream_trigger_worker(
                     );
                     return Ok(());
                 };
+                let Some(route_execution_cache) = &route_execution_cache else {
+                    info!(
+                        "trigger controlled tx skipped: mint={} sig={} reason=route_execution_cache_unavailable",
+                        signal.mint, signal.signature
+                    );
+                    return Ok(());
+                };
                 let compilation = {
                     let registry = registry
                         .lock()
                         .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
-                    compile_controlled_mint_routes(
+                    let route_execution_cache = route_execution_cache
+                        .read()
+                        .map_err(|_| anyhow::anyhow!("route execution cache lock poisoned"))?;
+                    compile_controlled_mint_routes_cached(
                         &config,
-                        rpc_client.as_ref(),
                         wallet.as_ref(),
                         &registry,
                         signal.mint,
                         recent_blockhash,
+                        &route_execution_cache,
                     )?
                 };
                 info!(
@@ -443,37 +532,6 @@ fn run_rabbitstream_trigger_worker(
                         };
                         let trigger_signature = signal.signature.clone();
                         let trigger_mint = signal.mint;
-                        for ata in &compilation.first_atas_to_prepare {
-                            if let Err(error) =
-                                ensure_pda_ata(rpc_client.as_ref(), wallet.as_ref(), ata)
-                            {
-                                tracing::error!(
-                                    "trigger ATA preparation failed: mint={} trigger_sig={} label={} owner={} mint={} ata={} error={}",
-                                    trigger_mint,
-                                    trigger_signature,
-                                    ata.label,
-                                    ata.owner,
-                                    ata.mint,
-                                    ata.address,
-                                    error
-                                );
-                                return Ok(());
-                            }
-                        }
-                        if config.execution.use_flashloan {
-                            if let Err(error) = ensure_flashloan_vault_ready(
-                                rpc_client.as_ref(),
-                                &Pubkey::from_str(&config.mev.program_id)?,
-                            ) {
-                                tracing::error!(
-                                    "trigger flashloan vault check failed: mint={} trigger_sig={} error={}",
-                                    trigger_mint,
-                                    trigger_signature,
-                                    error
-                                );
-                                return Ok(());
-                            }
-                        }
                         if config.execution.simulate_before_send {
                             match ensure_trigger_transaction_simulates(rpc_client.as_ref(), &tx) {
                                 Ok(TriggerSimulationOutcome::Ready) => {}
@@ -787,6 +845,7 @@ fn run_rabbitstream_trigger_worker(
     _config: AppConfig,
     _rpc_client: Arc<RpcClient>,
     _blockhash_cache: Arc<BlockhashCache>,
+    _route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
     _wallet: Arc<solana_sdk::signature::Keypair>,
     _registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
@@ -808,6 +867,7 @@ fn run_rabbitstream_trigger_worker(
 async fn run_geyser_account_worker(
     config: &AppConfig,
     rpc_client: Arc<RpcClient>,
+    route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
     wallet: Arc<solana_sdk::signature::Keypair>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     grpc_plan: Option<GeyserAccountStreamPlan>,
@@ -877,6 +937,25 @@ async fn run_geyser_account_worker(
                     );
 
                     if summary.route_groups > 0 {
+                        if let Some(mint_state) = registry.get(&mint) {
+                            match prepare_route_runtime_accounts_for_mint(
+                                config,
+                                rpc_client.as_ref(),
+                                wallet.as_ref(),
+                                mint_state,
+                            ) {
+                                Ok(prepared) if prepared > 0 => info!(
+                                    "route runtime accounts refreshed: mint={} prepared_checks={}",
+                                    mint, prepared
+                                ),
+                                Ok(_) => {}
+                                Err(error) => tracing::error!(
+                                    "route runtime account refresh failed: mint={} error={}",
+                                    mint,
+                                    error
+                                ),
+                            }
+                        }
                         if !config.execution.compile_dry_run_on_startup {
                             info!(
                                 "live controlled tx dry-run skipped: mint={} reason=compile_dry_run_disabled",
@@ -904,18 +983,47 @@ async fn run_geyser_account_worker(
                                 dry_run.compile_failed
                             );
                             if dry_run.missing_route_shard > 0 {
-                                if let Err(error) = maintain_live_route_shards(
+                                match maintain_live_route_shards(
                                     config,
                                     rpc_client.as_ref(),
                                     wallet.as_ref(),
                                     &registry,
                                     &slot_tracker.recent_slot_candidates(),
                                 ) {
-                                    tracing::error!(
-                                        "route shard live maintenance failed: mint={} error={}",
-                                        mint,
-                                        error
-                                    );
+                                    Ok(confirmed) if confirmed > 0 => {
+                                        if let Some(cache) = &route_execution_cache {
+                                            match RouteExecutionCache::load(
+                                                config,
+                                                rpc_client.as_ref(),
+                                            ) {
+                                                Ok(updated_cache) => {
+                                                    if let Ok(mut cache) = cache.write() {
+                                                        *cache = updated_cache;
+                                                    } else {
+                                                        tracing::error!(
+                                                            "route execution cache reload failed: mint={} reason=lock_poisoned",
+                                                            mint
+                                                        );
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    tracing::error!(
+                                                        "route execution cache reload failed: mint={} error={}",
+                                                        mint,
+                                                        error
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        tracing::error!(
+                                            "route shard live maintenance failed: mint={} error={}",
+                                            mint,
+                                            error
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -963,9 +1071,9 @@ fn maintain_live_route_shards(
     wallet: &solana_sdk::signature::Keypair,
     registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     recent_slot_candidates: &[u64],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     if !config.lookup_tables.route_shards.enabled {
-        return Ok(());
+        return Ok(0);
     }
 
     let allowed_mints = parse_allowed_mints(config)?;
@@ -992,7 +1100,7 @@ fn maintain_live_route_shards(
     );
 
     if summary.operations.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     let maintenance = execute_route_shard_plan_with_recent_slots(
@@ -1012,13 +1120,14 @@ fn maintain_live_route_shards(
         maintenance.confirmed.len()
     );
 
-    Ok(())
+    Ok(maintenance.confirmed.len())
 }
 
 #[cfg(not(feature = "geyser"))]
 async fn run_geyser_account_worker(
     _config: &AppConfig,
     _rpc_client: Arc<RpcClient>,
+    _route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
     _wallet: Arc<solana_sdk::signature::Keypair>,
     _registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     grpc_plan: Option<GeyserAccountStreamPlan>,
@@ -1057,7 +1166,6 @@ struct ControlledTxDryRunSummary {
 struct ControlledMintCompilation {
     summary: ControlledTxDryRunSummary,
     first_transaction: Option<VersionedTransaction>,
-    first_atas_to_prepare: Vec<AtaPreparation>,
 }
 
 #[derive(Debug, Clone)]
@@ -1110,6 +1218,78 @@ fn plan_route_shards(
     }
 
     Ok(summary)
+}
+
+fn prepare_route_runtime_accounts_for_registry(
+    config: &AppConfig,
+    rpc_client: &RpcClient,
+    wallet: &solana_sdk::signature::Keypair,
+    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+) -> anyhow::Result<usize> {
+    let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
+    let now_ms = now_ms();
+    let mut prepared = 0usize;
+    let mut seen_atas = HashSet::<Pubkey>::new();
+
+    for (_, mint_state) in registry.iter() {
+        let route_groups = packer.pack_mint_state(
+            mint_state,
+            config.execution.min_pool_base_liquidity_lamports,
+            config.execution.max_pool_state_age_ms,
+            now_ms,
+        );
+
+        for route in route_groups {
+            for ata in pump_route_atas_to_prepare(wallet.pubkey(), &route.pump) {
+                if seen_atas.insert(ata.address) {
+                    ensure_pda_ata(rpc_client, wallet, &ata)?;
+                    prepared += 1;
+                }
+            }
+        }
+    }
+
+    if config.execution.use_flashloan {
+        ensure_flashloan_vault_ready(rpc_client, &Pubkey::from_str(&config.mev.program_id)?)?;
+        prepared += 1;
+    }
+
+    Ok(prepared)
+}
+
+#[cfg(feature = "geyser")]
+fn prepare_route_runtime_accounts_for_mint(
+    config: &AppConfig,
+    rpc_client: &RpcClient,
+    wallet: &solana_sdk::signature::Keypair,
+    mint_state: &solana_onchain_arbitrage_bot::registry::MintRuntimeState,
+) -> anyhow::Result<usize> {
+    let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
+    let now_ms = now_ms();
+    let route_groups = packer.pack_mint_state(
+        mint_state,
+        config.execution.min_pool_base_liquidity_lamports,
+        config.execution.max_pool_state_age_ms,
+        now_ms,
+    );
+    let mut prepared = 0usize;
+    let mut seen_atas = HashSet::<Pubkey>::new();
+
+    for route in route_groups {
+        for ata in pump_route_atas_to_prepare(wallet.pubkey(), &route.pump) {
+            if seen_atas.insert(ata.address) {
+                ensure_pda_ata(rpc_client, wallet, &ata)?;
+                prepared += 1;
+            }
+        }
+    }
+
+    if config.execution.use_flashloan {
+        ensure_flashloan_vault_ready(rpc_client, &Pubkey::from_str(&config.mev.program_id)?)?;
+        prepared += 1;
+    }
+
+    Ok(prepared)
 }
 
 fn dry_run_controlled_routes(
@@ -1250,8 +1430,65 @@ fn compile_controlled_mint_routes(
             Ok(tx) => {
                 compilation.summary.compiled += 1;
                 if compilation.first_transaction.is_none() {
-                    compilation.first_atas_to_prepare =
-                        pump_route_atas_to_prepare(wallet.pubkey(), &route.pump);
+                    compilation.first_transaction = Some(tx);
+                }
+            }
+            Err(_) => {
+                compilation.summary.compile_failed += 1;
+            }
+        }
+    }
+
+    Ok(compilation)
+}
+
+fn compile_controlled_mint_routes_cached(
+    config: &AppConfig,
+    wallet: &solana_sdk::signature::Keypair,
+    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    mint: Pubkey,
+    recent_blockhash: Hash,
+    route_execution_cache: &RouteExecutionCache,
+) -> anyhow::Result<ControlledMintCompilation> {
+    let Some(mint_state) = registry.get(&mint) else {
+        return Ok(ControlledMintCompilation::default());
+    };
+
+    let now_ms = now_ms();
+    let mut compilation = ControlledMintCompilation::default();
+    let route_groups = route_execution_cache.packer.pack_mint_state(
+        mint_state,
+        config.execution.min_pool_base_liquidity_lamports,
+        config.execution.max_pool_state_age_ms,
+        now_ms,
+    );
+
+    for route in route_groups {
+        compilation.summary.routes += 1;
+        let Some(shard) = route_execution_cache
+            .route_resolver
+            .shard_for_mint(route.mint)?
+        else {
+            compilation.summary.missing_route_shard += 1;
+            continue;
+        };
+        let Some(route_alt) = route_execution_cache.route_alts.get(&shard) else {
+            compilation.summary.missing_route_shard += 1;
+            continue;
+        };
+        let lookup_tables =
+            lookup_tables_for_route(&route_execution_cache.protocol_alt, route_alt);
+        match build_controlled_transaction(
+            wallet,
+            &route,
+            mint_state.token_program,
+            recent_blockhash,
+            &lookup_tables,
+            route_execution_cache.params.clone(),
+        ) {
+            Ok(tx) => {
+                compilation.summary.compiled += 1;
+                if compilation.first_transaction.is_none() {
                     compilation.first_transaction = Some(tx);
                 }
             }
