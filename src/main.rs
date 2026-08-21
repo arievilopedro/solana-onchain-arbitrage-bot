@@ -413,17 +413,28 @@ fn run_rabbitstream_trigger_worker(
                                 return Ok(());
                             }
                         }
-                        if let Err(error) = ensure_trigger_transaction_simulates(
+                        match ensure_trigger_transaction_simulates(
                             rpc_client.as_ref(),
                             &tx,
                         ) {
-                            tracing::error!(
-                                "trigger transaction simulation failed: mint={} trigger_sig={} error={}",
-                                trigger_mint,
-                                trigger_signature,
-                                error
-                            );
-                            return Ok(());
+                            Ok(TriggerSimulationOutcome::Ready) => {}
+                            Ok(TriggerSimulationOutcome::NoProfit) => {
+                                info!(
+                                    "trigger transaction skipped: mint={} trigger_sig={} reason=no_profitable_arbitrage",
+                                    trigger_mint,
+                                    trigger_signature
+                                );
+                                return Ok(());
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    "trigger transaction simulation failed: mint={} trigger_sig={} error={}",
+                                    trigger_mint,
+                                    trigger_signature,
+                                    error
+                                );
+                                return Ok(());
+                            }
                         }
                         tokio::spawn(async move {
                             match sender.send_transaction(&tx).await {
@@ -462,10 +473,15 @@ fn run_rabbitstream_trigger_worker(
     Ok(())
 }
 
+enum TriggerSimulationOutcome {
+    Ready,
+    NoProfit,
+}
+
 fn ensure_trigger_transaction_simulates(
     rpc_client: &RpcClient,
     tx: &VersionedTransaction,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TriggerSimulationOutcome> {
     static DUMPED_SIMULATION_ACCOUNTS: AtomicBool = AtomicBool::new(false);
 
     let simulation = rpc_client.simulate_transaction_with_config(
@@ -478,6 +494,9 @@ fn ensure_trigger_transaction_simulates(
     )?;
     if let Some(err) = simulation.value.err {
         let logs = simulation.value.logs.unwrap_or_default().join(" | ");
+        if logs.contains("No profitable arbitrage opportunity found") {
+            return Ok(TriggerSimulationOutcome::NoProfit);
+        }
         if !DUMPED_SIMULATION_ACCOUNTS.swap(true, Ordering::Relaxed) {
             if let Err(error) = dump_simulation_account_owners(rpc_client, tx) {
                 tracing::error!("simulation account owner dump failed: {}", error);
@@ -485,7 +504,7 @@ fn ensure_trigger_transaction_simulates(
         }
         anyhow::bail!("err={:?} logs={}", err, logs);
     }
-    Ok(())
+    Ok(TriggerSimulationOutcome::Ready)
 }
 
 fn dump_simulation_account_owners(
