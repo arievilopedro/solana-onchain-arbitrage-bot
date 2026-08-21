@@ -29,13 +29,15 @@ use solana_program::program_pack::Pack;
 use solana_sdk::address_lookup_table::state::AddressLookupTable;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
+use solana_sdk::hash::Hash;
 use solana_sdk::message::VersionedMessage;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 use solana_sdk::transaction::VersionedTransaction;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tracing::{info, Level};
 
 #[cfg(feature = "geyser")]
@@ -175,10 +177,13 @@ async fn main() -> anyhow::Result<()> {
 
     let wallet = Arc::new(wallet);
     let registry = Arc::new(Mutex::new(registry));
+    let blockhash_cache = BlockhashCache::start(rpc_client.clone(), Duration::from_millis(300))
+        .context("failed to start blockhash cache")?;
     info!("supervisor bootstrap complete; starting configured stream workers");
     run_stream_workers(
         &config,
         rpc_client.clone(),
+        blockhash_cache,
         wallet.clone(),
         allowed_mints.clone(),
         registry.clone(),
@@ -245,9 +250,52 @@ fn log_stream_plans(
     }
 }
 
+struct BlockhashCache {
+    current: RwLock<Hash>,
+}
+
+impl BlockhashCache {
+    fn start(rpc_client: Arc<RpcClient>, refresh_interval: Duration) -> anyhow::Result<Arc<Self>> {
+        let initial = rpc_client.get_latest_blockhash()?;
+        let cache = Arc::new(Self {
+            current: RwLock::new(initial),
+        });
+        let worker_cache = cache.clone();
+        info!(
+            "blockhash cache started: initial={} refresh_ms={}",
+            initial,
+            refresh_interval.as_millis()
+        );
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(refresh_interval);
+            loop {
+                interval.tick().await;
+                match rpc_client.get_latest_blockhash() {
+                    Ok(blockhash) => {
+                        if let Ok(mut current) = worker_cache.current.write() {
+                            *current = blockhash;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!("blockhash cache refresh failed: {}", error);
+                    }
+                }
+            }
+        });
+
+        Ok(cache)
+    }
+
+    fn current(&self) -> Option<Hash> {
+        self.current.read().ok().map(|blockhash| *blockhash)
+    }
+}
+
 async fn run_stream_workers(
     config: &AppConfig,
     rpc_client: Arc<RpcClient>,
+    blockhash_cache: Arc<BlockhashCache>,
     wallet: Arc<solana_sdk::signature::Keypair>,
     allowed_mints: Vec<Pubkey>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
@@ -257,6 +305,7 @@ async fn run_stream_workers(
     run_rabbitstream_trigger_worker(
         config.clone(),
         rpc_client.clone(),
+        blockhash_cache,
         wallet.clone(),
         registry.clone(),
         rabbitstream_plan,
@@ -270,6 +319,7 @@ async fn run_stream_workers(
 fn run_rabbitstream_trigger_worker(
     config: AppConfig,
     rpc_client: Arc<RpcClient>,
+    blockhash_cache: Arc<BlockhashCache>,
     wallet: Arc<solana_sdk::signature::Keypair>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
@@ -346,6 +396,13 @@ fn run_rabbitstream_trigger_worker(
                     );
                     return Ok(());
                 }
+                let Some(recent_blockhash) = blockhash_cache.current() else {
+                    info!(
+                        "trigger controlled tx skipped: mint={} sig={} reason=blockhash_cache_empty",
+                        signal.mint, signal.signature
+                    );
+                    return Ok(());
+                };
                 let compilation = {
                     let registry = registry
                         .lock()
@@ -356,6 +413,7 @@ fn run_rabbitstream_trigger_worker(
                         wallet.as_ref(),
                         &registry,
                         signal.mint,
+                        recent_blockhash,
                     )?
                 };
                 info!(
@@ -728,6 +786,7 @@ fn user_volume_accumulator_wsol_ata(wallet: Pubkey) -> Pubkey {
 fn run_rabbitstream_trigger_worker(
     _config: AppConfig,
     _rpc_client: Arc<RpcClient>,
+    _blockhash_cache: Arc<BlockhashCache>,
     _wallet: Arc<solana_sdk::signature::Keypair>,
     _registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
@@ -1123,7 +1182,16 @@ fn dry_run_controlled_mint_routes(
     registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     mint: Pubkey,
 ) -> anyhow::Result<ControlledTxDryRunSummary> {
-    Ok(compile_controlled_mint_routes(config, rpc_client, wallet, registry, mint)?.summary)
+    let recent_blockhash = rpc_client.get_latest_blockhash()?;
+    Ok(compile_controlled_mint_routes(
+        config,
+        rpc_client,
+        wallet,
+        registry,
+        mint,
+        recent_blockhash,
+    )?
+    .summary)
 }
 
 fn compile_controlled_mint_routes(
@@ -1132,6 +1200,7 @@ fn compile_controlled_mint_routes(
     wallet: &solana_sdk::signature::Keypair,
     registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     mint: Pubkey,
+    recent_blockhash: Hash,
 ) -> anyhow::Result<ControlledMintCompilation> {
     let Some(mint_state) = registry.get(&mint) else {
         return Ok(ControlledMintCompilation::default());
@@ -1146,7 +1215,6 @@ fn compile_controlled_mint_routes(
         RouteShardLookupResolver::load(&config.lookup_tables.route_shards.state_file)
             .context("failed to load route shard resolver")?;
     let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
-    let recent_blockhash = rpc_client.get_latest_blockhash()?;
     let params = ControlledExecutionParams {
         compute_unit_limit: config.compute.default_limit,
         compute_unit_price: config.compute.unit_price,
