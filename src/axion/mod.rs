@@ -52,6 +52,11 @@ pub mod yellowstone {
     };
 
     const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+    const PUMP_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+    const PUMP_BUY_DISCRIMINATOR: [u8; 8] =
+        [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
+    const PUMP_SELL_DISCRIMINATOR: [u8; 8] =
+        [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
 
     pub fn account_keys(tx: &Transaction, meta: Option<&TransactionStatusMeta>) -> Vec<Pubkey> {
         let mut keys = Vec::new();
@@ -111,7 +116,9 @@ pub mod yellowstone {
         meta: Option<&TransactionStatusMeta>,
         axion_program: Pubkey,
     ) -> AxionVolume {
-        let instruction = axion_instruction_volume(tx, keys, axion_program);
+        let pump_instruction = pump_amm_instruction_volume(tx, keys);
+        let axion_instruction = axion_instruction_volume(tx, keys, axion_program, meta);
+        let instruction = pump_instruction.or(axion_instruction);
         if let Some(meta) = meta {
             let wsol = wsol_volume(meta);
             if wsol > 0.0 {
@@ -194,24 +201,39 @@ pub mod yellowstone {
         tx: &Transaction,
         keys: &[Pubkey],
         axion_program: Pubkey,
+        meta: Option<&TransactionStatusMeta>,
     ) -> Option<AxionVolume> {
         let msg = tx.message.as_ref()?;
         msg.instructions
             .iter()
             .filter(|ix| keys.get(ix.program_id_index as usize) == Some(&axion_program))
-            .filter_map(|ix| instruction_volume(&ix.data))
+            .filter_map(|ix| {
+                axion_volume_from_instruction(ix.accounts.as_slice(), &ix.data, keys, meta)
+            })
             .max_by_key(|volume| volume.raw_amount.unwrap_or(0))
     }
 
-    fn instruction_volume(data: &[u8]) -> Option<AxionVolume> {
+    fn axion_volume_from_instruction(
+        account_indexes: &[u8],
+        data: &[u8],
+        keys: &[Pubkey],
+        meta: Option<&TransactionStatusMeta>,
+    ) -> Option<AxionVolume> {
         if data.len() < 17 {
             return None;
         }
-        let side = match data[0] {
+        let byte_side = match data[0] {
             0 => Some("sell"),
             1 => Some("buy"),
             _ => None,
         };
+        let user = account_indexes
+            .get(1)
+            .and_then(|index| keys.get(*index as usize));
+        let side = meta
+            .and_then(|meta| user.and_then(|user| owner_wsol_delta_sol(meta, user)))
+            .map(|delta| if delta < 0.0 { "buy" } else { "sell" })
+            .or(byte_side);
         let amount_0 = read_le_u64(&data[1..9]).unwrap_or(0);
         let amount_1 = read_le_u64(&data[9..17]).unwrap_or(0);
         let raw_amount = if amount_0 > 0 { amount_0 } else { amount_1 };
@@ -234,6 +256,76 @@ pub mod yellowstone {
             side,
             raw_amount: Some(raw_amount),
         })
+    }
+
+    fn pump_amm_instruction_volume(tx: &Transaction, keys: &[Pubkey]) -> Option<AxionVolume> {
+        let msg = tx.message.as_ref()?;
+        let pump_program = PUMP_AMM_PROGRAM.parse::<Pubkey>().ok()?;
+        msg.instructions
+            .iter()
+            .filter(|ix| keys.get(ix.program_id_index as usize) == Some(&pump_program))
+            .filter_map(|ix| pump_amm_volume_from_instruction(&ix.data))
+            .max_by_key(|volume| volume.raw_amount.unwrap_or(0))
+    }
+
+    fn pump_amm_volume_from_instruction(data: &[u8]) -> Option<AxionVolume> {
+        if data.len() < 16 {
+            return None;
+        }
+        let (side, source) = if data.starts_with(&PUMP_BUY_DISCRIMINATOR) {
+            ("buy", "pump_swap_buy_bytes")
+        } else if data.starts_with(&PUMP_SELL_DISCRIMINATOR) {
+            ("sell", "pump_swap_sell_bytes")
+        } else {
+            return None;
+        };
+        let amount = read_le_u64(&data[8..16]).unwrap_or(0);
+        if amount == 0 {
+            return None;
+        }
+        Some(AxionVolume {
+            sol_amount: if side == "buy" {
+                amount as f64 / 1_000_000_000.0
+            } else {
+                0.0
+            },
+            source,
+            side: Some(side),
+            raw_amount: Some(amount),
+        })
+    }
+
+    fn owner_wsol_delta_sol(meta: &TransactionStatusMeta, owner: &Pubkey) -> Option<f64> {
+        let owner = owner.to_string();
+        let mut pre = std::collections::HashMap::new();
+        let mut post = std::collections::HashMap::new();
+        for balance in &meta.pre_token_balances {
+            if balance.mint == WSOL_MINT && balance.owner == owner {
+                if let Some(ui) = &balance.ui_token_amount {
+                    pre.insert(balance.account_index, token_amount(&ui.amount, ui.decimals));
+                }
+            }
+        }
+        for balance in &meta.post_token_balances {
+            if balance.mint == WSOL_MINT && balance.owner == owner {
+                if let Some(ui) = &balance.ui_token_amount {
+                    post.insert(balance.account_index, token_amount(&ui.amount, ui.decimals));
+                }
+            }
+        }
+        pre.keys()
+            .chain(post.keys())
+            .map(|idx| {
+                let before = pre.get(idx).copied().unwrap_or(0.0);
+                let after = post.get(idx).copied().unwrap_or(0.0);
+                after - before
+            })
+            .max_by(|left, right| {
+                left.abs()
+                    .partial_cmp(&right.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .filter(|delta| delta.abs() > 0.0)
     }
 
     fn read_le_u64(bytes: &[u8]) -> Option<u64> {
@@ -278,6 +370,37 @@ pub mod yellowstone {
             axion_program_seen,
         })
         .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pump_amm_discriminator_detects_buy() {
+            let mut data = Vec::from(PUMP_BUY_DISCRIMINATOR);
+            data.extend_from_slice(&1_500_000_000u64.to_le_bytes());
+
+            let volume = pump_amm_volume_from_instruction(&data).unwrap();
+
+            assert_eq!(volume.side, Some("buy"));
+            assert_eq!(volume.raw_amount, Some(1_500_000_000));
+            assert_eq!(volume.source, "pump_swap_buy_bytes");
+            assert_eq!(volume.sol_amount, 1.5);
+        }
+
+        #[test]
+        fn pump_amm_discriminator_detects_sell() {
+            let mut data = Vec::from(PUMP_SELL_DISCRIMINATOR);
+            data.extend_from_slice(&42_000_000u64.to_le_bytes());
+
+            let volume = pump_amm_volume_from_instruction(&data).unwrap();
+
+            assert_eq!(volume.side, Some("sell"));
+            assert_eq!(volume.raw_amount, Some(42_000_000));
+            assert_eq!(volume.source, "pump_swap_sell_bytes");
+            assert_eq!(volume.sol_amount, 0.0);
+        }
     }
 }
 

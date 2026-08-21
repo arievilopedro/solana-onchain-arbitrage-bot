@@ -651,7 +651,9 @@ fn adjusted_trigger_sol_amount(
     side: Option<&'static str>,
     raw_amount: Option<u64>,
 ) -> anyhow::Result<(f64, &'static str)> {
-    if side != Some("sell") || volume_source != "axion_instruction_amount" {
+    if side != Some("sell")
+        || (volume_source != "axion_instruction_amount" && volume_source != "pump_swap_sell_bytes")
+    {
         return Ok((sol_amount, volume_source));
     }
 
