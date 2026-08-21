@@ -470,6 +470,7 @@ fn run_rabbitstream_trigger_worker(
         let mut last_trigger_by_mint = HashMap::<Pubkey, Instant>::new();
         let result =
             run_axion_trigger_stream(plan, axion_program, allowed_mints, move |signal| {
+                let trigger_received_at = Instant::now();
                 if !seen_signatures.insert(signal.signature.clone()) {
                     return Ok(());
                 }
@@ -523,7 +524,7 @@ fn run_rabbitstream_trigger_worker(
                     }
                     last_trigger_by_mint.insert(signal.mint, now);
                 }
-                info!(
+                tracing::debug!(
                     "rabbitstream axion trigger: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={} side={} raw_amount={}",
                     signal.mint,
                     signal.slot,
@@ -608,6 +609,7 @@ fn run_rabbitstream_trigger_worker(
                         };
                         let trigger_signature = signal.signature.clone();
                         let trigger_mint = signal.mint;
+                        let trigger_slot = signal.slot;
                         let simulate_before_send = config.execution.simulate_before_send;
                         let rpc_client = rpc_client.clone();
                         for (tx_index, tx) in txs.into_iter().enumerate() {
@@ -645,15 +647,31 @@ fn run_rabbitstream_trigger_worker(
                             }
                             let sender = sender.clone();
                             let trigger_signature = trigger_signature.clone();
+                            let trigger_to_spawn_ms = trigger_received_at.elapsed().as_millis();
                             tokio::spawn(async move {
+                                let send_started_at = Instant::now();
                                 match sender.send_transaction(&tx).await {
                                     Ok(signature) => info!(
-                                        "trigger transaction sent: mint={} trigger_sig={} tx_index={} tx_sig={}",
-                                        trigger_mint, trigger_signature, tx_index, signature
+                                        "trigger transaction sent: mint={} trigger_slot={} trigger_sig={} tx_index={} tx_sig={} trigger_to_spawn_ms={} sender_ack_ms={} trigger_to_ack_ms={}",
+                                        trigger_mint,
+                                        trigger_slot,
+                                        trigger_signature,
+                                        tx_index,
+                                        signature,
+                                        trigger_to_spawn_ms,
+                                        send_started_at.elapsed().as_millis(),
+                                        trigger_received_at.elapsed().as_millis()
                                     ),
                                     Err(error) => tracing::error!(
-                                        "trigger transaction send failed: mint={} trigger_sig={} tx_index={} error={}",
-                                        trigger_mint, trigger_signature, tx_index, error
+                                        "trigger transaction send failed: mint={} trigger_slot={} trigger_sig={} tx_index={} trigger_to_spawn_ms={} sender_ack_ms={} trigger_to_ack_ms={} error={}",
+                                        trigger_mint,
+                                        trigger_slot,
+                                        trigger_signature,
+                                        tx_index,
+                                        trigger_to_spawn_ms,
+                                        send_started_at.elapsed().as_millis(),
+                                        trigger_received_at.elapsed().as_millis(),
+                                        error
                                     ),
                                 }
                             });
