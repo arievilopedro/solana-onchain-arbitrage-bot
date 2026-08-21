@@ -177,6 +177,10 @@ pub struct HeliusSenderConfig {
     pub tip_lamports_max: Option<u64>,
     #[serde(default = "crate::sender::default_helius_tip_accounts_csv")]
     pub tip_accounts: String,
+    #[serde(default = "default_helius_connection_warming_enabled")]
+    pub connection_warming_enabled: bool,
+    #[serde(default = "default_helius_connection_warming_interval_ms")]
+    pub connection_warming_interval_ms: u64,
 }
 
 impl HeliusSenderConfig {
@@ -382,6 +386,14 @@ impl AppConfig {
                 "sender.helius.tip_accounts",
                 &self.sender.helius.tip_accounts,
             )?;
+
+            if self.sender.helius.connection_warming_enabled
+                && self.sender.helius.connection_warming_interval_ms == 0
+            {
+                anyhow::bail!(
+                    "sender.helius.connection_warming_interval_ms must be greater than zero when connection warming is enabled"
+                );
+            }
         }
 
         Ok(())
@@ -442,6 +454,14 @@ fn default_helius_burst() -> u64 {
 
 fn default_helius_timeout_ms() -> u64 {
     700
+}
+
+fn default_helius_connection_warming_enabled() -> bool {
+    true
+}
+
+fn default_helius_connection_warming_interval_ms() -> u64 {
+    5_000
 }
 
 fn ensure_parent_dir(field: &str, path: &str) -> anyhow::Result<()> {

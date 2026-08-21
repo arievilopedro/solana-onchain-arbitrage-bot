@@ -8,6 +8,7 @@ use solana_program::pubkey::Pubkey;
 use solana_sdk::transaction::VersionedTransaction;
 use std::str::FromStr;
 use std::time::Duration;
+use tracing::{debug, info};
 
 pub const HELIUS_TIP_ACCOUNTS: &[&str] = &[
     "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
@@ -50,9 +51,12 @@ impl SenderTipConfig {
 #[derive(Debug, Clone)]
 pub struct HeliusSenderPlan {
     pub endpoint: String,
+    pub ping_endpoint: String,
     pub max_tps: u64,
     pub burst: u64,
     pub timeout_ms: u64,
+    pub connection_warming_enabled: bool,
+    pub connection_warming_interval_ms: u64,
     pub tip: SenderTipConfig,
 }
 
@@ -67,10 +71,13 @@ impl HeliusSenderPlan {
         let (tip_min, tip_max) = config.tip_lamports_range();
 
         Ok(Some(Self {
+            ping_endpoint: helius_ping_endpoint(&endpoint),
             endpoint,
             max_tps: config.max_tps,
             burst: config.burst,
             timeout_ms: config.timeout_ms,
+            connection_warming_enabled: config.connection_warming_enabled,
+            connection_warming_interval_ms: config.connection_warming_interval_ms,
             tip: SenderTipConfig {
                 min_lamports: tip_min,
                 max_lamports: tip_max,
@@ -127,6 +134,31 @@ impl HeliusSenderClient {
         extract_signature_from_response(&value)
             .ok_or_else(|| anyhow::anyhow!("Helius sender missing signature body={}", value))
     }
+
+    pub fn start_connection_warmer(&self) {
+        if !self.plan.connection_warming_enabled {
+            return;
+        }
+
+        let client = self.client.clone();
+        let endpoint = self.plan.ping_endpoint.clone();
+        let interval_ms = self.plan.connection_warming_interval_ms;
+        info!(
+            "Helius sender connection warming started: endpoint={} interval_ms={}",
+            redacted_sender_endpoint(&endpoint),
+            interval_ms
+        );
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+            loop {
+                interval.tick().await;
+                if let Err(error) = client.get(&endpoint).send().await {
+                    debug!("Helius sender connection warming failed: {}", error);
+                }
+            }
+        });
+    }
 }
 
 fn extract_signature_from_response(value: &Value) -> Option<String> {
@@ -158,6 +190,26 @@ pub fn helius_endpoint_with_api_key(endpoint: &str, api_key: &str) -> String {
 
     let sep = if endpoint.contains('?') { '&' } else { '?' };
     format!("{}{}api-key={}", endpoint, sep, api_key)
+}
+
+pub fn helius_ping_endpoint(endpoint: &str) -> String {
+    let endpoint_without_query = endpoint
+        .split_once('?')
+        .map(|(base, _)| base)
+        .unwrap_or(endpoint);
+    if let Some(prefix) = endpoint_without_query.strip_suffix("/fast") {
+        return format!("{}/ping", prefix);
+    }
+
+    format!("{}/ping", endpoint_without_query.trim_end_matches('/'))
+}
+
+fn redacted_sender_endpoint(endpoint: &str) -> String {
+    if let Some((prefix, _)) = endpoint.split_once("api-key=") {
+        format!("{}api-key=<redacted>", prefix)
+    } else {
+        endpoint.to_string()
+    }
 }
 
 fn parse_tip_accounts(raw: &str) -> anyhow::Result<Vec<Pubkey>> {
@@ -198,6 +250,24 @@ mod tests {
                 "new"
             ),
             "http://lon-sender.helius-rpc.com/fast?api-key=old"
+        );
+    }
+
+    #[test]
+    fn ping_endpoint_is_derived_from_fast_endpoint() {
+        assert_eq!(
+            helius_ping_endpoint("http://fra-sender.helius-rpc.com/fast"),
+            "http://fra-sender.helius-rpc.com/ping"
+        );
+        assert_eq!(
+            helius_ping_endpoint(
+                "http://fra-sender.helius-rpc.com/fast?swqos_only=true&api-key=key"
+            ),
+            "http://fra-sender.helius-rpc.com/ping"
+        );
+        assert_eq!(
+            helius_ping_endpoint("https://sender.helius-rpc.com"),
+            "https://sender.helius-rpc.com/ping"
         );
     }
 

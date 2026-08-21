@@ -75,6 +75,8 @@ api_key = "${HELIUS_SENDER_API_KEY}"
 max_tps = 50
 burst = 20
 timeout_ms = 700
+connection_warming_enabled = true
+connection_warming_interval_ms = 5000
 # Helius Sender requires both priority fee and a SOL tip.
 # 1_000_000 lamports = 0.001 SOL. If min/max are set, each tx randomizes in that range.
 # Use 5_000 lamports with a swqos_only endpoint for SWQOS-only.

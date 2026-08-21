@@ -2,30 +2,28 @@ use anyhow::Context;
 use clap::{App, Arg};
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSimulateTransactionConfig;
-use solana_onchain_arbitrage_bot::constants::sol_mint;
-use solana_onchain_arbitrage_bot::dex::pump::pump_program_id;
-use solana_onchain_arbitrage_bot::ata::ensure_base_atas_exist;
 use solana_onchain_arbitrage_bot::alt::{
     execute_route_shard_plan, execute_route_shard_plan_with_recent_slots,
     load_lookup_table_account, PendingRouteShardOperation, PlannedRouteShardExtension,
     RouteShardLookupResolver, RouteShardPlanFile, RouteShardPlanner, RouteShardStore,
     StableMintRouteAccounts,
 };
+use solana_onchain_arbitrage_bot::ata::ensure_base_atas_exist;
 use solana_onchain_arbitrage_bot::config::AppConfig;
+use solana_onchain_arbitrage_bot::constants::sol_mint;
+use solana_onchain_arbitrage_bot::dex::pump::pump_program_id;
 use solana_onchain_arbitrage_bot::discovery::{ControlledRpcBootstrap, RpcBootstrapConfig};
 use solana_onchain_arbitrage_bot::execution::{
     build_controlled_transaction, ControlledExecutionParams,
 };
 use solana_onchain_arbitrage_bot::routes::FixedDlmmRoutePacker;
-use solana_onchain_arbitrage_bot::sender::{
-    HeliusSenderClient, HeliusSenderPlan, SenderTipConfig,
-};
+use solana_onchain_arbitrage_bot::sender::{HeliusSenderClient, HeliusSenderPlan, SenderTipConfig};
 use solana_onchain_arbitrage_bot::streams::grpc::GeyserAccountStreamPlan;
 use solana_onchain_arbitrage_bot::streams::rabbitstream::RabbitStreamPlan;
 use solana_onchain_arbitrage_bot::transaction::derive_vault_token_account;
 use solana_onchain_arbitrage_bot::wallet::load_keypair;
-use solana_program::pubkey::Pubkey;
 use solana_program::program_pack::Pack;
+use solana_program::pubkey::Pubkey;
 use solana_sdk::address_lookup_table::state::AddressLookupTable;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
@@ -42,11 +40,11 @@ use std::time::{Duration, Instant};
 use tracing::{info, Level};
 
 #[cfg(feature = "geyser")]
-use std::collections::VecDeque;
-#[cfg(feature = "geyser")]
 use solana_onchain_arbitrage_bot::streams::{
     apply_pool_account_update, rpc::StreamRpcEnricher, SlotTracker,
 };
+#[cfg(feature = "geyser")]
+use std::collections::VecDeque;
 use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
@@ -226,14 +224,16 @@ fn log_sender_plan(config: &AppConfig, helius_sender_plan: Option<&HeliusSenderP
     if config.sender.primary == "helius" {
         if let Some(plan) = helius_sender_plan {
             info!(
-                "Helius sender planned: endpoint={} tip_lamports_min={} tip_lamports_max={} tip_accounts={} max_tps={} burst={} timeout_ms={}",
+                "Helius sender planned: endpoint={} tip_lamports_min={} tip_lamports_max={} tip_accounts={} max_tps={} burst={} timeout_ms={} connection_warming={} warming_interval_ms={}",
                 redacted_endpoint(&plan.endpoint),
                 plan.tip.min_lamports,
                 plan.tip.max_lamports,
                 plan.tip.accounts.len(),
                 plan.max_tps,
                 plan.burst,
-                plan.timeout_ms
+                plan.timeout_ms,
+                plan.connection_warming_enabled,
+                plan.connection_warming_interval_ms
             );
         }
     } else {
@@ -456,6 +456,9 @@ fn run_rabbitstream_trigger_worker(
     } else {
         None
     };
+    if let Some(sender) = &helius_sender {
+        sender.start_connection_warmer();
+    }
     info!(
         "starting RabbitStream Axion trigger worker: url={} allowed_mints={} min_sol={:.6}",
         plan.url,
@@ -975,7 +978,10 @@ fn ensure_pda_ata(
     if rpc_client.get_account(&ata.address).is_ok() {
         tracing::debug!(
             "route ATA already exists: label={} owner={} mint={} ata={}",
-            ata.label, ata.owner, ata.mint, ata.address
+            ata.label,
+            ata.owner,
+            ata.mint,
+            ata.address
         );
         return Ok(());
     }
@@ -986,11 +992,7 @@ fn ensure_pda_ata(
         &spl_token::ID,
     );
     if expected_ata != ata.address {
-        anyhow::bail!(
-            "ATA mismatch expected={} got={}",
-            expected_ata,
-            ata.address
-        );
+        anyhow::bail!("ATA mismatch expected={} got={}", expected_ata, ata.address);
     }
 
     let create_ata_ix =
@@ -1043,7 +1045,10 @@ fn ensure_cached_pda_ata(
     Ok(true)
 }
 
-fn ensure_flashloan_vault_ready(rpc_client: &RpcClient, mev_program: &Pubkey) -> anyhow::Result<()> {
+fn ensure_flashloan_vault_ready(
+    rpc_client: &RpcClient,
+    mev_program: &Pubkey,
+) -> anyhow::Result<()> {
     let vault = derive_vault_token_account(mev_program, &sol_mint()).0;
     let account = rpc_client
         .get_account(&vault)
@@ -1883,8 +1888,7 @@ fn compile_controlled_mint_routes_cached(
             compilation.summary.missing_route_shard += 1;
             continue;
         };
-        let lookup_tables =
-            lookup_tables_for_route(&route_execution_cache.protocol_alt, route_alt);
+        let lookup_tables = lookup_tables_for_route(&route_execution_cache.protocol_alt, route_alt);
         match build_controlled_transaction(
             wallet,
             &route,
