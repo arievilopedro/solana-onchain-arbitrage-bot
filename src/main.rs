@@ -176,9 +176,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let prepared_accounts =
-        prepare_route_runtime_accounts_for_registry(&config, rpc_client.as_ref(), &wallet, &registry)
-            .context("failed to prepare route runtime accounts")?;
+    let runtime_account_cache = Arc::new(Mutex::new(RuntimeAccountCache::default()));
+    let prepared_accounts = prepare_route_runtime_accounts_for_registry(
+        &config,
+        rpc_client.as_ref(),
+        &wallet,
+        &registry,
+        runtime_account_cache.as_ref(),
+    )
+    .context("failed to prepare route runtime accounts")?;
     info!(
         "route runtime accounts ready: prepared_checks={}",
         prepared_accounts
@@ -202,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
         rpc_client.clone(),
         blockhash_cache,
         route_execution_cache,
+        runtime_account_cache,
         wallet.clone(),
         allowed_mints.clone(),
         registry.clone(),
@@ -328,6 +335,12 @@ struct RouteExecutionCache {
     params: ControlledExecutionParams,
 }
 
+#[derive(Debug, Default)]
+struct RuntimeAccountCache {
+    ready_atas: HashSet<Pubkey>,
+    flashloan_vault_ready: bool,
+}
+
 #[cfg(feature = "geyser")]
 struct GeyserRouteAction {
     mint: Pubkey,
@@ -386,6 +399,7 @@ async fn run_stream_workers(
     rpc_client: Arc<RpcClient>,
     blockhash_cache: Arc<BlockhashCache>,
     route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
+    runtime_account_cache: Arc<Mutex<RuntimeAccountCache>>,
     wallet: Arc<solana_sdk::signature::Keypair>,
     allowed_mints: Vec<Pubkey>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
@@ -407,6 +421,7 @@ async fn run_stream_workers(
         config,
         rpc_client,
         route_execution_cache,
+        runtime_account_cache,
         wallet,
         registry,
         grpc_plans,
@@ -922,6 +937,30 @@ fn ensure_pda_ata(
     Ok(())
 }
 
+fn ensure_cached_pda_ata(
+    rpc_client: &RpcClient,
+    wallet: &solana_sdk::signature::Keypair,
+    runtime_account_cache: &Mutex<RuntimeAccountCache>,
+    ata: &AtaPreparation,
+) -> anyhow::Result<bool> {
+    if runtime_account_cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime account cache mutex poisoned"))?
+        .ready_atas
+        .contains(&ata.address)
+    {
+        return Ok(false);
+    }
+
+    ensure_pda_ata(rpc_client, wallet, ata)?;
+    runtime_account_cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime account cache mutex poisoned"))?
+        .ready_atas
+        .insert(ata.address);
+    Ok(true)
+}
+
 fn ensure_flashloan_vault_ready(rpc_client: &RpcClient, mev_program: &Pubkey) -> anyhow::Result<()> {
     let vault = derive_vault_token_account(mev_program, &sol_mint()).0;
     let account = rpc_client
@@ -956,6 +995,27 @@ fn ensure_flashloan_vault_ready(rpc_client: &RpcClient, mev_program: &Pubkey) ->
         token_account.owner
     );
     Ok(())
+}
+
+fn ensure_cached_flashloan_vault_ready(
+    rpc_client: &RpcClient,
+    runtime_account_cache: &Mutex<RuntimeAccountCache>,
+    mev_program: &Pubkey,
+) -> anyhow::Result<bool> {
+    if runtime_account_cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime account cache mutex poisoned"))?
+        .flashloan_vault_ready
+    {
+        return Ok(false);
+    }
+
+    ensure_flashloan_vault_ready(rpc_client, mev_program)?;
+    runtime_account_cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime account cache mutex poisoned"))?
+        .flashloan_vault_ready = true;
+    Ok(true)
 }
 
 fn user_volume_accumulator(wallet: Pubkey) -> Pubkey {
@@ -1002,6 +1062,7 @@ async fn run_geyser_account_worker(
     config: &AppConfig,
     rpc_client: Arc<RpcClient>,
     route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
+    runtime_account_cache: Arc<Mutex<RuntimeAccountCache>>,
     wallet: Arc<solana_sdk::signature::Keypair>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     grpc_plans: Vec<GeyserAccountStreamPlan>,
@@ -1015,6 +1076,7 @@ async fn run_geyser_account_worker(
         let config = config.clone();
         let rpc_client = rpc_client.clone();
         let route_execution_cache = route_execution_cache.clone();
+        let runtime_account_cache = runtime_account_cache.clone();
         let wallet = wallet.clone();
         let registry = registry.clone();
         tokio::spawn(async move {
@@ -1022,6 +1084,7 @@ async fn run_geyser_account_worker(
                 config,
                 rpc_client,
                 route_execution_cache,
+                runtime_account_cache,
                 wallet,
                 registry,
                 plan,
@@ -1047,6 +1110,7 @@ async fn run_single_geyser_account_worker(
     config: AppConfig,
     rpc_client: Arc<RpcClient>,
     route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
+    runtime_account_cache: Arc<Mutex<RuntimeAccountCache>>,
     wallet: Arc<solana_sdk::signature::Keypair>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     plan: GeyserAccountStreamPlan,
@@ -1141,12 +1205,14 @@ async fn run_single_geyser_account_worker(
                         let rpc_client = rpc_client.clone();
                         let wallet = wallet.clone();
                         let route_execution_cache = route_execution_cache.clone();
+                        let runtime_account_cache = runtime_account_cache.clone();
                         tokio::task::spawn_blocking(move || {
                             process_geyser_route_action(
                                 config,
                                 rpc_client,
                                 wallet,
                                 route_execution_cache,
+                                runtime_account_cache,
                                 action,
                             );
                         });
@@ -1193,6 +1259,7 @@ fn process_geyser_route_action(
     rpc_client: Arc<RpcClient>,
     wallet: Arc<solana_sdk::signature::Keypair>,
     route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
+    runtime_account_cache: Arc<Mutex<RuntimeAccountCache>>,
     action: GeyserRouteAction,
 ) {
     if let Some(mint_state) = action.mint_state.as_ref() {
@@ -1201,6 +1268,7 @@ fn process_geyser_route_action(
             rpc_client.as_ref(),
             wallet.as_ref(),
             mint_state,
+            runtime_account_cache.as_ref(),
         ) {
             Ok(prepared) if prepared > 0 => info!(
                 "route runtime accounts refreshed: mint={} prepared_checks={}",
@@ -1364,6 +1432,7 @@ async fn run_geyser_account_worker(
     _config: &AppConfig,
     _rpc_client: Arc<RpcClient>,
     _route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
+    _runtime_account_cache: Arc<Mutex<RuntimeAccountCache>>,
     _wallet: Arc<solana_sdk::signature::Keypair>,
     _registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     grpc_plans: Vec<GeyserAccountStreamPlan>,
@@ -1461,6 +1530,7 @@ fn prepare_route_runtime_accounts_for_registry(
     rpc_client: &RpcClient,
     wallet: &solana_sdk::signature::Keypair,
     registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    runtime_account_cache: &Mutex<RuntimeAccountCache>,
 ) -> anyhow::Result<usize> {
     let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
     let now_ms = now_ms();
@@ -1478,16 +1548,22 @@ fn prepare_route_runtime_accounts_for_registry(
         for route in route_groups {
             for ata in pump_route_atas_to_prepare(wallet.pubkey(), &route.pump) {
                 if seen_atas.insert(ata.address) {
-                    ensure_pda_ata(rpc_client, wallet, &ata)?;
-                    prepared += 1;
+                    if ensure_cached_pda_ata(rpc_client, wallet, runtime_account_cache, &ata)? {
+                        prepared += 1;
+                    }
                 }
             }
         }
     }
 
     if config.execution.use_flashloan {
-        ensure_flashloan_vault_ready(rpc_client, &Pubkey::from_str(&config.mev.program_id)?)?;
-        prepared += 1;
+        if ensure_cached_flashloan_vault_ready(
+            rpc_client,
+            runtime_account_cache,
+            &Pubkey::from_str(&config.mev.program_id)?,
+        )? {
+            prepared += 1;
+        }
     }
 
     Ok(prepared)
@@ -1499,6 +1575,7 @@ fn prepare_route_runtime_accounts_for_mint(
     rpc_client: &RpcClient,
     wallet: &solana_sdk::signature::Keypair,
     mint_state: &solana_onchain_arbitrage_bot::registry::MintRuntimeState,
+    runtime_account_cache: &Mutex<RuntimeAccountCache>,
 ) -> anyhow::Result<usize> {
     let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
     let now_ms = now_ms();
@@ -1514,15 +1591,21 @@ fn prepare_route_runtime_accounts_for_mint(
     for route in route_groups {
         for ata in pump_route_atas_to_prepare(wallet.pubkey(), &route.pump) {
             if seen_atas.insert(ata.address) {
-                ensure_pda_ata(rpc_client, wallet, &ata)?;
-                prepared += 1;
+                if ensure_cached_pda_ata(rpc_client, wallet, runtime_account_cache, &ata)? {
+                    prepared += 1;
+                }
             }
         }
     }
 
     if config.execution.use_flashloan {
-        ensure_flashloan_vault_ready(rpc_client, &Pubkey::from_str(&config.mev.program_id)?)?;
-        prepared += 1;
+        if ensure_cached_flashloan_vault_ready(
+            rpc_client,
+            runtime_account_cache,
+            &Pubkey::from_str(&config.mev.program_id)?,
+        )? {
+            prepared += 1;
+        }
     }
 
     Ok(prepared)
