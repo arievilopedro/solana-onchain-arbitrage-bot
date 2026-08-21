@@ -328,6 +328,17 @@ struct RouteExecutionCache {
     params: ControlledExecutionParams,
 }
 
+#[cfg(feature = "geyser")]
+struct GeyserRouteAction {
+    mint: Pubkey,
+    summary: LiveRouteCandidateSummary,
+    previous_route_groups: Option<usize>,
+    report: solana_onchain_arbitrage_bot::streams::RegistryUpdateReport,
+    mint_state: Option<solana_onchain_arbitrage_bot::registry::MintRuntimeState>,
+    registry_snapshot: solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    recent_slot_candidates: Vec<u64>,
+}
+
 impl RouteExecutionCache {
     fn load(config: &AppConfig, rpc_client: &RpcClient) -> anyhow::Result<Self> {
         let protocol_alt = load_lookup_table_account(
@@ -467,7 +478,7 @@ fn run_rabbitstream_trigger_worker(
                     signal.raw_amount,
                 )?;
                 if sol_amount < config.axion.min_sol {
-                    info!(
+                    tracing::debug!(
                         "rabbitstream axion trigger filtered: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={} side={} raw_amount={}",
                         signal.mint,
                         signal.slot,
@@ -583,7 +594,7 @@ fn run_rabbitstream_trigger_worker(
                                 }
                             }
                         } else {
-                            info!(
+                            tracing::debug!(
                                 "trigger transaction simulation skipped: mint={} trigger_sig={} reason=simulate_before_send_false",
                                 trigger_mint,
                                 trigger_signature
@@ -1043,139 +1054,81 @@ async fn run_single_geyser_account_worker(
             }
         };
 
-        let mut registry = registry
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
-        let report = apply_pool_account_update(
-            &mut registry,
-            update,
-            |token_vault, base_vault| enricher.pump_vault_liquidity(token_vault, base_vault),
-            |base_vault| enricher.base_vault_liquidity(base_vault),
-            |mint| enricher.mint_uses_token_2022(mint),
-            |pair| enricher.dlmm_bitmap_extension(pair),
-        )?;
+        let (report, route_action) = {
+            let mut registry = registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
+            let report = apply_pool_account_update(
+                &mut registry,
+                update,
+                |token_vault, base_vault| enricher.pump_vault_liquidity(token_vault, base_vault),
+                |base_vault| enricher.base_vault_liquidity(base_vault),
+                |mint| enricher.mint_uses_token_2022(mint),
+                |pair| enricher.dlmm_bitmap_extension(pair),
+            )?;
+            let route_action = if report.applied {
+                report.applied_mint.and_then(|mint| {
+                    registry.get(&mint).map(|state| {
+                        let summary = live_route_candidate_summary(&config, &packer, state);
+                        let previous_route_groups =
+                            last_route_groups_by_mint.insert(mint, summary.route_groups);
+                        GeyserRouteAction {
+                            mint,
+                            summary,
+                            previous_route_groups,
+                            report,
+                            mint_state: Some(state.clone()),
+                            registry_snapshot: registry.clone(),
+                            recent_slot_candidates: slot_tracker.recent_slot_candidates(),
+                        }
+                    })
+                })
+            } else {
+                None
+            };
+            (report, route_action)
+        };
 
         if report.applied {
-            let route_summary = report
-                .applied_mint
-                .and_then(|mint| registry.get(&mint).map(|state| (mint, state)))
-                .map(|(mint, state)| (mint, live_route_candidate_summary(&config, &packer, state)));
-
-            if let Some((mint, summary)) = route_summary {
-                let previous_route_groups =
-                    last_route_groups_by_mint.insert(mint, summary.route_groups);
-                if previous_route_groups != Some(summary.route_groups) {
+            if let Some(action) = route_action {
+                if action.previous_route_groups != Some(action.summary.route_groups) {
                     info!(
                         "route candidate state: mint={} eligible_pump={} eligible_dlmm={} route_groups={} previous_route_groups={} last_update_kind={:?} last_update_pool={} last_base_liquidity_lamports={}",
-                        mint,
-                        summary.eligible_pump,
-                        summary.eligible_dlmm,
-                        summary.route_groups,
-                        previous_route_groups
+                        action.mint,
+                        action.summary.eligible_pump,
+                        action.summary.eligible_dlmm,
+                        action.summary.route_groups,
+                        action
+                            .previous_route_groups
                             .map(|groups| groups.to_string())
                             .unwrap_or_else(|| "none".to_string()),
-                        report.applied_kind,
-                        report
+                        action.report.applied_kind,
+                        action
+                            .report
                             .applied_pool
                             .map(|pool| pool.to_string())
                             .unwrap_or_else(|| "unknown".to_string()),
-                        report
+                        action
+                            .report
                             .applied_base_liquidity_lamports
                             .map(|liquidity| liquidity.to_string())
                             .unwrap_or_else(|| "unknown".to_string())
                     );
 
-                    if summary.route_groups > 0 {
-                        if let Some(mint_state) = registry.get(&mint) {
-                            match prepare_route_runtime_accounts_for_mint(
-                                &config,
-                                rpc_client.as_ref(),
-                                wallet.as_ref(),
-                                mint_state,
-                            ) {
-                                Ok(prepared) if prepared > 0 => info!(
-                                    "route runtime accounts refreshed: mint={} prepared_checks={}",
-                                    mint, prepared
-                                ),
-                                Ok(_) => {}
-                                Err(error) => tracing::error!(
-                                    "route runtime account refresh failed: mint={} error={}",
-                                    mint,
-                                    error
-                                ),
-                            }
-                        }
-                        if !config.execution.compile_dry_run_on_startup {
-                            info!(
-                                "live controlled tx dry-run skipped: mint={} reason=compile_dry_run_disabled",
-                                mint
+                    if action.summary.route_groups > 0 {
+                        let config = config.clone();
+                        let rpc_client = rpc_client.clone();
+                        let wallet = wallet.clone();
+                        let route_execution_cache = route_execution_cache.clone();
+                        tokio::task::spawn_blocking(move || {
+                            process_geyser_route_action(
+                                config,
+                                rpc_client,
+                                wallet,
+                                route_execution_cache,
+                                action,
                             );
-                        } else if !config.lookup_tables.route_shards.enabled {
-                            info!(
-                                "live controlled tx dry-run skipped: mint={} reason=route_shards_disabled",
-                                mint
-                            );
-                        } else {
-                            let dry_run = dry_run_controlled_mint_routes(
-                                &config,
-                                rpc_client.as_ref(),
-                                wallet.as_ref(),
-                                &registry,
-                                mint,
-                            )?;
-                            info!(
-                                "live controlled tx dry-run: mint={} routes={} compiled={} missing_route_shard={} compile_failed={}",
-                                mint,
-                                dry_run.routes,
-                                dry_run.compiled,
-                                dry_run.missing_route_shard,
-                                dry_run.compile_failed
-                            );
-                            if dry_run.missing_route_shard > 0 {
-                                match maintain_live_route_shards(
-                                    &config,
-                                    rpc_client.as_ref(),
-                                    wallet.as_ref(),
-                                    &registry,
-                                    &slot_tracker.recent_slot_candidates(),
-                                ) {
-                                    Ok(confirmed) if confirmed > 0 => {
-                                        if let Some(cache) = &route_execution_cache {
-                                            match RouteExecutionCache::load(
-                                                &config,
-                                                rpc_client.as_ref(),
-                                            ) {
-                                                Ok(updated_cache) => {
-                                                    if let Ok(mut cache) = cache.write() {
-                                                        *cache = updated_cache;
-                                                    } else {
-                                                        tracing::error!(
-                                                            "route execution cache reload failed: mint={} reason=lock_poisoned",
-                                                            mint
-                                                        );
-                                                    }
-                                                }
-                                                Err(error) => {
-                                                    tracing::error!(
-                                                        "route execution cache reload failed: mint={} error={}",
-                                                        mint,
-                                                        error
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Ok(_) => {}
-                                    Err(error) => {
-                                        tracing::error!(
-                                            "route shard live maintenance failed: mint={} error={}",
-                                            mint,
-                                            error
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                        });
                     }
                 }
             } else {
@@ -1197,20 +1150,133 @@ async fn run_single_geyser_account_worker(
                 );
             }
         } else if report.ignored_not_pool_program {
-            info!("gRPC account update ignored: not_pool_program");
+            tracing::debug!("gRPC account update ignored: not_pool_program");
         } else if report.ignored_not_pool_account {
-            info!("gRPC account update ignored: not_pool_account");
+            tracing::debug!("gRPC account update ignored: not_pool_account");
         } else if report.ignored_not_allowlisted {
-            info!("gRPC account update ignored: not_allowlisted");
+            tracing::debug!("gRPC account update ignored: not_allowlisted");
         } else if report.ignored_missing_mint_state {
-            info!("gRPC account update ignored: missing_mint_state");
+            tracing::debug!("gRPC account update ignored: missing_mint_state");
         } else if report.ignored_non_sol_route {
-            info!("gRPC account update ignored: non_sol_route");
+            tracing::debug!("gRPC account update ignored: non_sol_route");
         }
 
         Ok(())
     })
     .await
+}
+
+#[cfg(feature = "geyser")]
+fn process_geyser_route_action(
+    config: AppConfig,
+    rpc_client: Arc<RpcClient>,
+    wallet: Arc<solana_sdk::signature::Keypair>,
+    route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
+    action: GeyserRouteAction,
+) {
+    if let Some(mint_state) = action.mint_state.as_ref() {
+        match prepare_route_runtime_accounts_for_mint(
+            &config,
+            rpc_client.as_ref(),
+            wallet.as_ref(),
+            mint_state,
+        ) {
+            Ok(prepared) if prepared > 0 => info!(
+                "route runtime accounts refreshed: mint={} prepared_checks={}",
+                action.mint, prepared
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::error!(
+                "route runtime account refresh failed: mint={} error={}",
+                action.mint,
+                error
+            ),
+        }
+    }
+
+    if !config.execution.compile_dry_run_on_startup {
+        info!(
+            "live controlled tx dry-run skipped: mint={} reason=compile_dry_run_disabled",
+            action.mint
+        );
+        return;
+    }
+    if !config.lookup_tables.route_shards.enabled {
+        info!(
+            "live controlled tx dry-run skipped: mint={} reason=route_shards_disabled",
+            action.mint
+        );
+        return;
+    }
+
+    let dry_run = match dry_run_controlled_mint_routes(
+        &config,
+        rpc_client.as_ref(),
+        wallet.as_ref(),
+        &action.registry_snapshot,
+        action.mint,
+    ) {
+        Ok(dry_run) => dry_run,
+        Err(error) => {
+            tracing::error!(
+                "live controlled tx dry-run failed: mint={} error={}",
+                action.mint,
+                error
+            );
+            return;
+        }
+    };
+    info!(
+        "live controlled tx dry-run: mint={} routes={} compiled={} missing_route_shard={} compile_failed={}",
+        action.mint,
+        dry_run.routes,
+        dry_run.compiled,
+        dry_run.missing_route_shard,
+        dry_run.compile_failed
+    );
+    if dry_run.missing_route_shard == 0 {
+        return;
+    }
+
+    match maintain_live_route_shards(
+        &config,
+        rpc_client.as_ref(),
+        wallet.as_ref(),
+        &action.registry_snapshot,
+        &action.recent_slot_candidates,
+    ) {
+        Ok(confirmed) if confirmed > 0 => {
+            if let Some(cache) = &route_execution_cache {
+                match RouteExecutionCache::load(&config, rpc_client.as_ref()) {
+                    Ok(updated_cache) => {
+                        if let Ok(mut cache) = cache.write() {
+                            *cache = updated_cache;
+                        } else {
+                            tracing::error!(
+                                "route execution cache reload failed: mint={} reason=lock_poisoned",
+                                action.mint
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            "route execution cache reload failed: mint={} error={}",
+                            action.mint,
+                            error
+                        );
+                    }
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(
+                "route shard live maintenance failed: mint={} error={}",
+                action.mint,
+                error
+            );
+        }
+    }
 }
 
 #[cfg(feature = "geyser")]
