@@ -18,10 +18,8 @@ use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 use solana_program::instruction::AccountMeta;
-use solana_program::program_pack::Pack;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::account::Account;
-use spl_token::state::Account as TokenAccount;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -173,9 +171,8 @@ impl ControlledRpcBootstrap {
 
     fn base_vault_liquidity(&self, base_vault: Pubkey) -> anyhow::Result<Option<PoolLiquidity>> {
         let account = self.rpc.get_account(&base_vault)?;
-        let token_account = TokenAccount::unpack(&account.data)?;
         Ok(Some(PoolLiquidity {
-            base_lamports: token_account.amount,
+            base_lamports: token_account_amount(&account.data)?,
             token_lamports: None,
             updated_at_ms: now_ms(),
         }))
@@ -187,12 +184,10 @@ impl ControlledRpcBootstrap {
         base_vault: Pubkey,
     ) -> anyhow::Result<Option<PoolLiquidity>> {
         let token_account = self.rpc.get_account(&token_vault)?;
-        let token_account = TokenAccount::unpack(&token_account.data)?;
         let base_account = self.rpc.get_account(&base_vault)?;
-        let base_account = TokenAccount::unpack(&base_account.data)?;
         Ok(Some(PoolLiquidity {
-            base_lamports: base_account.amount,
-            token_lamports: Some(token_account.amount),
+            base_lamports: token_account_amount(&base_account.data)?,
+            token_lamports: Some(token_account_amount(&token_account.data)?),
             updated_at_ms: now_ms(),
         }))
     }
@@ -332,6 +327,15 @@ fn token_2022_program_id() -> Pubkey {
     "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
         .parse()
         .unwrap()
+}
+
+fn token_account_amount(data: &[u8]) -> anyhow::Result<u64> {
+    let amount = data
+        .get(64..72)
+        .ok_or_else(|| anyhow::anyhow!("token account data too short for amount"))?;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(amount);
+    Ok(u64::from_le_bytes(buf))
 }
 
 fn now_ms() -> u128 {
