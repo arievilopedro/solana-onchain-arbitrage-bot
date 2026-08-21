@@ -44,6 +44,7 @@ min_pool_base_liquidity_lamports = 1000000000
 max_pool_state_age_ms = 1500
 compile_dry_run_on_startup = true
 send_live_transactions = false
+simulate_before_send = false
 
 [routes]
 max_dlmm_per_tx = 3

@@ -117,6 +117,8 @@ pub struct ExecutionConfig {
     pub compile_dry_run_on_startup: bool,
     #[serde(default)]
     pub send_live_transactions: bool,
+    #[serde(default)]
+    pub simulate_before_send: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]

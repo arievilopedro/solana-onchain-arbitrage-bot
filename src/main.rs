@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     let rabbitstream_plan = RabbitStreamPlan::controlled_v1(&config.rabbitstream)?;
     let helius_sender_plan = HeliusSenderPlan::from_config(&config.sender.helius)?;
     info!(
-        "config OK: wallet={} mints={} sol_only={} route_shards={} auto_create={} auto_extend={} compile_dry_run={} send_live_transactions={} grpc={} rabbitstream={}",
+        "config OK: wallet={} mints={} sol_only={} route_shards={} auto_create={} auto_extend={} compile_dry_run={} send_live_transactions={} simulate_before_send={} grpc={} rabbitstream={}",
         wallet.pubkey(),
         config.runtime.allowed_mints.len(),
         config.execution.sol_only,
@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         config.lookup_tables.route_shards.auto_extend,
         config.execution.compile_dry_run_on_startup,
         config.execution.send_live_transactions,
+        config.execution.simulate_before_send,
         config.grpc.enabled,
         config.rabbitstream.enabled
     );
@@ -413,28 +414,33 @@ fn run_rabbitstream_trigger_worker(
                                 return Ok(());
                             }
                         }
-                        match ensure_trigger_transaction_simulates(
-                            rpc_client.as_ref(),
-                            &tx,
-                        ) {
-                            Ok(TriggerSimulationOutcome::Ready) => {}
-                            Ok(TriggerSimulationOutcome::NoProfit) => {
-                                info!(
-                                    "trigger transaction skipped: mint={} trigger_sig={} reason=no_profitable_arbitrage",
-                                    trigger_mint,
-                                    trigger_signature
-                                );
-                                return Ok(());
+                        if config.execution.simulate_before_send {
+                            match ensure_trigger_transaction_simulates(rpc_client.as_ref(), &tx) {
+                                Ok(TriggerSimulationOutcome::Ready) => {}
+                                Ok(TriggerSimulationOutcome::NoProfit) => {
+                                    info!(
+                                        "trigger transaction skipped: mint={} trigger_sig={} reason=no_profitable_arbitrage",
+                                        trigger_mint,
+                                        trigger_signature
+                                    );
+                                    return Ok(());
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        "trigger transaction simulation failed: mint={} trigger_sig={} error={}",
+                                        trigger_mint,
+                                        trigger_signature,
+                                        error
+                                    );
+                                    return Ok(());
+                                }
                             }
-                            Err(error) => {
-                                tracing::error!(
-                                    "trigger transaction simulation failed: mint={} trigger_sig={} error={}",
-                                    trigger_mint,
-                                    trigger_signature,
-                                    error
-                                );
-                                return Ok(());
-                            }
+                        } else {
+                            info!(
+                                "trigger transaction simulation skipped: mint={} trigger_sig={} reason=simulate_before_send_false",
+                                trigger_mint,
+                                trigger_signature
+                            );
                         }
                         tokio::spawn(async move {
                             match sender.send_transaction(&tx).await {
