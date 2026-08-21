@@ -21,8 +21,10 @@ use solana_onchain_arbitrage_bot::sender::{
 };
 use solana_onchain_arbitrage_bot::streams::grpc::GeyserAccountStreamPlan;
 use solana_onchain_arbitrage_bot::streams::rabbitstream::RabbitStreamPlan;
+use solana_onchain_arbitrage_bot::transaction::derive_vault_token_account;
 use solana_onchain_arbitrage_bot::wallet::load_keypair;
 use solana_program::pubkey::Pubkey;
+use solana_program::program_pack::Pack;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::signer::Signer;
@@ -392,6 +394,20 @@ fn run_rabbitstream_trigger_worker(
                                 return Ok(());
                             }
                         }
+                        if config.execution.use_flashloan {
+                            if let Err(error) = ensure_flashloan_vault_ready(
+                                rpc_client.as_ref(),
+                                &Pubkey::from_str(&config.mev.program_id)?,
+                            ) {
+                                tracing::error!(
+                                    "trigger flashloan vault check failed: mint={} trigger_sig={} error={}",
+                                    trigger_mint,
+                                    trigger_signature,
+                                    error
+                                );
+                                return Ok(());
+                            }
+                        }
                         if let Err(error) = ensure_trigger_transaction_simulates(
                             rpc_client.as_ref(),
                             &tx,
@@ -508,6 +524,42 @@ fn ensure_pda_ata(
     info!(
         "route ATA prepared: label={} owner={} mint={} ata={} sig={}",
         ata.label, ata.owner, ata.mint, ata.address, signature
+    );
+    Ok(())
+}
+
+fn ensure_flashloan_vault_ready(rpc_client: &RpcClient, mev_program: &Pubkey) -> anyhow::Result<()> {
+    let vault = derive_vault_token_account(mev_program, &sol_mint()).0;
+    let account = rpc_client
+        .get_account(&vault)
+        .with_context(|| format!("flashloan vault token account {} does not exist", vault))?;
+
+    if account.owner != spl_token::ID {
+        anyhow::bail!(
+            "flashloan vault {} owner is {}, expected SPL Token program {}",
+            vault,
+            account.owner,
+            spl_token::ID
+        );
+    }
+
+    let token_account = spl_token::state::Account::unpack(&account.data)
+        .with_context(|| format!("flashloan vault {} is not a valid SPL Token account", vault))?;
+    if token_account.mint != sol_mint() {
+        anyhow::bail!(
+            "flashloan vault {} mint is {}, expected {}",
+            vault,
+            token_account.mint,
+            sol_mint()
+        );
+    }
+
+    info!(
+        "flashloan vault ready: vault={} owner={} mint={} token_owner={}",
+        vault,
+        account.owner,
+        token_account.mint,
+        token_account.owner
     );
     Ok(())
 }
