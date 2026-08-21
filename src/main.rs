@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, Level};
 
 #[cfg(feature = "geyser")]
@@ -457,6 +457,7 @@ fn run_rabbitstream_trigger_worker(
         let url = plan.url.clone();
         let mut seen_signatures = HashSet::<String>::new();
         let mut seen_signature_order = VecDeque::<String>::new();
+        let mut last_trigger_by_mint = HashMap::<Pubkey, Instant>::new();
         let result =
             run_axion_trigger_stream(plan, axion_program, allowed_mints, move |signal| {
                 if !seen_signatures.insert(signal.signature.clone()) {
@@ -493,6 +494,24 @@ fn run_rabbitstream_trigger_worker(
                             .unwrap_or_else(|| "unknown".to_string())
                     );
                     return Ok(());
+                }
+                if config.axion.cooldown_ms > 0 {
+                    let now = Instant::now();
+                    if let Some(last_trigger) = last_trigger_by_mint.get(&signal.mint) {
+                        if now.duration_since(*last_trigger)
+                            < Duration::from_millis(config.axion.cooldown_ms)
+                        {
+                            tracing::debug!(
+                                "rabbitstream axion trigger skipped: mint={} slot={} sig={} reason=cooldown cooldown_ms={}",
+                                signal.mint,
+                                signal.slot,
+                                signal.signature,
+                                config.axion.cooldown_ms
+                            );
+                            return Ok(());
+                        }
+                    }
+                    last_trigger_by_mint.insert(signal.mint, now);
                 }
                 info!(
                     "rabbitstream axion trigger: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={} side={} raw_amount={}",
