@@ -1,6 +1,7 @@
 //! Transaction sender abstractions and rate limiting.
 
 use crate::config::HeliusSenderConfig;
+use rand::Rng;
 use reqwest::Client;
 use serde_json::{json, Value};
 use solana_program::pubkey::Pubkey;
@@ -23,11 +24,20 @@ pub const HELIUS_TIP_ACCOUNTS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct SenderTipConfig {
-    pub lamports: u64,
+    pub min_lamports: u64,
+    pub max_lamports: u64,
     pub accounts: Vec<Pubkey>,
 }
 
 impl SenderTipConfig {
+    pub fn random_lamports(&self) -> u64 {
+        if self.min_lamports >= self.max_lamports {
+            return self.min_lamports;
+        }
+
+        rand::thread_rng().gen_range(self.min_lamports..=self.max_lamports)
+    }
+
     pub fn random_account(&self) -> Option<Pubkey> {
         if self.accounts.is_empty() {
             None
@@ -54,6 +64,7 @@ impl HeliusSenderPlan {
 
         let endpoint = helius_endpoint_with_api_key(&config.endpoint, &config.api_key);
         let tip_accounts = parse_tip_accounts(&config.tip_accounts)?;
+        let (tip_min, tip_max) = config.tip_lamports_range();
 
         Ok(Some(Self {
             endpoint,
@@ -61,7 +72,8 @@ impl HeliusSenderPlan {
             burst: config.burst,
             timeout_ms: config.timeout_ms,
             tip: SenderTipConfig {
-                lamports: config.tip_lamports,
+                min_lamports: tip_min,
+                max_lamports: tip_max,
                 accounts: tip_accounts,
             },
         }))

@@ -166,8 +166,21 @@ pub struct HeliusSenderConfig {
     pub timeout_ms: u64,
     #[serde(default = "default_helius_tip_lamports")]
     pub tip_lamports: u64,
+    #[serde(default)]
+    pub tip_lamports_min: Option<u64>,
+    #[serde(default)]
+    pub tip_lamports_max: Option<u64>,
     #[serde(default = "crate::sender::default_helius_tip_accounts_csv")]
     pub tip_accounts: String,
+}
+
+impl HeliusSenderConfig {
+    pub fn tip_lamports_range(&self) -> (u64, u64) {
+        (
+            self.tip_lamports_min.unwrap_or(self.tip_lamports),
+            self.tip_lamports_max.unwrap_or(self.tip_lamports),
+        )
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -316,9 +329,15 @@ impl AppConfig {
                 anyhow::bail!("sender.helius.endpoint is required when Helius is enabled");
             }
 
-            if self.sender.helius.tip_lamports == 0 {
+            let (tip_min, tip_max) = self.sender.helius.tip_lamports_range();
+            if tip_min == 0 || tip_max == 0 {
                 anyhow::bail!(
-                    "sender.helius.tip_lamports must be greater than zero for Helius Sender"
+                    "sender.helius tip lamports must be greater than zero for Helius Sender"
+                );
+            }
+            if tip_min > tip_max {
+                anyhow::bail!(
+                    "sender.helius.tip_lamports_min must be <= sender.helius.tip_lamports_max"
                 );
             }
 

@@ -194,9 +194,10 @@ fn log_sender_plan(config: &AppConfig, helius_sender_plan: Option<&HeliusSenderP
     if config.sender.primary == "helius" {
         if let Some(plan) = helius_sender_plan {
             info!(
-                "Helius sender planned: endpoint={} tip_lamports={} tip_accounts={} max_tps={} burst={} timeout_ms={}",
+                "Helius sender planned: endpoint={} tip_lamports_min={} tip_lamports_max={} tip_accounts={} max_tps={} burst={} timeout_ms={}",
                 redacted_endpoint(&plan.endpoint),
-                plan.tip.lamports,
+                plan.tip.min_lamports,
+                plan.tip.max_lamports,
                 plan.tip.accounts.len(),
                 plan.max_tps,
                 plan.burst,

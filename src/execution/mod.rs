@@ -39,12 +39,13 @@ pub fn build_controlled_transaction(
         ComputeBudgetInstruction::set_compute_unit_price(params.compute_unit_price),
     ];
     if let Some(tip) = &params.sender_tip {
-        if tip.lamports > 0 {
+        let lamports = tip.random_lamports();
+        if lamports > 0 {
             if let Some(tip_account) = tip.random_account() {
                 instructions.push(system_instruction::transfer(
                     &wallet.pubkey(),
                     &tip_account,
-                    tip.lamports,
+                    lamports,
                 ));
             }
         }
@@ -205,7 +206,8 @@ mod tests {
             use_flashloan: false,
             no_failure_mode: true,
             sender_tip: Some(SenderTipConfig {
-                lamports: 1_000_000,
+                min_lamports: 1_000_000,
+                max_lamports: 1_000_000,
                 accounts: vec![tip_account],
             }),
         };
