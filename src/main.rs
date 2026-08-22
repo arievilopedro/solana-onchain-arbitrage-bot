@@ -769,6 +769,92 @@ async fn process_axion_trigger(
     Ok(())
 }
 
+#[cfg(feature = "geyser")]
+fn adjusted_trigger_sol_amount(
+    config: &AppConfig,
+    registry: &Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>,
+    mint: Pubkey,
+    sol_amount: f64,
+    volume_source: &'static str,
+    side: Option<&'static str>,
+    raw_amount: Option<u64>,
+) -> anyhow::Result<(f64, &'static str)> {
+    if side != Some("sell")
+        || (volume_source != "axion_instruction_amount" && volume_source != "pump_swap_sell_bytes")
+    {
+        return Ok((sol_amount, volume_source));
+    }
+
+    let Some(raw_token_amount) = raw_amount else {
+        return Ok((sol_amount, volume_source));
+    };
+    let registry = registry
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
+    let Some(estimated_sol) =
+        estimate_pump_sell_sol_from_registry(config, &registry, mint, raw_token_amount)
+    else {
+        return Ok((sol_amount, volume_source));
+    };
+
+    Ok((estimated_sol, "pump_sell_registry_reserves"))
+}
+
+#[cfg(feature = "geyser")]
+fn estimate_pump_sell_sol_from_registry(
+    config: &AppConfig,
+    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    mint: Pubkey,
+    raw_token_amount: u64,
+) -> Option<f64> {
+    let mint_state = registry.get(&mint)?;
+    let now_ms = now_ms();
+    let mut pumps = mint_state.eligible_pumps(
+        config.execution.min_pool_base_liquidity_lamports,
+        config.execution.max_pool_state_age_ms,
+        now_ms,
+    );
+    if pumps.is_empty() {
+        pumps = mint_state.eligible_pumps(
+            config.execution.min_pool_base_liquidity_lamports,
+            u64::MAX,
+            now_ms,
+        );
+    }
+
+    pumps
+        .into_iter()
+        .filter_map(|pump| {
+            let liquidity = pump.liquidity?;
+            let token_reserve = liquidity.token_lamports?;
+            estimate_constant_product_sell_sol(
+                raw_token_amount,
+                token_reserve,
+                liquidity.base_lamports,
+            )
+        })
+        .max_by(|left, right| left.total_cmp(right))
+}
+
+#[cfg(feature = "geyser")]
+fn estimate_constant_product_sell_sol(
+    token_amount_in: u64,
+    token_reserve: u64,
+    sol_reserve_lamports: u64,
+) -> Option<f64> {
+    if token_amount_in == 0 || token_reserve == 0 || sol_reserve_lamports == 0 {
+        return None;
+    }
+
+    let token_amount_in = token_amount_in as u128;
+    let token_reserve = token_reserve as u128;
+    let sol_reserve_lamports = sol_reserve_lamports as u128;
+    let sol_out = sol_reserve_lamports
+        .saturating_mul(token_amount_in)
+        .checked_div(token_reserve.saturating_add(token_amount_in))?;
+    Some(sol_out as f64 / 1_000_000_000.0)
+}
+
 fn ensure_pda_ata(
     rpc_client: &RpcClient,
     wallet: &solana_sdk::signature::Keypair,
@@ -1514,6 +1600,87 @@ fn prepare_route_runtime_accounts_for_mint(
     }
 
     Ok(prepared)
+}
+
+#[cfg(feature = "geyser")]
+fn dry_run_controlled_mint_routes(
+    config: &AppConfig,
+    rpc_client: &RpcClient,
+    wallet: &solana_sdk::signature::Keypair,
+    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    mint: Pubkey,
+) -> anyhow::Result<ControlledTxDryRunSummary> {
+    let recent_blockhash = rpc_client.get_latest_blockhash()?;
+    Ok(compile_controlled_mint_routes(
+        config,
+        rpc_client,
+        wallet,
+        registry,
+        mint,
+        recent_blockhash,
+    )?
+    .summary)
+}
+
+#[cfg(feature = "geyser")]
+fn compile_controlled_mint_routes(
+    config: &AppConfig,
+    rpc_client: &RpcClient,
+    wallet: &solana_sdk::signature::Keypair,
+    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
+    mint: Pubkey,
+    recent_blockhash: Hash,
+) -> anyhow::Result<ControlledMintCompilation> {
+    let Some(mint_state) = registry.get(&mint) else {
+        return Ok(ControlledMintCompilation::default());
+    };
+
+    let protocol_alt = load_lookup_table_account(
+        rpc_client,
+        Pubkey::from_str(&config.lookup_tables.protocol_alt)?,
+    )
+    .context("failed to load protocol ALT")?;
+    let route_resolver =
+        RouteShardLookupResolver::load(&config.lookup_tables.route_shards.state_file)
+            .context("failed to load route shard resolver")?;
+    let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
+    let params = controlled_execution_params(config)?;
+    let now_ms = now_ms();
+    let mut compilation = ControlledMintCompilation::default();
+    let route_groups = pack_execution_route_groups(
+        &packer,
+        mint_state,
+        config.execution.min_pool_base_liquidity_lamports,
+        config.execution.max_pool_state_age_ms,
+        now_ms,
+    );
+
+    for route in route_groups {
+        compilation.summary.routes += 1;
+        let Some(route_alt) = route_resolver.load_lookup_for_mint(rpc_client, route.mint)? else {
+            compilation.summary.missing_route_shard += 1;
+            continue;
+        };
+        let lookup_tables = lookup_tables_for_route(&protocol_alt, &route_alt);
+        match build_controlled_transaction(
+            wallet,
+            &route,
+            mint_state.token_program,
+            recent_blockhash,
+            &lookup_tables,
+            params.clone(),
+        ) {
+            Ok(tx) => {
+                compilation.summary.compiled += 1;
+                compilation.transactions.push(tx);
+            }
+            Err(_) => {
+                compilation.summary.compile_failed += 1;
+            }
+        }
+    }
+
+    Ok(compilation)
 }
 
 #[cfg(feature = "geyser")]
