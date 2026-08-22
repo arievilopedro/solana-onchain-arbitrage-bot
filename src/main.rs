@@ -1,7 +1,6 @@
 use anyhow::Context;
 use clap::{App, Arg};
 use solana_client::rpc_client::RpcClient;
-use solana_client::rpc_config::RpcSimulateTransactionConfig;
 use solana_onchain_arbitrage_bot::alt::{
     execute_route_shard_plan, execute_route_shard_plan_with_recent_slots,
     load_lookup_table_account, PendingRouteShardOperation, PlannedRouteShardExtension,
@@ -14,7 +13,8 @@ use solana_onchain_arbitrage_bot::constants::sol_mint;
 use solana_onchain_arbitrage_bot::dex::pump::pump_program_id;
 use solana_onchain_arbitrage_bot::discovery::{ControlledRpcBootstrap, RpcBootstrapConfig};
 use solana_onchain_arbitrage_bot::execution::{
-    build_controlled_transaction, ControlledExecutionParams, PreCompiledTxCache,
+    build_controlled_transaction, build_controlled_transaction_with_nonce,
+    ControlledExecutionParams,
 };
 use solana_onchain_arbitrage_bot::nonce::{parse_nonce_pubkeys, NonceManager};
 use solana_onchain_arbitrage_bot::registry::{DlmmRouteState, PumpRouteState};
@@ -26,17 +26,14 @@ use solana_onchain_arbitrage_bot::transaction::derive_vault_token_account;
 use solana_onchain_arbitrage_bot::wallet::load_keypair;
 use solana_program::program_pack::Pack;
 use solana_program::pubkey::Pubkey;
-use solana_sdk::address_lookup_table::state::AddressLookupTable;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::hash::Hash;
-use solana_sdk::message::VersionedMessage;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 use solana_sdk::transaction::VersionedTransaction;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{info, Level};
@@ -83,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     let rabbitstream_plan = RabbitStreamPlan::controlled_v1(&config.rabbitstream)?;
     let helius_sender_plan = HeliusSenderPlan::from_config(&config.sender.helius)?;
     info!(
-        "config OK: wallet={} mints={} sol_only={} minimum_profit_lamports={} route_shards={} auto_create={} auto_extend={} compile_dry_run={} send_live_transactions={} simulate_before_send={} live_route_refresh_cooldown_ms={} trigger_send_max_transactions={} grpc={} rabbitstream={}",
+        "config OK: wallet={} mints={} sol_only={} minimum_profit_lamports={} route_shards={} auto_create={} auto_extend={} send_live_transactions={} live_route_refresh_cooldown_ms={} trigger_send_max_transactions={} grpc={} rabbitstream={}",
         wallet.pubkey(),
         config.runtime.allowed_mints.len(),
         config.execution.sol_only,
@@ -91,9 +88,7 @@ async fn main() -> anyhow::Result<()> {
         config.lookup_tables.route_shards.enabled,
         config.lookup_tables.route_shards.auto_create,
         config.lookup_tables.route_shards.auto_extend,
-        config.execution.compile_dry_run_on_startup,
         config.execution.send_live_transactions,
-        config.execution.simulate_before_send,
         config.execution.live_route_refresh_cooldown_ms,
         config.execution.trigger_send_max_transactions,
         config.grpc.enabled,
@@ -166,16 +161,6 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
-        if config.execution.compile_dry_run_on_startup {
-            let tx_dry_run = dry_run_controlled_routes(&config, &rpc_client, &wallet, &registry)?;
-            info!(
-                "controlled tx dry-run: routes={} compiled={} missing_route_shard={} compile_failed={}",
-                tx_dry_run.routes,
-                tx_dry_run.compiled,
-                tx_dry_run.missing_route_shard,
-                tx_dry_run.compile_failed
-            );
-        }
     }
 
     let runtime_account_cache = Arc::new(Mutex::new(RuntimeAccountCache::default()));
@@ -204,33 +189,6 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-
-    // Start precompiled cache cleanup task if enabled
-    if config.precompiled.enabled {
-        if let Some(cache) = &route_execution_cache {
-            let cache = cache.clone();
-            let cleanup_interval_ms = config.precompiled.cleanup_interval_ms;
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_millis(cleanup_interval_ms));
-                loop {
-                    interval.tick().await;
-                    if let Ok(cache) = cache.read() {
-                        let cleaned = cache.precompiled_cache.cleanup_expired();
-                        if cleaned > 0 {
-                            tracing::debug!(
-                                "precompiled cache cleanup: removed={} mints",
-                                cleaned
-                            );
-                        }
-                    }
-                }
-            });
-            info!(
-                "precompiled cache cleanup task started: interval_ms={}",
-                cleanup_interval_ms
-            );
-        }
-    }
 
     // Start nonce refresh task if nonce mode is enabled
     if config.nonce.enabled {
@@ -388,12 +346,19 @@ impl BlockhashCache {
 }
 
 struct RouteExecutionCache {
+    // Fields are only read from the geyser-gated hot path
+    // (`compile_controlled_mint_routes_cached`). Without geyser they are
+    // still constructed by `load()` but never accessed.
+    #[cfg_attr(not(feature = "geyser"), allow(dead_code))]
     protocol_alt: AddressLookupTableAccount,
+    #[cfg_attr(not(feature = "geyser"), allow(dead_code))]
     route_resolver: RouteShardLookupResolver,
+    #[cfg_attr(not(feature = "geyser"), allow(dead_code))]
     route_alts: HashMap<Pubkey, AddressLookupTableAccount>,
+    #[cfg_attr(not(feature = "geyser"), allow(dead_code))]
     packer: FixedDlmmRoutePacker,
+    #[cfg_attr(not(feature = "geyser"), allow(dead_code))]
     params: ControlledExecutionParams,
-    precompiled_cache: PreCompiledTxCache,
     nonce_manager: Option<Arc<NonceManager>>,
 }
 
@@ -453,24 +418,6 @@ impl RouteExecutionCache {
             None
         };
 
-        // Create precompiled cache with nonce support if enabled
-        let precompiled_cache = if let Some(ref nonce_mgr) = nonce_manager {
-            info!("precompiled cache using durable nonce mode");
-            PreCompiledTxCache::with_nonce(
-                FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?,
-                nonce_mgr.clone(),
-            )
-        } else {
-            info!(
-                "precompiled cache using blockhash mode: ttl_ms={}",
-                config.precompiled.ttl_ms
-            );
-            PreCompiledTxCache::with_ttl(
-                FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?,
-                config.precompiled.ttl_ms,
-            )
-        };
-
         info!(
             "route execution cache loaded: protocol_alt={} route_alts={} nonce_enabled={}",
             protocol_alt.key,
@@ -484,7 +431,6 @@ impl RouteExecutionCache {
             route_alts,
             packer,
             params,
-            precompiled_cache,
             nonce_manager,
         })
     }
@@ -698,89 +644,67 @@ async fn process_axion_trigger(
             .unwrap_or_else(|| "unknown".to_string())
     );
     if !config.lookup_tables.route_shards.enabled {
-        info!(
+        tracing::debug!(
             "trigger controlled tx dry-run skipped: mint={} sig={} reason=route_shards_disabled",
             signal.mint, signal.signature
         );
         return Ok(());
     }
     let Some(recent_blockhash) = blockhash_cache.current() else {
-        info!(
+        tracing::debug!(
             "trigger controlled tx skipped: mint={} sig={} reason=blockhash_cache_empty",
             signal.mint, signal.signature
         );
         return Ok(());
     };
     let Some(route_execution_cache) = &route_execution_cache else {
-        info!(
+        tracing::debug!(
             "trigger controlled tx skipped: mint={} sig={} reason=route_execution_cache_unavailable",
             signal.mint, signal.signature
         );
         return Ok(());
     };
-    // Try precompiled cache first for lower latency
-    let precompiled_txs = if config.precompiled.enabled {
+    let compilation = {
+        let registry = registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
         let route_execution_cache = route_execution_cache
             .read()
             .map_err(|_| anyhow::anyhow!("route execution cache lock poisoned"))?;
-        route_execution_cache.precompiled_cache.get_ready_txs(&signal.mint)
-    } else {
-        Vec::new()
-    };
-
-    let txs = if !precompiled_txs.is_empty() {
-        info!(
-            "trigger cache hit: mint={} sig={} precompiled_count={} cache_lookup_ms={}",
+        compile_controlled_mint_routes_cached(
+            &config,
+            wallet.as_ref(),
+            &registry,
             signal.mint,
-            signal.signature,
-            precompiled_txs.len(),
-            trigger_received_at.elapsed().as_millis()
-        );
-        precompiled_txs
-    } else {
-        // Fall back to on-demand compilation
-        let compilation = {
-            let registry = registry
-                .lock()
-                .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
-            let route_execution_cache = route_execution_cache
-                .read()
-                .map_err(|_| anyhow::anyhow!("route execution cache lock poisoned"))?;
-            compile_controlled_mint_routes_cached(
-                &config,
-                wallet.as_ref(),
-                &registry,
-                signal.mint,
-                recent_blockhash,
-                &route_execution_cache,
-            )?
-        };
-        info!(
-            "trigger cache miss: mint={} sig={} routes={} compiled={} missing_route_shard={} compile_failed={} compile_ms={}",
+            recent_blockhash,
+            &route_execution_cache,
+        )?
+    };
+    tracing::debug!(
+        "trigger compiled: mint={} sig={} routes={} compiled={} missing_route_shard={} compile_failed={} compile_ms={}",
+        signal.mint,
+        signal.signature,
+        compilation.summary.routes,
+        compilation.summary.compiled,
+        compilation.summary.missing_route_shard,
+        compilation.summary.compile_failed,
+        trigger_received_at.elapsed().as_millis()
+    );
+    if compilation.summary.compiled == 0 {
+        tracing::debug!(
+            "trigger transaction send skipped: mint={} sig={} reason=no_compiled_route routes={} missing_route_shard={} compile_failed={}",
             signal.mint,
             signal.signature,
             compilation.summary.routes,
-            compilation.summary.compiled,
             compilation.summary.missing_route_shard,
-            compilation.summary.compile_failed,
-            trigger_received_at.elapsed().as_millis()
+            compilation.summary.compile_failed
         );
-        if compilation.summary.compiled == 0 {
-            info!(
-                "trigger transaction send skipped: mint={} sig={} reason=no_compiled_route routes={} missing_route_shard={} compile_failed={}",
-                signal.mint,
-                signal.signature,
-                compilation.summary.routes,
-                compilation.summary.missing_route_shard,
-                compilation.summary.compile_failed
-            );
-            return Ok(());
-        }
-        compilation.transactions
-    };
+        return Ok(());
+    }
+    let txs = compilation.transactions;
 
     if !config.execution.send_live_transactions {
-        info!(
+        tracing::debug!(
             "would_send trigger transaction: mint={} sig={} compiled={} sender={} reason=send_live_transactions_false",
             signal.mint,
             signal.signature,
@@ -793,14 +717,14 @@ async fn process_axion_trigger(
     let max_transactions = config.execution.trigger_send_max_transactions.max(1);
     let txs: Vec<_> = txs.into_iter().take(max_transactions).collect();
     if txs.is_empty() {
-        info!(
+        tracing::debug!(
             "trigger transaction send skipped: mint={} sig={} reason=missing_compiled_transaction",
             signal.mint, signal.signature
         );
         return Ok(());
     };
     let Some(sender) = helius_sender else {
-        info!(
+        tracing::debug!(
             "trigger transaction send skipped: mint={} sig={} reason=helius_sender_disabled",
             signal.mint, signal.signature
         );
@@ -809,39 +733,7 @@ async fn process_axion_trigger(
     let trigger_signature = signal.signature.clone();
     let trigger_mint = signal.mint;
     let trigger_slot = signal.slot;
-    let simulate_before_send = config.execution.simulate_before_send;
     for (tx_index, tx) in txs.into_iter().enumerate() {
-        if simulate_before_send {
-            match ensure_trigger_transaction_simulates(rpc_client.as_ref(), &tx) {
-                Ok(TriggerSimulationOutcome::Ready) => {}
-                Ok(TriggerSimulationOutcome::NoProfit) => {
-                    info!(
-                        "trigger transaction skipped: mint={} trigger_sig={} tx_index={} reason=no_profitable_arbitrage",
-                        trigger_mint,
-                        trigger_signature,
-                        tx_index
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    tracing::error!(
-                        "trigger transaction simulation failed: mint={} trigger_sig={} tx_index={} error={}",
-                        trigger_mint,
-                        trigger_signature,
-                        tx_index,
-                        error
-                    );
-                    continue;
-                }
-            }
-        } else {
-            tracing::debug!(
-                "trigger transaction simulation skipped: mint={} trigger_sig={} tx_index={} reason=simulate_before_send_false",
-                trigger_mint,
-                trigger_signature,
-                tx_index
-            );
-        }
         let sender = sender.clone();
         let trigger_signature = trigger_signature.clone();
         let trigger_to_spawn_ms = trigger_received_at.elapsed().as_millis();
@@ -875,228 +767,6 @@ async fn process_axion_trigger(
     }
 
     Ok(())
-}
-
-enum TriggerSimulationOutcome {
-    Ready,
-    NoProfit,
-}
-
-fn adjusted_trigger_sol_amount(
-    config: &AppConfig,
-    registry: &Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>,
-    mint: Pubkey,
-    sol_amount: f64,
-    volume_source: &'static str,
-    side: Option<&'static str>,
-    raw_amount: Option<u64>,
-) -> anyhow::Result<(f64, &'static str)> {
-    if side != Some("sell")
-        || (volume_source != "axion_instruction_amount" && volume_source != "pump_swap_sell_bytes")
-    {
-        return Ok((sol_amount, volume_source));
-    }
-
-    let Some(raw_token_amount) = raw_amount else {
-        return Ok((sol_amount, volume_source));
-    };
-    let registry = registry
-        .lock()
-        .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
-    let Some(estimated_sol) =
-        estimate_pump_sell_sol_from_registry(config, &registry, mint, raw_token_amount)
-    else {
-        return Ok((sol_amount, volume_source));
-    };
-
-    Ok((estimated_sol, "pump_sell_registry_reserves"))
-}
-
-fn estimate_pump_sell_sol_from_registry(
-    config: &AppConfig,
-    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
-    mint: Pubkey,
-    raw_token_amount: u64,
-) -> Option<f64> {
-    let mint_state = registry.get(&mint)?;
-    let now_ms = now_ms();
-    let mut pumps = mint_state.eligible_pumps(
-        config.execution.min_pool_base_liquidity_lamports,
-        config.execution.max_pool_state_age_ms,
-        now_ms,
-    );
-    if pumps.is_empty() {
-        pumps = mint_state.eligible_pumps(
-            config.execution.min_pool_base_liquidity_lamports,
-            u64::MAX,
-            now_ms,
-        );
-    }
-
-    pumps
-        .into_iter()
-        .filter_map(|pump| {
-            let liquidity = pump.liquidity?;
-            let token_reserve = liquidity.token_lamports?;
-            estimate_constant_product_sell_sol(
-                raw_token_amount,
-                token_reserve,
-                liquidity.base_lamports,
-            )
-        })
-        .max_by(|left, right| left.total_cmp(right))
-}
-
-fn estimate_constant_product_sell_sol(
-    token_amount_in: u64,
-    token_reserve: u64,
-    sol_reserve_lamports: u64,
-) -> Option<f64> {
-    if token_amount_in == 0 || token_reserve == 0 || sol_reserve_lamports == 0 {
-        return None;
-    }
-
-    let token_amount_in = token_amount_in as u128;
-    let token_reserve = token_reserve as u128;
-    let sol_reserve_lamports = sol_reserve_lamports as u128;
-    let sol_out = sol_reserve_lamports
-        .saturating_mul(token_amount_in)
-        .checked_div(token_reserve.saturating_add(token_amount_in))?;
-    Some(sol_out as f64 / 1_000_000_000.0)
-}
-
-fn ensure_trigger_transaction_simulates(
-    rpc_client: &RpcClient,
-    tx: &VersionedTransaction,
-) -> anyhow::Result<TriggerSimulationOutcome> {
-    static DUMPED_SIMULATION_ACCOUNTS: AtomicBool = AtomicBool::new(false);
-
-    let simulation = rpc_client.simulate_transaction_with_config(
-        tx,
-        RpcSimulateTransactionConfig {
-            sig_verify: false,
-            replace_recent_blockhash: false,
-            ..Default::default()
-        },
-    )?;
-    if let Some(err) = simulation.value.err {
-        let logs = simulation.value.logs.unwrap_or_default().join(" | ");
-        if logs.contains("No profitable arbitrage opportunity found") {
-            return Ok(TriggerSimulationOutcome::NoProfit);
-        }
-        if !DUMPED_SIMULATION_ACCOUNTS.swap(true, Ordering::Relaxed) {
-            if let Err(error) = dump_simulation_account_owners(rpc_client, tx) {
-                tracing::error!("simulation account owner dump failed: {}", error);
-            }
-        }
-        anyhow::bail!("err={:?} logs={}", err, logs);
-    }
-    Ok(TriggerSimulationOutcome::Ready)
-}
-
-fn dump_simulation_account_owners(
-    rpc_client: &RpcClient,
-    tx: &VersionedTransaction,
-) -> anyhow::Result<()> {
-    let account_keys = resolve_transaction_account_keys(rpc_client, tx)?;
-    info!(
-        "simulation account owner dump: total_accounts={}",
-        account_keys.len()
-    );
-
-    for (index, pubkey) in account_keys.iter().enumerate() {
-        match rpc_client.get_account(pubkey) {
-            Ok(account) => {
-                if account.owner == spl_token::ID {
-                    match spl_token::state::Account::unpack(&account.data) {
-                        Ok(token_account) => info!(
-                            "simulation account: index={} pubkey={} owner={} data_len={} token_mint={} token_owner={} token_amount={}",
-                            index + 1,
-                            pubkey,
-                            account.owner,
-                            account.data.len(),
-                            token_account.mint,
-                            token_account.owner,
-                            token_account.amount
-                        ),
-                        Err(error) => info!(
-                            "simulation account: index={} pubkey={} owner={} data_len={} token_unpack_error={}",
-                            index + 1,
-                            pubkey,
-                            account.owner,
-                            account.data.len(),
-                            error
-                        ),
-                    }
-                } else {
-                    info!(
-                        "simulation account: index={} pubkey={} owner={} data_len={}",
-                        index + 1,
-                        pubkey,
-                        account.owner,
-                        account.data.len()
-                    );
-                }
-            }
-            Err(error) => info!(
-                "simulation account: index={} pubkey={} missing error={}",
-                index + 1,
-                pubkey,
-                error
-            ),
-        }
-    }
-
-    Ok(())
-}
-
-fn resolve_transaction_account_keys(
-    rpc_client: &RpcClient,
-    tx: &VersionedTransaction,
-) -> anyhow::Result<Vec<Pubkey>> {
-    let VersionedMessage::V0(message) = &tx.message else {
-        return match &tx.message {
-            VersionedMessage::Legacy(message) => Ok(message.account_keys.clone()),
-            VersionedMessage::V0(_) => unreachable!(),
-        };
-    };
-
-    let mut account_keys = message.account_keys.clone();
-    for lookup in &message.address_table_lookups {
-        let account = rpc_client
-            .get_account(&lookup.account_key)
-            .with_context(|| format!("failed to load ALT {}", lookup.account_key))?;
-        let table = AddressLookupTable::deserialize(&account.data).map_err(|error| {
-            anyhow::anyhow!(
-                "failed to deserialize ALT {}: {:?}",
-                lookup.account_key,
-                error
-            )
-        })?;
-
-        for index in &lookup.writable_indexes {
-            let Some(address) = table.addresses.get(*index as usize) else {
-                anyhow::bail!(
-                    "ALT {} missing writable index {}",
-                    lookup.account_key,
-                    index
-                );
-            };
-            account_keys.push(*address);
-        }
-        for index in &lookup.readonly_indexes {
-            let Some(address) = table.addresses.get(*index as usize) else {
-                anyhow::bail!(
-                    "ALT {} missing readonly index {}",
-                    lookup.account_key,
-                    index
-                );
-            };
-            account_keys.push(*address);
-        }
-    }
-
-    Ok(account_keys)
 }
 
 fn ensure_pda_ata(
@@ -1392,30 +1062,6 @@ async fn run_single_geyser_account_worker(
         };
 
         if report.applied {
-            // Refresh precompiled cache on ANY pool update (not just route count changes)
-            if let Some(action) = &route_action {
-                if config.precompiled.enabled && action.summary.route_groups > 0 {
-                    if let Some(mint_state) = &action.mint_state {
-                        let config = config.clone();
-                        let rpc_client = rpc_client.clone();
-                        let wallet = wallet.clone();
-                        let route_execution_cache = route_execution_cache.clone();
-                        let mint = action.mint;
-                        let mint_state = mint_state.clone();
-                        tokio::task::spawn_blocking(move || {
-                            refresh_precompiled_cache_for_mint(
-                                &config,
-                                &rpc_client,
-                                &wallet,
-                                &route_execution_cache,
-                                mint,
-                                &mint_state,
-                            );
-                        });
-                    }
-                }
-            }
-
             if let Some(action) = route_action {
                 if action.previous_route_groups != Some(action.summary.route_groups) {
                     info!(
@@ -1546,13 +1192,6 @@ fn process_geyser_route_action(
 
     }
 
-    if !config.execution.compile_dry_run_on_startup {
-        tracing::debug!(
-            "live controlled tx dry-run skipped: mint={} reason=compile_dry_run_disabled",
-            action.mint
-        );
-        return;
-    }
     if !config.lookup_tables.route_shards.enabled {
         tracing::debug!(
             "live controlled tx dry-run skipped: mint={} reason=route_shards_disabled",
@@ -1722,6 +1361,7 @@ struct RouteShardDryRunSummary {
     operations: Vec<PendingRouteShardOperation>,
 }
 
+#[cfg(feature = "geyser")]
 #[derive(Debug, Default)]
 struct ControlledTxDryRunSummary {
     routes: usize,
@@ -1730,6 +1370,7 @@ struct ControlledTxDryRunSummary {
     compile_failed: usize,
 }
 
+#[cfg(feature = "geyser")]
 #[derive(Debug, Default)]
 struct ControlledMintCompilation {
     summary: ControlledTxDryRunSummary,
@@ -1875,141 +1516,7 @@ fn prepare_route_runtime_accounts_for_mint(
     Ok(prepared)
 }
 
-fn dry_run_controlled_routes(
-    config: &AppConfig,
-    rpc_client: &RpcClient,
-    wallet: &solana_sdk::signature::Keypair,
-    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
-) -> anyhow::Result<ControlledTxDryRunSummary> {
-    let protocol_alt = load_lookup_table_account(
-        rpc_client,
-        Pubkey::from_str(&config.lookup_tables.protocol_alt)?,
-    )
-    .context("failed to load protocol ALT")?;
-    let route_resolver =
-        RouteShardLookupResolver::load(&config.lookup_tables.route_shards.state_file)
-            .context("failed to load route shard resolver")?;
-    let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
-    let recent_blockhash = rpc_client.get_latest_blockhash()?;
-    let params = controlled_execution_params(config)?;
-    let now_ms = now_ms();
-    let mut summary = ControlledTxDryRunSummary::default();
-
-    for (_, mint_state) in registry.iter() {
-        let route_groups = packer.pack_mint_state(
-            mint_state,
-            config.execution.min_pool_base_liquidity_lamports,
-            config.execution.max_pool_state_age_ms,
-            now_ms,
-        );
-
-        for route in route_groups {
-            summary.routes += 1;
-            let Some(route_alt) = route_resolver.load_lookup_for_mint(rpc_client, route.mint)?
-            else {
-                summary.missing_route_shard += 1;
-                continue;
-            };
-            let lookup_tables = lookup_tables_for_route(&protocol_alt, &route_alt);
-            if build_controlled_transaction(
-                wallet,
-                &route,
-                mint_state.token_program,
-                recent_blockhash,
-                &lookup_tables,
-                params.clone(),
-            )
-            .is_ok()
-            {
-                summary.compiled += 1;
-            } else {
-                summary.compile_failed += 1;
-            }
-        }
-    }
-
-    Ok(summary)
-}
-
-fn dry_run_controlled_mint_routes(
-    config: &AppConfig,
-    rpc_client: &RpcClient,
-    wallet: &solana_sdk::signature::Keypair,
-    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
-    mint: Pubkey,
-) -> anyhow::Result<ControlledTxDryRunSummary> {
-    let recent_blockhash = rpc_client.get_latest_blockhash()?;
-    Ok(compile_controlled_mint_routes(
-        config,
-        rpc_client,
-        wallet,
-        registry,
-        mint,
-        recent_blockhash,
-    )?
-    .summary)
-}
-
-fn compile_controlled_mint_routes(
-    config: &AppConfig,
-    rpc_client: &RpcClient,
-    wallet: &solana_sdk::signature::Keypair,
-    registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
-    mint: Pubkey,
-    recent_blockhash: Hash,
-) -> anyhow::Result<ControlledMintCompilation> {
-    let Some(mint_state) = registry.get(&mint) else {
-        return Ok(ControlledMintCompilation::default());
-    };
-
-    let protocol_alt = load_lookup_table_account(
-        rpc_client,
-        Pubkey::from_str(&config.lookup_tables.protocol_alt)?,
-    )
-    .context("failed to load protocol ALT")?;
-    let route_resolver =
-        RouteShardLookupResolver::load(&config.lookup_tables.route_shards.state_file)
-            .context("failed to load route shard resolver")?;
-    let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
-    let params = controlled_execution_params(config)?;
-    let now_ms = now_ms();
-    let mut compilation = ControlledMintCompilation::default();
-    let route_groups = pack_execution_route_groups(
-        &packer,
-        mint_state,
-        config.execution.min_pool_base_liquidity_lamports,
-        config.execution.max_pool_state_age_ms,
-        now_ms,
-    );
-
-    for route in route_groups {
-        compilation.summary.routes += 1;
-        let Some(route_alt) = route_resolver.load_lookup_for_mint(rpc_client, route.mint)? else {
-            compilation.summary.missing_route_shard += 1;
-            continue;
-        };
-        let lookup_tables = lookup_tables_for_route(&protocol_alt, &route_alt);
-        match build_controlled_transaction(
-            wallet,
-            &route,
-            mint_state.token_program,
-            recent_blockhash,
-            &lookup_tables,
-            params.clone(),
-        ) {
-            Ok(tx) => {
-                compilation.summary.compiled += 1;
-                compilation.transactions.push(tx);
-            }
-            Err(_) => {
-                compilation.summary.compile_failed += 1;
-            }
-        }
-    }
-
-    Ok(compilation)
-}
-
+#[cfg(feature = "geyser")]
 fn compile_controlled_mint_routes_cached(
     config: &AppConfig,
     wallet: &solana_sdk::signature::Keypair,
@@ -2046,17 +1553,41 @@ fn compile_controlled_mint_routes_cached(
             continue;
         };
         let lookup_tables = lookup_tables_for_route(&route_execution_cache.protocol_alt, route_alt);
-        match build_controlled_transaction(
-            wallet,
-            &route,
-            mint_state.token_program,
-            recent_blockhash,
-            &lookup_tables,
-            controlled_execution_params_with_tip(
-                config,
-                route_execution_cache.params.sender_tip.clone(),
-            ),
-        ) {
+        let params = controlled_execution_params_with_tip(
+            config,
+            route_execution_cache.params.sender_tip.clone(),
+        );
+        let build_result = if let Some(nonce_mgr) = &route_execution_cache.nonce_manager {
+            if let Some((nonce_pubkey, nonce_hash, _authority)) = nonce_mgr.next_nonce() {
+                nonce_mgr.mark_in_flight(&nonce_pubkey);
+                build_controlled_transaction_with_nonce(
+                    wallet,
+                    &route,
+                    mint_state.token_program,
+                    nonce_hash,
+                    nonce_pubkey,
+                    &lookup_tables,
+                    params,
+                )
+            } else {
+                tracing::warn!(
+                    "trigger nonce unavailable: mint={} reason=all_nonces_in_flight",
+                    mint
+                );
+                compilation.summary.compile_failed += 1;
+                continue;
+            }
+        } else {
+            build_controlled_transaction(
+                wallet,
+                &route,
+                mint_state.token_program,
+                recent_blockhash,
+                &lookup_tables,
+                params,
+            )
+        };
+        match build_result {
             Ok(tx) => {
                 compilation.summary.compiled += 1;
                 compilation.transactions.push(tx);
@@ -2070,6 +1601,7 @@ fn compile_controlled_mint_routes_cached(
     Ok(compilation)
 }
 
+#[cfg(feature = "geyser")]
 fn pack_execution_route_groups(
     packer: &FixedDlmmRoutePacker,
     mint_state: &solana_onchain_arbitrage_bot::registry::MintRuntimeState,
@@ -2124,63 +1656,6 @@ fn sender_tip_config(config: &AppConfig) -> anyhow::Result<Option<SenderTipConfi
     Ok(HeliusSenderPlan::from_config(&config.sender.helius)?.map(|plan| plan.tip))
 }
 
-#[cfg(feature = "geyser")]
-fn refresh_precompiled_cache_for_mint(
-    config: &AppConfig,
-    rpc_client: &RpcClient,
-    wallet: &solana_sdk::signature::Keypair,
-    route_execution_cache: &Option<Arc<RwLock<RouteExecutionCache>>>,
-    mint: Pubkey,
-    mint_state: &solana_onchain_arbitrage_bot::registry::MintRuntimeState,
-) {
-    let Some(cache) = route_execution_cache else {
-        return;
-    };
-
-    let blockhash = match rpc_client.get_latest_blockhash() {
-        Ok(hash) => hash,
-        Err(e) => {
-            tracing::warn!("precompiled cache refresh failed: mint={} error=blockhash_{}", mint, e);
-            return;
-        }
-    };
-
-    let Ok(cache) = cache.read() else {
-        tracing::warn!("precompiled cache refresh failed: mint={} error=lock_poisoned", mint);
-        return;
-    };
-
-    let Some(shard) = cache.route_resolver.shard_for_mint(mint).ok().flatten() else {
-        tracing::debug!("precompiled cache refresh skipped: mint={} reason=no_shard", mint);
-        return;
-    };
-
-    let Some(route_alt) = cache.route_alts.get(&shard) else {
-        tracing::debug!("precompiled cache refresh skipped: mint={} reason=no_route_alt", mint);
-        return;
-    };
-
-    let lookup_tables = lookup_tables_for_route(&cache.protocol_alt, route_alt);
-    cache.precompiled_cache.refresh_mint(
-        mint,
-        mint_state,
-        wallet,
-        blockhash,
-        mint_state.token_program,
-        &lookup_tables,
-        &cache.params,
-        config.execution.min_pool_base_liquidity_lamports,
-        config.execution.max_pool_state_age_ms,
-    );
-
-    info!(
-        "precompiled cache refreshed: mint={} valid_txs={} blockhash={}",
-        mint,
-        cache.precompiled_cache.valid_tx_count(&mint),
-        blockhash
-    );
-}
-
 fn controlled_execution_params(config: &AppConfig) -> anyhow::Result<ControlledExecutionParams> {
     Ok(controlled_execution_params_with_tip(
         config,
@@ -2202,6 +1677,7 @@ fn controlled_execution_params_with_tip(
     }
 }
 
+#[cfg(feature = "geyser")]
 fn lookup_tables_for_route(
     protocol_alt: &AddressLookupTableAccount,
     route_alt: &AddressLookupTableAccount,

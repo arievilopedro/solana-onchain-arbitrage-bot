@@ -168,8 +168,7 @@ pub mod yellowstone {
             let update = update?;
             match update.update_oneof {
                 Some(UpdateOneof::Account(account_update)) => {
-                    let Some(pool_update) =
-                        pool_account_update_from_yellowstone(account_update)?
+                    let Some(pool_update) = pool_account_update_from_yellowstone(account_update)?
                     else {
                         continue;
                     };
@@ -266,8 +265,8 @@ mod tests {
             x_token: "token".to_string(),
         };
 
-        let plans = GeyserAccountStreamPlan::controlled_v1(&endpoint, &[Pubkey::new_unique()])
-            .unwrap();
+        let plans =
+            GeyserAccountStreamPlan::controlled_v1(&endpoint, &[Pubkey::new_unique()]).unwrap();
         let plan = plans.first().unwrap();
 
         assert_eq!(plan.url, endpoint.url);

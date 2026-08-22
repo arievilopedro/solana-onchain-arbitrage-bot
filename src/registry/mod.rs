@@ -345,5 +345,4 @@ mod tests {
             PoolEligibility::Rejected(PoolRejectReason::StaleState)
         );
     }
-
 }

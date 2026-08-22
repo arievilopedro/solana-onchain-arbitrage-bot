@@ -6,6 +6,61 @@
 
 use solana_program::pubkey::Pubkey;
 use std::collections::HashSet;
+use std::sync::OnceLock;
+
+pub const PUMP_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+pub const COMPUTE_BUDGET_PROGRAM: &str = "ComputeBudget111111111111111111111111111111";
+pub const AXIOM_ALT: &str = "4vX5U9XsiY11infmC13d6VFPjvUqtuRw744r4o94dyow";
+pub const AXIOM_VANITY_PREFIX: &str = "jitodontfront";
+pub const AXIOM_VANITY_SUFFIX: &str = "1111111TradeWithAxiomDotTrade";
+pub const AXION_PREPARE_IX_LEN: usize = 10;
+pub const AXION_PREPARE_OPCODE: u8 = 0x01;
+pub const AXION_SWAP_IX_LEN: usize = 23;
+pub const AXION_SWAP_OPCODE: u8 = 0x00;
+pub const AXIOM_CU_LIMIT: u32 = 275_000;
+const BASE58_ALPHABET: &[u8] =
+    b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+fn cached_pubkey(cell: &'static OnceLock<Pubkey>, source: &str) -> Pubkey {
+    *cell.get_or_init(|| source.parse().expect("valid static pubkey"))
+}
+
+pub fn pump_amm_pubkey() -> Pubkey {
+    static CELL: OnceLock<Pubkey> = OnceLock::new();
+    cached_pubkey(&CELL, PUMP_AMM_PROGRAM)
+}
+
+pub fn compute_budget_pubkey() -> Pubkey {
+    static CELL: OnceLock<Pubkey> = OnceLock::new();
+    cached_pubkey(&CELL, COMPUTE_BUDGET_PROGRAM)
+}
+
+pub fn axiom_alt_pubkey() -> Pubkey {
+    static CELL: OnceLock<Pubkey> = OnceLock::new();
+    cached_pubkey(&CELL, AXIOM_ALT)
+}
+
+/// Precomputes the family of Axiom vanity tip addresses observed on-chain.
+///
+/// The pattern is `jitodontfront?1111111TradeWithAxiomDotTrade` where `?`
+/// varies across the base58 alphabet. Only strings that decode to valid
+/// pubkeys are retained.
+pub fn axiom_vanity_family() -> &'static HashSet<Pubkey> {
+    static CELL: OnceLock<HashSet<Pubkey>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut out = HashSet::new();
+        for ch in BASE58_ALPHABET {
+            let candidate = format!(
+                "{}{}{}",
+                AXIOM_VANITY_PREFIX, *ch as char, AXIOM_VANITY_SUFFIX
+            );
+            if let Ok(pk) = candidate.parse::<Pubkey>() {
+                out.insert(pk);
+            }
+        }
+        out
+    })
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AxionTriggerSignal {
@@ -17,6 +72,12 @@ pub struct AxionTriggerSignal {
     pub side: Option<&'static str>,
     pub raw_amount: Option<u64>,
     pub axion_program_seen: bool,
+    /// `SetComputeUnitLimit(275_000)` present (Axiom-typical value).
+    pub cu_limit_axiom: bool,
+    /// Axiom canonical ALT referenced in `addressTableLookups`.
+    pub axiom_alt_seen: bool,
+    /// Any address in the Axiom vanity tip family is a static key.
+    pub axiom_vanity_seen: bool,
 }
 
 pub fn pubkey_bytes_to_pubkey(bytes: &[u8]) -> Option<Pubkey> {
@@ -43,20 +104,21 @@ pub fn collect_allowlisted_mints_from_strings<'a>(
 #[cfg(feature = "geyser")]
 pub mod yellowstone {
     use super::{
-        collect_allowlisted_mints_from_strings, pubkey_bytes_to_pubkey, AxionTriggerSignal,
+        axiom_alt_pubkey, axiom_vanity_family, collect_allowlisted_mints_from_strings,
+        compute_budget_pubkey, pubkey_bytes_to_pubkey, pump_amm_pubkey, AxionTriggerSignal,
+        AXIOM_CU_LIMIT, AXION_PREPARE_IX_LEN, AXION_PREPARE_OPCODE, AXION_SWAP_IX_LEN,
+        AXION_SWAP_OPCODE,
     };
     use solana_program::pubkey::Pubkey;
     use std::collections::HashSet;
     use yellowstone_grpc_proto::solana::storage::confirmed_block::{
-        Transaction, TransactionStatusMeta,
+        CompiledInstruction, Transaction, TransactionStatusMeta,
     };
 
     const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
-    const PUMP_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
-    const PUMP_BUY_DISCRIMINATOR: [u8; 8] =
-        [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
-    const PUMP_SELL_DISCRIMINATOR: [u8; 8] =
-        [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
+    const PUMP_BUY_DISCRIMINATOR: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
+    const PUMP_SELL_DISCRIMINATOR: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
+    const CB_SET_COMPUTE_UNIT_LIMIT: u8 = 0x02;
 
     pub fn account_keys(tx: &Transaction, meta: Option<&TransactionStatusMeta>) -> Vec<Pubkey> {
         let mut keys = Vec::new();
@@ -219,12 +281,15 @@ pub mod yellowstone {
         keys: &[Pubkey],
         meta: Option<&TransactionStatusMeta>,
     ) -> Option<AxionVolume> {
-        if data.len() < 17 {
+        // Only decode the swap ix; prepare ix carries no volume.
+        if data.len() != AXION_SWAP_IX_LEN || data[0] != AXION_SWAP_OPCODE {
             return None;
         }
-        let byte_side = match data[0] {
-            0 => Some("sell"),
-            1 => Some("buy"),
+        let amount_in = read_le_u64(&data[1..9]).unwrap_or(0);
+        let amount_out = read_le_u64(&data[9..17]).unwrap_or(0);
+        let byte_side = match data[17] {
+            0 => Some("buy"),
+            1 => Some("sell"),
             _ => None,
         };
         let user = account_indexes
@@ -234,18 +299,15 @@ pub mod yellowstone {
             .and_then(|meta| user.and_then(|user| owner_wsol_delta_sol(meta, user)))
             .map(|delta| if delta < 0.0 { "buy" } else { "sell" })
             .or(byte_side);
-        let amount_0 = read_le_u64(&data[1..9]).unwrap_or(0);
-        let amount_1 = read_le_u64(&data[9..17]).unwrap_or(0);
-        let raw_amount = if amount_0 > 0 { amount_0 } else { amount_1 };
         let lamports = match side {
-            Some("buy") => amount_0,
-            Some("sell") => amount_1,
-            _ => [amount_0, amount_1]
-                .iter()
-                .copied()
-                .filter(|amount| *amount > 0)
-                .min()
-                .unwrap_or(0),
+            Some("buy") => amount_in,
+            Some("sell") => amount_out,
+            _ => 0,
+        };
+        let raw_amount = if lamports > 0 {
+            lamports
+        } else {
+            amount_in.max(amount_out)
         };
         if raw_amount == 0 {
             return None;
@@ -260,7 +322,7 @@ pub mod yellowstone {
 
     fn pump_amm_instruction_volume(tx: &Transaction, keys: &[Pubkey]) -> Option<AxionVolume> {
         let msg = tx.message.as_ref()?;
-        let pump_program = PUMP_AMM_PROGRAM.parse::<Pubkey>().ok()?;
+        let pump_program = pump_amm_pubkey();
         msg.instructions
             .iter()
             .filter(|ix| keys.get(ix.program_id_index as usize) == Some(&pump_program))
@@ -337,6 +399,81 @@ pub mod yellowstone {
         Some(u64::from_le_bytes(buf))
     }
 
+    /// Verifies the Axion trigger shape (2 ixs: prepare + swap) and the swap
+    /// touches pump-amm. Rejects everything else (single-ix probes, wrong
+    /// opcodes, wrong lengths, no pump-amm).
+    pub fn validate_axion_structure(
+        tx: &Transaction,
+        keys: &[Pubkey],
+        axion_program: Pubkey,
+    ) -> bool {
+        let Some(msg) = tx.message.as_ref() else {
+            return false;
+        };
+        let axion_ixs: Vec<&CompiledInstruction> = msg
+            .instructions
+            .iter()
+            .filter(|ix| keys.get(ix.program_id_index as usize) == Some(&axion_program))
+            .collect();
+        if axion_ixs.len() != 2 {
+            return false;
+        }
+        let prepare = axion_ixs[0];
+        let swap = axion_ixs[1];
+        if prepare.data.len() != AXION_PREPARE_IX_LEN
+            || prepare.data.first().copied() != Some(AXION_PREPARE_OPCODE)
+        {
+            return false;
+        }
+        if swap.data.len() != AXION_SWAP_IX_LEN
+            || swap.data.first().copied() != Some(AXION_SWAP_OPCODE)
+        {
+            return false;
+        }
+        let pump = pump_amm_pubkey();
+        swap.accounts
+            .iter()
+            .any(|idx| keys.get(*idx as usize) == Some(&pump))
+    }
+
+    /// True iff the tx contains a `SetComputeUnitLimit(target)` ComputeBudget ix.
+    pub fn cu_limit_matches(tx: &Transaction, keys: &[Pubkey], target: u32) -> bool {
+        let Some(msg) = tx.message.as_ref() else {
+            return false;
+        };
+        let cb = compute_budget_pubkey();
+        msg.instructions
+            .iter()
+            .filter(|ix| keys.get(ix.program_id_index as usize) == Some(&cb))
+            .any(|ix| {
+                ix.data.len() >= 5
+                    && ix.data[0] == CB_SET_COMPUTE_UNIT_LIMIT
+                    && {
+                        let mut buf = [0u8; 4];
+                        buf.copy_from_slice(&ix.data[1..5]);
+                        u32::from_le_bytes(buf) == target
+                    }
+            })
+    }
+
+    /// True iff `addressTableLookups` references the canonical Axiom ALT.
+    pub fn axiom_alt_referenced(tx: &Transaction) -> bool {
+        let Some(msg) = tx.message.as_ref() else {
+            return false;
+        };
+        let target = axiom_alt_pubkey();
+        msg.address_table_lookups
+            .iter()
+            .filter_map(|lookup| pubkey_bytes_to_pubkey(&lookup.account_key))
+            .any(|pk| pk == target)
+    }
+
+    /// True iff any static/loaded key belongs to the Axiom vanity tip family.
+    pub fn axiom_vanity_present(keys: &[Pubkey]) -> bool {
+        let family = axiom_vanity_family();
+        keys.iter().any(|k| family.contains(k))
+    }
+
     pub fn axion_trigger_signals(
         signature: String,
         slot: u64,
@@ -350,6 +487,14 @@ pub mod yellowstone {
         if !axion_program_seen {
             return Vec::new();
         }
+
+        if !validate_axion_structure(tx, &keys, axion_program) {
+            return Vec::new();
+        }
+
+        let cu_limit_axiom = cu_limit_matches(tx, &keys, AXIOM_CU_LIMIT);
+        let axiom_alt_seen = axiom_alt_referenced(tx);
+        let axiom_vanity_seen = axiom_vanity_present(&keys);
 
         let token_balance_mints = token_balance_mints(meta);
         let volume = sol_volume(tx, &keys, meta, axion_program);
@@ -368,6 +513,9 @@ pub mod yellowstone {
             side: volume.side,
             raw_amount: volume.raw_amount,
             axion_program_seen,
+            cu_limit_axiom,
+            axiom_alt_seen,
+            axiom_vanity_seen,
         })
         .collect()
     }
@@ -375,6 +523,19 @@ pub mod yellowstone {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn swap_ix_bytes(amount_in: u64, amount_out: u64, side: u8) -> Vec<u8> {
+            let mut d = Vec::with_capacity(AXION_SWAP_IX_LEN);
+            d.push(AXION_SWAP_OPCODE);
+            d.extend_from_slice(&amount_in.to_le_bytes());
+            d.extend_from_slice(&amount_out.to_le_bytes());
+            d.push(side);
+            d.push(0x02);
+            d.extend_from_slice(&31u16.to_le_bytes());
+            d.extend_from_slice(&0u16.to_le_bytes());
+            debug_assert_eq!(d.len(), AXION_SWAP_IX_LEN);
+            d
+        }
 
         #[test]
         fn pump_amm_discriminator_detects_buy() {
@@ -401,6 +562,58 @@ pub mod yellowstone {
             assert_eq!(volume.source, "pump_swap_sell_bytes");
             assert_eq!(volume.sol_amount, 0.0);
         }
+
+        #[test]
+        fn axion_swap_decodes_buy_side_and_amount_in() {
+            let data = swap_ix_bytes(2_500_000_000, 999_999, 0);
+            let volume =
+                axion_volume_from_instruction(&[0, 1], &data, &[], None).expect("volume");
+            assert_eq!(volume.side, Some("buy"));
+            assert_eq!(volume.raw_amount, Some(2_500_000_000));
+            assert_eq!(volume.sol_amount, 2.5);
+            assert_eq!(volume.source, "axion_instruction_amount");
+        }
+
+        #[test]
+        fn axion_swap_decodes_sell_side_and_amount_out() {
+            let data = swap_ix_bytes(4_240_000_000_000, 18_870_000_000, 1);
+            let volume =
+                axion_volume_from_instruction(&[0, 1], &data, &[], None).expect("volume");
+            assert_eq!(volume.side, Some("sell"));
+            assert_eq!(volume.raw_amount, Some(18_870_000_000));
+            assert_eq!(volume.sol_amount, 18.87);
+        }
+
+        #[test]
+        fn axion_prepare_ix_is_not_decoded_as_volume() {
+            let prepare = vec![AXION_PREPARE_OPCODE, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            assert!(axion_volume_from_instruction(&[], &prepare, &[], None).is_none());
+        }
+
+        #[test]
+        fn axion_swap_with_wrong_len_rejected() {
+            let mut data = swap_ix_bytes(1, 1, 0);
+            data.pop();
+            assert!(axion_volume_from_instruction(&[], &data, &[], None).is_none());
+        }
+
+        #[test]
+        fn vanity_family_contains_observed_keys() {
+            let family = axiom_vanity_family();
+            for observed in [
+                "jitodontfront91111111TradeWithAxiomDotTrade",
+                "jitodontfront81111111TradeWithAxiomDotTrade",
+                "jitodontfrontP1111111TradeWithAxiomDotTrade",
+                "jitodontfrontB1111111TradeWithAxiomDotTrade",
+                "jitodontfront31111111TradeWithAxiomDotTrade",
+            ] {
+                let pk = observed.parse::<Pubkey>().expect("valid pubkey");
+                assert!(
+                    family.contains(&pk),
+                    "vanity family missing observed key {observed}"
+                );
+            }
+        }
     }
 }
 
@@ -416,6 +629,13 @@ mod tests {
     fn pubkey_bytes_require_exact_length() {
         assert_eq!(pubkey_bytes_to_pubkey(&[1; 31]), None);
         assert_eq!(pubkey_bytes_to_pubkey(&[2; 32]), Some(pk(2)));
+    }
+
+    #[test]
+    fn axiom_vanity_family_is_non_empty() {
+        let family = axiom_vanity_family();
+        assert!(!family.is_empty(), "expected at least one vanity variant");
+        assert!(family.len() <= 58, "family cannot exceed base58 alphabet");
     }
 
     #[test]

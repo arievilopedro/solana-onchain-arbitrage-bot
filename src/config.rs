@@ -71,8 +71,6 @@ pub struct AppConfig {
     pub compute: ComputeConfig,
     pub metrics: MetricsConfig,
     #[serde(default)]
-    pub precompiled: PrecompiledConfig,
-    #[serde(default)]
     pub nonce: NonceConfig,
 }
 
@@ -119,11 +117,8 @@ pub struct ExecutionConfig {
     pub no_failure_mode: bool,
     pub min_pool_base_liquidity_lamports: u64,
     pub max_pool_state_age_ms: u64,
-    pub compile_dry_run_on_startup: bool,
     #[serde(default)]
     pub send_live_transactions: bool,
-    #[serde(default)]
-    pub simulate_before_send: bool,
     #[serde(default = "default_live_route_refresh_cooldown_ms")]
     pub live_route_refresh_cooldown_ms: u64,
     #[serde(default = "default_trigger_send_max_transactions")]
@@ -228,42 +223,6 @@ impl ComputeConfig {
 pub struct MetricsConfig {
     pub enabled: bool,
     pub file: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct PrecompiledConfig {
-    /// Enable pre-compiled transaction cache for lower trigger latency.
-    #[serde(default = "default_precompiled_enabled")]
-    pub enabled: bool,
-    /// TTL for cached transactions in milliseconds.
-    /// Blockhash is valid for ~60s, but we use a shorter TTL for safety.
-    #[serde(default = "default_precompiled_ttl_ms")]
-    pub ttl_ms: u64,
-    /// Interval for cleaning up expired cache entries in milliseconds.
-    #[serde(default = "default_precompiled_cleanup_interval_ms")]
-    pub cleanup_interval_ms: u64,
-}
-
-impl Default for PrecompiledConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_precompiled_enabled(),
-            ttl_ms: default_precompiled_ttl_ms(),
-            cleanup_interval_ms: default_precompiled_cleanup_interval_ms(),
-        }
-    }
-}
-
-fn default_precompiled_enabled() -> bool {
-    true
-}
-
-fn default_precompiled_ttl_ms() -> u64 {
-    25_000 // 25 seconds
-}
-
-fn default_precompiled_cleanup_interval_ms() -> u64 {
-    5_000 // 5 seconds
 }
 
 #[derive(Debug, Deserialize, Clone)]

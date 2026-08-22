@@ -533,8 +533,7 @@ fn build_simulated_route_shard_transaction(
     candidate_slots.sort_unstable();
     candidate_slots.dedup();
     for recent_slot in candidate_slots.into_iter().rev() {
-        let built =
-            operation.build_instructions(wallet.pubkey(), wallet.pubkey(), recent_slot)?;
+        let built = operation.build_instructions(wallet.pubkey(), wallet.pubkey(), recent_slot)?;
         let tx = Transaction::new_signed_with_payer(
             &built.instructions,
             Some(&wallet.pubkey()),
@@ -566,11 +565,7 @@ fn ensure_route_shard_transaction_simulates(
     )?;
 
     if let Some(err) = simulation.value.err {
-        let logs = simulation
-            .value
-            .logs
-            .unwrap_or_default()
-            .join(" | ");
+        let logs = simulation.value.logs.unwrap_or_default().join(" | ");
         anyhow::bail!(
             "route shard transaction simulation failed: shard={} err={:?} logs={}",
             shard,

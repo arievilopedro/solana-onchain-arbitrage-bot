@@ -727,9 +727,8 @@ mod tests {
         pool_data.wallet_wsol_account = pk(11);
         let minimum_profit = 123_456_789u64;
 
-        let ix =
-            create_swap_instruction(&wallet, &pool_data, 400_000, minimum_profit, true, true)
-                .unwrap();
+        let ix = create_swap_instruction(&wallet, &pool_data, 400_000, minimum_profit, true, true)
+            .unwrap();
 
         assert_eq!(&ix.data[1..9], &minimum_profit.to_le_bytes());
         assert_eq!(ix.data[16], 1);

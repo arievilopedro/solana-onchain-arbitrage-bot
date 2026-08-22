@@ -1,9 +1,5 @@
 //! Transaction assembly and execution pipeline.
 
-pub mod precompiled;
-
-pub use precompiled::{PreCompiledCacheStats, PreCompiledEntry, PreCompiledTxCache};
-
 use crate::pools::MintPoolData;
 use crate::registry::{DlmmRouteState, PumpRouteState};
 use crate::routes::RouteGroup;

@@ -58,12 +58,17 @@ impl ControlledRpcBootstrap {
 
             let pump_accounts = self.discover_pump_pool_accounts(*mint)?;
             for (pool, account) in pump_accounts {
-                let Some(route_state) =
-                    pump_route_state_from_account(*mint, pool, &account, |token_vault, base_vault| {
-                        self.pump_vault_liquidity(token_vault, base_vault).with_context(|| {
-                            format!("failed to read Pump vault liquidity for pool {}", pool)
-                        })
-                    })?
+                let Some(route_state) = pump_route_state_from_account(
+                    *mint,
+                    pool,
+                    &account,
+                    |token_vault, base_vault| {
+                        self.pump_vault_liquidity(token_vault, base_vault)
+                            .with_context(|| {
+                                format!("failed to read Pump vault liquidity for pool {}", pool)
+                            })
+                    },
+                )?
                 else {
                     continue;
                 };
