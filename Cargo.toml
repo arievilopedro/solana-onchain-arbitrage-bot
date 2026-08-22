@@ -33,6 +33,11 @@ required-features = ["geyser"]
 name = "nonce_setup"
 path = "src/bin/nonce_setup.rs"
 
+[[bin]]
+name = "wallet_probe"
+path = "src/bin/wallet_probe.rs"
+required-features = ["geyser"]
+
 [dependencies]
 # Core Solana dependencies
 solana-sdk = "1.17"

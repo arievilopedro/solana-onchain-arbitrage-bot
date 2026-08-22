@@ -18,3 +18,4 @@ pub mod sender;
 pub mod streams;
 pub mod transaction;
 pub mod wallet;
+pub mod wallet_probe;
