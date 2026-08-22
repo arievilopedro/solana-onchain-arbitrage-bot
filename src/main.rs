@@ -2,9 +2,7 @@ use anyhow::Context;
 use clap::{App, Arg};
 use solana_client::rpc_client::RpcClient;
 use solana_onchain_arbitrage_bot::alt::{
-    execute_route_shard_plan, execute_route_shard_plan_with_recent_slots,
-    load_lookup_table_account, PendingRouteShardOperation, PlannedRouteShardExtension,
-    RouteShardLookupResolver, RouteShardPlanFile, RouteShardPlanner, RouteShardStore,
+    load_lookup_table_account, maintain_route_shards_incremental, RouteShardLookupResolver,
     StableMintRouteAccounts,
 };
 use solana_onchain_arbitrage_bot::ata::ensure_base_atas_exist;
@@ -119,48 +117,29 @@ async fn main() -> anyhow::Result<()> {
     let registry = report.registry;
 
     if config.lookup_tables.route_shards.enabled {
-        let store = RouteShardStore::load(&config.lookup_tables.route_shards.state_file)
-            .context("failed to load route shard state")?;
-        let planner = RouteShardPlanner::new(
-            store,
+        let (routes, skipped_unready) = collect_stable_mint_routes(&config, &registry);
+        let maintenance = maintain_route_shards_incremental(
+            &rpc_client,
+            &wallet,
+            &config.lookup_tables.route_shards.state_file,
             allowed_mints.iter().copied(),
             config.lookup_tables.route_shards.max_addresses,
-        )?;
-        let summary = plan_route_shards(&config, &planner, &registry)?;
-        RouteShardPlanFile::new(summary.operations.clone())
-            .save(&config.lookup_tables.route_shards.plan_file)
-            .context("failed to write route shard plan file")?;
+            routes,
+            config.lookup_tables.route_shards.auto_create,
+            config.lookup_tables.route_shards.auto_extend,
+            &[],
+        )
+        .context("route shard maintenance failed")?;
         info!(
-            "route shard dry-run: mint_blocks={} create_shard={} extend_shard={} skipped_unready={} skipped_disabled={} execute_on_startup={} plan_file={}",
-            summary.mint_blocks,
-            summary.create_shard,
-            summary.extend_shard,
-            summary.skipped_unready,
-            summary.skipped_disabled,
-            config.lookup_tables.route_shards.execute_on_startup,
-            config.lookup_tables.route_shards.plan_file
+            "route shard maintenance OK: mint_blocks={} create_shard={} extend_shard={} skipped_unready={} skipped_disabled={} attempted={} confirmed={}",
+            maintenance.mint_blocks,
+            maintenance.create_shard,
+            maintenance.extend_shard,
+            skipped_unready,
+            maintenance.skipped_disabled,
+            maintenance.attempted,
+            maintenance.confirmed.len()
         );
-
-        let should_execute_startup_route_shards =
-            config.lookup_tables.route_shards.execute_on_startup || !summary.operations.is_empty();
-
-        if should_execute_startup_route_shards {
-            let maintenance = execute_route_shard_plan(
-                &rpc_client,
-                &wallet,
-                &config.lookup_tables.route_shards.state_file,
-                &config.lookup_tables.route_shards.plan_file,
-                allowed_mints.iter().copied(),
-                config.lookup_tables.route_shards.max_addresses,
-            )
-            .context("route shard maintenance failed")?;
-            info!(
-                "route shard maintenance OK: attempted={} confirmed={}",
-                maintenance.attempted,
-                maintenance.confirmed.len()
-            );
-        }
-
     }
 
     let runtime_account_cache = Arc::new(Mutex::new(RuntimeAccountCache::default()));
@@ -1369,45 +1348,27 @@ fn maintain_live_route_shards(
     }
 
     let allowed_mints = parse_allowed_mints(config)?;
-    let store = RouteShardStore::load(&config.lookup_tables.route_shards.state_file)
-        .context("failed to load route shard state for live maintenance")?;
-    let planner = RouteShardPlanner::new(
-        store,
-        allowed_mints.iter().copied(),
-        config.lookup_tables.route_shards.max_addresses,
-    )?;
-    let summary = plan_route_shards(config, &planner, registry)?;
-    RouteShardPlanFile::new(summary.operations.clone())
-        .save(&config.lookup_tables.route_shards.plan_file)
-        .context("failed to write live route shard plan file")?;
-
-    info!(
-        "route shard live maintenance planned: mint_blocks={} create_shard={} extend_shard={} skipped_unready={} skipped_disabled={} plan_file={}",
-        summary.mint_blocks,
-        summary.create_shard,
-        summary.extend_shard,
-        summary.skipped_unready,
-        summary.skipped_disabled,
-        config.lookup_tables.route_shards.plan_file
-    );
-
-    if summary.operations.is_empty() {
-        return Ok(0);
-    }
-
-    let maintenance = execute_route_shard_plan_with_recent_slots(
+    let (routes, skipped_unready) = collect_stable_mint_routes(config, registry);
+    let maintenance = maintain_route_shards_incremental(
         rpc_client,
         wallet,
         &config.lookup_tables.route_shards.state_file,
-        &config.lookup_tables.route_shards.plan_file,
         allowed_mints.iter().copied(),
         config.lookup_tables.route_shards.max_addresses,
+        routes,
+        config.lookup_tables.route_shards.auto_create,
+        config.lookup_tables.route_shards.auto_extend,
         recent_slot_candidates,
     )
     .context("live route shard maintenance failed")?;
 
     info!(
-        "route shard live maintenance OK: attempted={} confirmed={}",
+        "route shard live maintenance OK: mint_blocks={} create_shard={} extend_shard={} skipped_unready={} skipped_disabled={} attempted={} confirmed={}",
+        maintenance.mint_blocks,
+        maintenance.create_shard,
+        maintenance.extend_shard,
+        skipped_unready,
+        maintenance.skipped_disabled,
         maintenance.attempted,
         maintenance.confirmed.len()
     );
@@ -1437,16 +1398,6 @@ async fn run_geyser_account_worker(
     Ok(())
 }
 
-#[derive(Debug, Default)]
-struct RouteShardDryRunSummary {
-    mint_blocks: usize,
-    create_shard: usize,
-    extend_shard: usize,
-    skipped_unready: usize,
-    skipped_disabled: usize,
-    operations: Vec<PendingRouteShardOperation>,
-}
-
 #[cfg(feature = "geyser")]
 #[derive(Debug, Default)]
 struct ControlledTxDryRunSummary {
@@ -1471,48 +1422,31 @@ struct AtaPreparation {
     address: Pubkey,
 }
 
-fn plan_route_shards(
+/// Collect `StableMintRouteAccounts` for every registry mint whose pump/base
+/// pools are ready, sorted deterministically by mint pubkey. Returns the ready
+/// routes and the count of mints skipped for not being ready.
+fn collect_stable_mint_routes(
     config: &AppConfig,
-    planner: &RouteShardPlanner,
     registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
-) -> anyhow::Result<RouteShardDryRunSummary> {
+) -> (Vec<StableMintRouteAccounts>, usize) {
     let now_ms = now_ms();
-    let mut summary = RouteShardDryRunSummary::default();
+    let mut ready: Vec<StableMintRouteAccounts> = Vec::new();
+    let mut skipped_unready = 0usize;
 
     for (_, mint_state) in registry.iter() {
-        let Some(stable_route) = StableMintRouteAccounts::from_mint_runtime_state(
+        match StableMintRouteAccounts::from_mint_runtime_state(
             mint_state,
             config.execution.min_pool_base_liquidity_lamports,
             config.execution.max_pool_state_age_ms,
             now_ms,
-        ) else {
-            summary.skipped_unready += 1;
-            continue;
-        };
-
-        if let Some(plan) = planner.plan_mint_block(&stable_route)? {
-            match &plan {
-                PlannedRouteShardExtension::CreateShard { .. } => {
-                    if !config.lookup_tables.route_shards.auto_create {
-                        summary.skipped_disabled += 1;
-                        continue;
-                    }
-                    summary.create_shard += 1;
-                }
-                PlannedRouteShardExtension::ExtendShard { .. } => {
-                    if !config.lookup_tables.route_shards.auto_extend {
-                        summary.skipped_disabled += 1;
-                        continue;
-                    }
-                    summary.extend_shard += 1;
-                }
-            }
-            summary.mint_blocks += 1;
-            summary.operations.push(plan.pending_operation());
+        ) {
+            Some(route) => ready.push(route),
+            None => skipped_unready += 1,
         }
     }
 
-    Ok(summary)
+    ready.sort_by_key(|route| route.mint);
+    (ready, skipped_unready)
 }
 
 fn prepare_route_runtime_accounts_for_registry(

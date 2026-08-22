@@ -159,48 +159,6 @@ pub struct PendingRouteShardOperation {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RouteShardPlanFile {
-    pub version: u8,
-    pub operations: Vec<PendingRouteShardOperation>,
-}
-
-impl RouteShardPlanFile {
-    pub fn new(operations: Vec<PendingRouteShardOperation>) -> Self {
-        Self {
-            version: ROUTE_SHARD_STATE_VERSION,
-            operations,
-        }
-    }
-
-    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path.as_ref();
-        if !path.exists() {
-            return Ok(Self::new(Vec::new()));
-        }
-
-        let contents = fs::read_to_string(path)?;
-        let plan: Self = serde_json::from_str(&contents)?;
-        plan.validate()?;
-        Ok(plan)
-    }
-
-    pub fn save(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
-        self.validate()?;
-        write_json(path, self)
-    }
-
-    pub fn validate(&self) -> anyhow::Result<()> {
-        if self.version != ROUTE_SHARD_STATE_VERSION {
-            anyhow::bail!("unsupported route shard plan version {}", self.version);
-        }
-        for operation in &self.operations {
-            operation.validate()?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PendingRouteShardOperationKind {
     CreateShard {
@@ -288,12 +246,6 @@ impl PendingRouteShardOperation {
 pub struct RouteShardInstructions {
     pub shard: Pubkey,
     pub instructions: Vec<Instruction>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct RouteShardMaintenanceReport {
-    pub attempted: usize,
-    pub confirmed: Vec<ConfirmedRouteShardOperation>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -388,47 +340,69 @@ pub fn load_lookup_table_account(
     })
 }
 
-pub fn execute_route_shard_plan(
-    rpc_client: &RpcClient,
-    wallet: &Keypair,
-    state_file: impl AsRef<Path>,
-    plan_file: impl AsRef<Path>,
-    allowed_mints: impl IntoIterator<Item = Pubkey>,
-    shard_capacity: usize,
-) -> anyhow::Result<RouteShardMaintenanceReport> {
-    execute_route_shard_plan_with_recent_slots(
-        rpc_client,
-        wallet,
-        state_file,
-        plan_file,
-        allowed_mints,
-        shard_capacity,
-        &[],
-    )
+#[derive(Debug, Default)]
+pub struct RouteShardIncrementalReport {
+    pub mint_blocks: usize,
+    pub create_shard: usize,
+    pub extend_shard: usize,
+    pub skipped_disabled: usize,
+    pub attempted: usize,
+    pub confirmed: Vec<ConfirmedRouteShardOperation>,
 }
 
-pub fn execute_route_shard_plan_with_recent_slots(
+/// Plan and execute route shard operations for `routes` incrementally, one
+/// mint block at a time. After each confirmed operation the planner state is
+/// mutated in memory and persisted to `state_file`, so the next iteration's
+/// `plan_mint_block` decision reflects the actual on-chain capacity.
+///
+/// This closes the "startup encheu a ALT e não conseguiu criar nova" gap: the
+/// old two-phase `plan_route_shards` + `execute_route_shard_plan` computed the
+/// entire plan against a frozen store snapshot and emitted `ExtendShard` for
+/// every mint even after the shard filled, then bailed at apply time.
+pub fn maintain_route_shards_incremental(
     rpc_client: &RpcClient,
     wallet: &Keypair,
     state_file: impl AsRef<Path>,
-    plan_file: impl AsRef<Path>,
     allowed_mints: impl IntoIterator<Item = Pubkey>,
     shard_capacity: usize,
+    routes: Vec<StableMintRouteAccounts>,
+    auto_create: bool,
+    auto_extend: bool,
     recent_slot_candidates: &[u64],
-) -> anyhow::Result<RouteShardMaintenanceReport> {
-    let plan = RouteShardPlanFile::load(plan_file)?;
+) -> anyhow::Result<RouteShardIncrementalReport> {
+    let state_file = state_file.as_ref();
     let mut planner = RouteShardPlanner::new(
-        RouteShardStore::load(&state_file)?,
+        RouteShardStore::load(state_file)?,
         allowed_mints,
         shard_capacity,
     )?;
-    let mut report = RouteShardMaintenanceReport {
-        attempted: 0,
-        confirmed: Vec::new(),
-    };
+    let mut report = RouteShardIncrementalReport::default();
 
-    for operation in plan.operations {
-        for operation in split_route_shard_operation(operation)? {
+    for route in routes {
+        let Some(plan) = planner.plan_mint_block(&route)? else {
+            continue;
+        };
+
+        match &plan {
+            PlannedRouteShardExtension::CreateShard { .. } => {
+                if !auto_create {
+                    report.skipped_disabled += 1;
+                    continue;
+                }
+                report.create_shard += 1;
+            }
+            PlannedRouteShardExtension::ExtendShard { .. } => {
+                if !auto_extend {
+                    report.skipped_disabled += 1;
+                    continue;
+                }
+                report.extend_shard += 1;
+            }
+        }
+        report.mint_blocks += 1;
+
+        let pending = plan.pending_operation();
+        for operation in split_route_shard_operation(pending)? {
             report.attempted += 1;
             let blockhash = rpc_client.get_latest_blockhash()?;
             let (built, tx) = build_simulated_route_shard_transaction(
@@ -440,9 +414,8 @@ pub fn execute_route_shard_plan_with_recent_slots(
             )?;
             let signature = rpc_client.send_and_confirm_transaction(&tx)?;
             let confirmed_slot = rpc_client.get_slot()?;
-
             planner.apply_confirmed_operation(&operation, built.shard, confirmed_slot)?;
-            planner.store().save(&state_file)?;
+            planner.store().save(state_file)?;
             report.confirmed.push(ConfirmedRouteShardOperation {
                 shard: built.shard,
                 signature,
