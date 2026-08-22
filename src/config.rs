@@ -375,8 +375,8 @@ impl AppConfig {
             )?;
         }
 
-        validate_stream_endpoint("grpc", &self.grpc)?;
-        validate_stream_endpoint("rabbitstream", &self.rabbitstream)?;
+        validate_stream_endpoint("grpc", &self.grpc, false)?;
+        validate_stream_endpoint("rabbitstream", &self.rabbitstream, true)?;
 
         match self.sender.primary.as_str() {
             "rpc" | "helius" => {}
@@ -452,12 +452,16 @@ fn validate_pubkey_csv(field: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_stream_endpoint(name: &str, endpoint: &StreamEndpointConfig) -> anyhow::Result<()> {
+fn validate_stream_endpoint(
+    name: &str,
+    endpoint: &StreamEndpointConfig,
+    require_token: bool,
+) -> anyhow::Result<()> {
     if endpoint.enabled {
         if endpoint.url.trim().is_empty() {
             anyhow::bail!("{}.url is required when enabled", name);
         }
-        if endpoint.x_token.trim().is_empty() {
+        if require_token && endpoint.x_token.trim().is_empty() {
             anyhow::bail!("{}.x_token is required when enabled", name);
         }
     }
