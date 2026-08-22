@@ -41,10 +41,6 @@ impl GeyserAccountStreamPlan {
             anyhow::bail!("grpc.url is required when grpc.enabled=true");
         }
 
-        if endpoint.x_token.trim().is_empty() {
-            anyhow::bail!("grpc.x_token is required when grpc.enabled=true");
-        }
-
         if allowed_mints.is_empty() {
             anyhow::bail!("allowed_mints must not be empty when grpc.enabled=true");
         }
@@ -123,8 +119,11 @@ pub mod yellowstone {
         plan: GeyserAccountStreamPlan,
         mut on_update: impl FnMut(GeyserStreamUpdate) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        let mut client = GeyserGrpcClient::build_from_shared(plan.url.clone())?
-            .x_token(Some(plan.x_token.clone()))?
+        let mut builder = GeyserGrpcClient::build_from_shared(plan.url.clone())?;
+        if !plan.x_token.trim().is_empty() {
+            builder = builder.x_token(Some(plan.x_token.clone()))?;
+        }
+        let mut client = builder
             .max_decoding_message_size(64 * 1024 * 1024)
             .connect()
             .await?;
