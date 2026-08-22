@@ -340,8 +340,20 @@ pub fn load_lookup_table_account(
     })
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct RouteShardReconciliationReport {
+    pub checked: usize,
+    pub updated_used: usize,
+    pub marked_full: usize,
+    pub marked_deactivated: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct RouteShardIncrementalReport {
+    pub reconciled_checked: usize,
+    pub reconciled_updated_used: usize,
+    pub reconciled_marked_full: usize,
+    pub reconciled_marked_deactivated: usize,
     pub mint_blocks: usize,
     pub create_shard: usize,
     pub extend_shard: usize,
@@ -377,6 +389,18 @@ pub fn maintain_route_shards_incremental(
         shard_capacity,
     )?;
     let mut report = RouteShardIncrementalReport::default();
+
+    let reconciliation = planner.reconcile_with_chain(rpc_client)?;
+    report.reconciled_checked = reconciliation.checked;
+    report.reconciled_updated_used = reconciliation.updated_used;
+    report.reconciled_marked_full = reconciliation.marked_full;
+    report.reconciled_marked_deactivated = reconciliation.marked_deactivated;
+    if reconciliation.updated_used > 0
+        || reconciliation.marked_full > 0
+        || reconciliation.marked_deactivated > 0
+    {
+        planner.store().save(state_file)?;
+    }
 
     for route in routes {
         let Some(plan) = planner.plan_mint_block(&route)? else {
@@ -693,6 +717,70 @@ impl RouteShardPlanner {
 
     pub fn store(&self) -> &RouteShardStore {
         &self.store
+    }
+
+    /// Fetch each known shard from RPC and reconcile local `used` / `status`
+    /// with on-chain reality. ALTs are append-only, so `on_chain_len >=
+    /// record.used` is invariant. If violated the local state is corrupt and
+    /// we bail. If on-chain is ahead, we adopt the on-chain length so the
+    /// next `plan_mint_block` sees real remaining capacity. Missing accounts
+    /// (closed/never created) are marked Deactivated so planning skips them.
+    pub fn reconcile_with_chain(
+        &mut self,
+        rpc_client: &RpcClient,
+    ) -> anyhow::Result<RouteShardReconciliationReport> {
+        let mut report = RouteShardReconciliationReport::default();
+        let shard_keys: Vec<String> = self.store.shards.keys().cloned().collect();
+        for shard_key in shard_keys {
+            report.checked += 1;
+            let shard_pubkey = parse_pubkey(&shard_key)?;
+            let account_opt = rpc_client
+                .get_account_with_commitment(&shard_pubkey, CommitmentConfig::confirmed())?
+                .value;
+            let record = self
+                .store
+                .shards
+                .get_mut(&shard_key)
+                .expect("shard key iterated from same map");
+            match account_opt {
+                None => {
+                    if !matches!(record.status, RouteShardStatus::Deactivated) {
+                        record.status = RouteShardStatus::Deactivated;
+                        report.marked_deactivated += 1;
+                    }
+                }
+                Some(account) => {
+                    let lookup_table =
+                        AddressLookupTable::deserialize(&account.data).map_err(|e| {
+                            anyhow::anyhow!(
+                                "failed to deserialize lookup table {}: {}",
+                                shard_key,
+                                e
+                            )
+                        })?;
+                    let on_chain_len = lookup_table.addresses.len();
+                    if on_chain_len < record.used {
+                        anyhow::bail!(
+                            "route shard {} local used {} exceeds on-chain len {}; state file is corrupt",
+                            shard_key,
+                            record.used,
+                            on_chain_len
+                        );
+                    }
+                    if on_chain_len > record.used {
+                        record.used = on_chain_len;
+                        report.updated_used += 1;
+                    }
+                    if record.used >= record.capacity
+                        && matches!(record.status, RouteShardStatus::Active)
+                    {
+                        record.status = RouteShardStatus::Full;
+                        report.marked_full += 1;
+                    }
+                }
+            }
+        }
+        Ok(report)
     }
 
     pub fn plan_mint_block(

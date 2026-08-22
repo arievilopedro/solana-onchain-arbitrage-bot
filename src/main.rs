@@ -131,7 +131,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .context("route shard maintenance failed")?;
         info!(
-            "route shard maintenance OK: mint_blocks={} create_shard={} extend_shard={} skipped_unready={} skipped_disabled={} attempted={} confirmed={}",
+            "route shard maintenance OK: reconciled_checked={} reconciled_updated_used={} reconciled_marked_full={} reconciled_marked_deactivated={} mint_blocks={} create_shard={} extend_shard={} skipped_unready={} skipped_disabled={} attempted={} confirmed={}",
+            maintenance.reconciled_checked,
+            maintenance.reconciled_updated_used,
+            maintenance.reconciled_marked_full,
+            maintenance.reconciled_marked_deactivated,
             maintenance.mint_blocks,
             maintenance.create_shard,
             maintenance.extend_shard,
@@ -1363,7 +1367,11 @@ fn maintain_live_route_shards(
     .context("live route shard maintenance failed")?;
 
     info!(
-        "route shard live maintenance OK: mint_blocks={} create_shard={} extend_shard={} skipped_unready={} skipped_disabled={} attempted={} confirmed={}",
+        "route shard live maintenance OK: reconciled_checked={} reconciled_updated_used={} reconciled_marked_full={} reconciled_marked_deactivated={} mint_blocks={} create_shard={} extend_shard={} skipped_unready={} skipped_disabled={} attempted={} confirmed={}",
+        maintenance.reconciled_checked,
+        maintenance.reconciled_updated_used,
+        maintenance.reconciled_marked_full,
+        maintenance.reconciled_marked_deactivated,
         maintenance.mint_blocks,
         maintenance.create_shard,
         maintenance.extend_shard,
