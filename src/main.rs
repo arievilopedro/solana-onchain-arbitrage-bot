@@ -38,7 +38,7 @@ use tracing::{info, Level};
 
 #[cfg(feature = "geyser")]
 use solana_onchain_arbitrage_bot::streams::{
-    apply_pool_account_update, rpc::StreamRpcEnricher, SlotTracker,
+    apply_prepared_pool_update, prepare_pool_account_update, rpc::StreamRpcEnricher, SlotTracker,
 };
 #[cfg(feature = "geyser")]
 use std::collections::VecDeque;
@@ -498,100 +498,163 @@ fn run_rabbitstream_trigger_worker(
 
     tokio::spawn(async move {
         let url = plan.url.clone();
-        let mut seen_signatures = HashSet::<String>::new();
-        let mut seen_signature_order = VecDeque::<String>::new();
-        let mut last_trigger_by_mint = HashMap::<Pubkey, Instant>::new();
-        let result =
-            run_axion_trigger_stream(plan, axion_program, allowed_mints, move |signal| {
-                let trigger_received_at = Instant::now();
-                if !seen_signatures.insert(signal.signature.clone()) {
-                    return Ok(());
-                }
-                seen_signature_order.push_back(signal.signature.clone());
-                while seen_signature_order.len() > 4096 {
-                    if let Some(old_signature) = seen_signature_order.pop_front() {
-                        seen_signatures.remove(&old_signature);
-                    }
-                }
-                let (sol_amount, volume_source) = adjusted_trigger_sol_amount(
-                    &config,
-                    registry.as_ref(),
-                    signal.mint,
-                    signal.sol_amount,
-                    signal.volume_source,
-                    signal.side,
-                    signal.raw_amount,
-                )?;
-                if sol_amount < config.axion.min_sol {
-                    tracing::debug!(
-                        "rabbitstream axion trigger filtered: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={} side={} raw_amount={}",
-                        signal.mint,
-                        signal.slot,
-                        signal.signature,
-                        sol_amount,
-                        config.axion.min_sol,
-                        volume_source,
-                        signal.side.unwrap_or("unknown"),
-                        signal
-                            .raw_amount
-                            .map(|amount| amount.to_string())
-                            .unwrap_or_else(|| "unknown".to_string())
-                    );
-                    return Ok(());
-                }
-                if config.axion.cooldown_ms > 0 {
-                    let now = Instant::now();
-                    if let Some(last_trigger) = last_trigger_by_mint.get(&signal.mint) {
-                        if now.duration_since(*last_trigger)
-                            < Duration::from_millis(config.axion.cooldown_ms)
-                        {
-                            tracing::debug!(
-                                "rabbitstream axion trigger skipped: mint={} slot={} sig={} reason=cooldown cooldown_ms={}",
-                                signal.mint,
-                                signal.slot,
-                                signal.signature,
-                                config.axion.cooldown_ms
-                            );
+        // Dedupe/cooldown state must survive across reconnects so we don't
+        // double-process signals that arrive while a stream is being rebuilt.
+        let seen_signatures = Arc::new(Mutex::new(HashSet::<String>::new()));
+        let seen_signature_order = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let last_trigger_by_mint = Arc::new(Mutex::new(HashMap::<Pubkey, Instant>::new()));
+
+        const INITIAL_BACKOFF_MS: u64 = 250;
+        const MAX_BACKOFF_MS: u64 = 30_000;
+        // If the stream stays connected at least this long we treat it as a
+        // healthy session and reset the backoff on the next reconnect.
+        const HEALTHY_UPTIME_MS: u128 = 30_000;
+        let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
+
+        loop {
+            let plan_iter = plan.clone();
+            let axion_program_iter = axion_program;
+            let allowed_mints_iter = allowed_mints.clone();
+            let config_iter = config.clone();
+            let rpc_client_iter = rpc_client.clone();
+            let blockhash_cache_iter = blockhash_cache.clone();
+            let route_execution_cache_iter = route_execution_cache.clone();
+            let wallet_iter = wallet.clone();
+            let registry_iter = registry.clone();
+            let helius_sender_iter = helius_sender.clone();
+            let seen_signatures_iter = seen_signatures.clone();
+            let seen_signature_order_iter = seen_signature_order.clone();
+            let last_trigger_by_mint_iter = last_trigger_by_mint.clone();
+
+            let started_at = Instant::now();
+            let result = run_axion_trigger_stream(
+                plan_iter,
+                axion_program_iter,
+                allowed_mints_iter,
+                move |signal| {
+                    let trigger_received_at = Instant::now();
+                    {
+                        let mut seen = seen_signatures_iter
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("seen_signatures mutex poisoned"))?;
+                        if !seen.insert(signal.signature.clone()) {
                             return Ok(());
                         }
+                        let mut order = seen_signature_order_iter.lock().map_err(|_| {
+                            anyhow::anyhow!("seen_signature_order mutex poisoned")
+                        })?;
+                        order.push_back(signal.signature.clone());
+                        while order.len() > 4096 {
+                            if let Some(old_signature) = order.pop_front() {
+                                seen.remove(&old_signature);
+                            }
+                        }
                     }
-                    last_trigger_by_mint.insert(signal.mint, now);
-                }
-                let config = config.clone();
-                let rpc_client = rpc_client.clone();
-                let blockhash_cache = blockhash_cache.clone();
-                let route_execution_cache = route_execution_cache.clone();
-                let wallet = wallet.clone();
-                let registry = registry.clone();
-                let helius_sender = helius_sender.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = process_axion_trigger(
-                        config,
-                        rpc_client,
-                        blockhash_cache,
-                        route_execution_cache,
-                        wallet,
-                        registry,
-                        helius_sender,
-                        signal,
-                        sol_amount,
-                        volume_source,
-                        trigger_received_at,
-                    )
-                    .await
-                    {
-                        tracing::error!("trigger processing failed: {}", error);
+                    let (sol_amount, volume_source) = adjusted_trigger_sol_amount(
+                        &config_iter,
+                        registry_iter.as_ref(),
+                        signal.mint,
+                        signal.sol_amount,
+                        signal.volume_source,
+                        signal.side,
+                        signal.raw_amount,
+                    )?;
+                    if sol_amount < config_iter.axion.min_sol {
+                        tracing::debug!(
+                            "rabbitstream axion trigger filtered: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={} side={} raw_amount={}",
+                            signal.mint,
+                            signal.slot,
+                            signal.signature,
+                            sol_amount,
+                            config_iter.axion.min_sol,
+                            volume_source,
+                            signal.side.unwrap_or("unknown"),
+                            signal
+                                .raw_amount
+                                .map(|amount| amount.to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        );
+                        return Ok(());
                     }
-                });
-                Ok(())
-            })
+                    if config_iter.axion.cooldown_ms > 0 {
+                        let now = Instant::now();
+                        let mut cooldown = last_trigger_by_mint_iter.lock().map_err(|_| {
+                            anyhow::anyhow!("last_trigger_by_mint mutex poisoned")
+                        })?;
+                        if let Some(last_trigger) = cooldown.get(&signal.mint) {
+                            if now.duration_since(*last_trigger)
+                                < Duration::from_millis(config_iter.axion.cooldown_ms)
+                            {
+                                tracing::debug!(
+                                    "rabbitstream axion trigger skipped: mint={} slot={} sig={} reason=cooldown cooldown_ms={}",
+                                    signal.mint,
+                                    signal.slot,
+                                    signal.signature,
+                                    config_iter.axion.cooldown_ms
+                                );
+                                return Ok(());
+                            }
+                        }
+                        cooldown.insert(signal.mint, now);
+                    }
+                    let config = config_iter.clone();
+                    let rpc_client = rpc_client_iter.clone();
+                    let blockhash_cache = blockhash_cache_iter.clone();
+                    let route_execution_cache = route_execution_cache_iter.clone();
+                    let wallet = wallet_iter.clone();
+                    let registry = registry_iter.clone();
+                    let helius_sender = helius_sender_iter.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = process_axion_trigger(
+                            config,
+                            rpc_client,
+                            blockhash_cache,
+                            route_execution_cache,
+                            wallet,
+                            registry,
+                            helius_sender,
+                            signal,
+                            sol_amount,
+                            volume_source,
+                            trigger_received_at,
+                        )
+                        .await
+                        {
+                            tracing::error!("trigger processing failed: {}", error);
+                        }
+                    });
+                    Ok(())
+                },
+            )
             .await;
-        if let Err(error) = result {
-            tracing::error!(
-                "RabbitStream Axion trigger worker stopped: url={} error={}",
-                url,
-                error
-            );
+
+            let uptime_ms = started_at.elapsed().as_millis();
+            if uptime_ms >= HEALTHY_UPTIME_MS {
+                backoff_ms = INITIAL_BACKOFF_MS;
+            }
+
+            match result {
+                Ok(()) => {
+                    tracing::warn!(
+                        "RabbitStream Axion trigger stream ended: url={} uptime_ms={} reconnect_in_ms={}",
+                        url,
+                        uptime_ms,
+                        backoff_ms
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        "RabbitStream Axion trigger stream error: url={} uptime_ms={} reconnect_in_ms={} error={}",
+                        url,
+                        uptime_ms,
+                        backoff_ms,
+                        error
+                    );
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(MAX_BACKOFF_MS);
         }
     });
 
@@ -1095,18 +1158,36 @@ async fn run_single_geyser_account_worker(
             }
         };
 
+        // Step 1: snapshot the allowlist under a brief lock so we can drop it
+        // before running enrichment RPCs. This prevents the registry mutex from
+        // being held during any I/O.
+        let allowed_mints: Vec<Pubkey> = {
+            let registry = registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
+            registry.allowed_mints().collect()
+        };
+
+        let slot = update.slot;
+
+        // Step 2: parse + enrich the update WITHOUT holding the registry lock.
+        // Any RPC calls performed by the enricher happen here.
+        let plan = prepare_pool_account_update(
+            &allowed_mints,
+            &update,
+            |token_vault, base_vault| enricher.pump_vault_liquidity(token_vault, base_vault),
+            |base_vault| enricher.base_vault_liquidity(base_vault),
+            |mint| enricher.mint_uses_token_2022(mint),
+            |pair| enricher.dlmm_bitmap_extension(pair),
+        )?;
+
+        // Step 3: apply the prepared plan and compute the route action summary
+        // under a short lock (no I/O inside).
         let (report, route_action) = {
             let mut registry = registry
                 .lock()
                 .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
-            let report = apply_pool_account_update(
-                &mut registry,
-                update,
-                |token_vault, base_vault| enricher.pump_vault_liquidity(token_vault, base_vault),
-                |base_vault| enricher.base_vault_liquidity(base_vault),
-                |mint| enricher.mint_uses_token_2022(mint),
-                |pair| enricher.dlmm_bitmap_extension(pair),
-            )?;
+            let report = apply_prepared_pool_update(&mut registry, plan, slot);
             let route_action = if report.applied {
                 report.applied_mint.and_then(|mint| {
                     registry.get(&mint).map(|state| {
@@ -1738,24 +1819,15 @@ fn pack_execution_route_groups(
     now_ms: u128,
     alt_addresses: Option<&HashSet<Pubkey>>,
 ) -> Vec<RouteGroup<PumpRouteState, DlmmRouteState>> {
-    let route_groups = pack_with_optional_alt_filter(
-        packer,
-        mint_state,
-        min_base_liquidity_lamports,
-        max_state_age_ms,
-        now_ms,
-        alt_addresses,
-    );
-    if !route_groups.is_empty() {
-        return route_groups;
-    }
-
-    // Do not drop a trigger only because one side of a known route missed the short freshness window.
+    // Honor `max_state_age_ms` strictly: if all pool states are stale we return
+    // no route groups. Previously a `u64::MAX` fallback re-admitted stale pools
+    // to avoid dropping triggers, but this defeated the freshness filter and
+    // produced execution attempts against known-stale state.
     pack_with_optional_alt_filter(
         packer,
         mint_state,
         min_base_liquidity_lamports,
-        u64::MAX,
+        max_state_age_ms,
         now_ms,
         alt_addresses,
     )

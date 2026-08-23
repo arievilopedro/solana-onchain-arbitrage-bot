@@ -3,7 +3,9 @@
 use crate::dex::meteora::constants::dlmm_program_id;
 use crate::dex::pump::pump_program_id;
 use crate::discovery::{dlmm_route_state_from_account, pump_route_state_from_account};
-use crate::registry::{PoolKind, PoolLiquidity, RuntimeRegistry};
+use crate::registry::{
+    DlmmRouteState, PoolKind, PoolLiquidity, PumpRouteState, RuntimeRegistry,
+};
 use solana_program::pubkey::Pubkey;
 use solana_sdk::account::Account;
 use std::collections::VecDeque;
@@ -80,6 +82,172 @@ pub struct RegistryUpdateReport {
     pub ignored_non_sol_route: bool,
 }
 
+/// Result of parsing + enriching a pool account update without holding the
+/// registry lock. Produced by `prepare_pool_account_update` and consumed by
+/// `apply_prepared_pool_update`.
+#[derive(Debug)]
+pub enum PoolUpdatePlan {
+    Pump {
+        mint: Pubkey,
+        route: PumpRouteState,
+        applied_pool: Pubkey,
+        applied_base_liquidity_lamports: Option<u64>,
+    },
+    Dlmm {
+        mint: Pubkey,
+        route: DlmmRouteState,
+        applied_pool: Pubkey,
+        applied_base_liquidity_lamports: Option<u64>,
+    },
+    NotAllowlisted,
+    NotPoolAccount,
+    NotPoolProgram,
+}
+
+/// Parse a pool account update and run any enrichment RPCs. This function does
+/// not touch the runtime registry, so it can (and should) be called without
+/// holding the registry lock. Enrichment RPCs execute here.
+pub fn prepare_pool_account_update(
+    allowed_mints: &[Pubkey],
+    update: &PoolAccountUpdate,
+    pump_liquidity: impl Fn(Pubkey, Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
+    base_liquidity: impl Fn(Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
+    mint_uses_token_2022: impl Fn(Pubkey) -> anyhow::Result<bool>,
+    dlmm_bitmap_extension: impl Fn(Pubkey) -> anyhow::Result<Option<Pubkey>>,
+) -> anyhow::Result<PoolUpdatePlan> {
+    if update.owner == pump_program_id() {
+        for mint in allowed_mints {
+            let route = match pump_route_state_from_account(
+                *mint,
+                update.pubkey,
+                &update.account,
+                |token_vault, base_vault| pump_liquidity(token_vault, base_vault),
+            ) {
+                Ok(Some(mut route)) => {
+                    route.last_update_slot = update.slot;
+                    route
+                }
+                Ok(None) => continue,
+                Err(_) => return Ok(PoolUpdatePlan::NotPoolAccount),
+            };
+            let applied_pool = route.pool;
+            let applied_base_liquidity_lamports =
+                route.liquidity.map(|liquidity| liquidity.base_lamports);
+            return Ok(PoolUpdatePlan::Pump {
+                mint: *mint,
+                route,
+                applied_pool,
+                applied_base_liquidity_lamports,
+            });
+        }
+        return Ok(PoolUpdatePlan::NotAllowlisted);
+    }
+
+    if update.owner == dlmm_program_id() {
+        for mint in allowed_mints {
+            let route = match dlmm_route_state_from_account(
+                *mint,
+                update.pubkey,
+                &update.account,
+                |base_vault| base_liquidity(base_vault),
+                |pair| dlmm_bitmap_extension(pair),
+                |m| mint_uses_token_2022(m),
+            ) {
+                Ok(Some(mut route)) => {
+                    route.last_update_slot = update.slot;
+                    route
+                }
+                Ok(None) => continue,
+                Err(_) => return Ok(PoolUpdatePlan::NotPoolAccount),
+            };
+            let applied_pool = route.lb_pair;
+            let applied_base_liquidity_lamports =
+                route.liquidity.map(|liquidity| liquidity.base_lamports);
+            return Ok(PoolUpdatePlan::Dlmm {
+                mint: *mint,
+                route,
+                applied_pool,
+                applied_base_liquidity_lamports,
+            });
+        }
+        return Ok(PoolUpdatePlan::NotAllowlisted);
+    }
+
+    Ok(PoolUpdatePlan::NotPoolProgram)
+}
+
+/// Commit a previously-prepared update into the registry. Must be called under
+/// the registry lock. Performs only in-memory mutation; no I/O.
+pub fn apply_prepared_pool_update(
+    registry: &mut RuntimeRegistry,
+    plan: PoolUpdatePlan,
+    slot: u64,
+) -> RegistryUpdateReport {
+    match plan {
+        PoolUpdatePlan::Pump {
+            mint,
+            route,
+            applied_pool,
+            applied_base_liquidity_lamports,
+        } => {
+            let Some(state) = registry.get_mut(&mint) else {
+                return RegistryUpdateReport {
+                    ignored_missing_mint_state: true,
+                    ..RegistryUpdateReport::default()
+                };
+            };
+            upsert_pump(&mut state.pump, route);
+            state.updated_slot = slot;
+            RegistryUpdateReport {
+                applied: true,
+                applied_kind: Some(PoolKind::Pump),
+                applied_mint: Some(mint),
+                applied_pool: Some(applied_pool),
+                applied_base_liquidity_lamports,
+                ..RegistryUpdateReport::default()
+            }
+        }
+        PoolUpdatePlan::Dlmm {
+            mint,
+            route,
+            applied_pool,
+            applied_base_liquidity_lamports,
+        } => {
+            let Some(state) = registry.get_mut(&mint) else {
+                return RegistryUpdateReport {
+                    ignored_missing_mint_state: true,
+                    ..RegistryUpdateReport::default()
+                };
+            };
+            upsert_dlmm(&mut state.dlmms, route);
+            state.updated_slot = slot;
+            RegistryUpdateReport {
+                applied: true,
+                applied_kind: Some(PoolKind::MeteoraDlmm),
+                applied_mint: Some(mint),
+                applied_pool: Some(applied_pool),
+                applied_base_liquidity_lamports,
+                ..RegistryUpdateReport::default()
+            }
+        }
+        PoolUpdatePlan::NotAllowlisted => RegistryUpdateReport {
+            ignored_not_allowlisted: true,
+            ..RegistryUpdateReport::default()
+        },
+        PoolUpdatePlan::NotPoolAccount => RegistryUpdateReport {
+            ignored_not_pool_account: true,
+            ..RegistryUpdateReport::default()
+        },
+        PoolUpdatePlan::NotPoolProgram => RegistryUpdateReport {
+            ignored_not_pool_program: true,
+            ..RegistryUpdateReport::default()
+        },
+    }
+}
+
+/// Backwards-compatible wrapper: parse+enrich under the caller's lock. Prefer
+/// `prepare_pool_account_update` + `apply_prepared_pool_update` in the hot path
+/// so that enrichment RPCs run without holding the registry lock.
 pub fn apply_pool_account_update(
     registry: &mut RuntimeRegistry,
     update: PoolAccountUpdate,
@@ -88,130 +256,17 @@ pub fn apply_pool_account_update(
     mint_uses_token_2022: impl Fn(Pubkey) -> anyhow::Result<bool>,
     dlmm_bitmap_extension: impl Fn(Pubkey) -> anyhow::Result<Option<Pubkey>>,
 ) -> anyhow::Result<RegistryUpdateReport> {
-    if update.owner == pump_program_id() {
-        return apply_pump_update(registry, update, pump_liquidity);
-    }
-
-    if update.owner == dlmm_program_id() {
-        return apply_dlmm_update(
-            registry,
-            update,
-            base_liquidity,
-            mint_uses_token_2022,
-            dlmm_bitmap_extension,
-        );
-    }
-
-    Ok(RegistryUpdateReport {
-        ignored_not_pool_program: true,
-        ..RegistryUpdateReport::default()
-    })
-}
-
-fn apply_pump_update(
-    registry: &mut RuntimeRegistry,
-    update: PoolAccountUpdate,
-    liquidity: impl Fn(Pubkey, Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
-) -> anyhow::Result<RegistryUpdateReport> {
-    for mint in registry.allowed_mints().collect::<Vec<_>>() {
-        let route = match pump_route_state_from_account(
-            mint,
-            update.pubkey,
-            &update.account,
-            |token_vault, base_vault| liquidity(token_vault, base_vault),
-        ) {
-            Ok(Some(route)) => route,
-            Ok(None) => continue,
-            Err(_) => {
-                return Ok(RegistryUpdateReport {
-                    ignored_not_pool_account: true,
-                    ..RegistryUpdateReport::default()
-                });
-            }
-        };
-        let mut route = route;
-
-        route.last_update_slot = update.slot;
-        let applied_pool = route.pool;
-        let applied_base_liquidity_lamports =
-            route.liquidity.map(|liquidity| liquidity.base_lamports);
-        let Some(state) = registry.get_mut(&mint) else {
-            return Ok(RegistryUpdateReport {
-                ignored_missing_mint_state: true,
-                ..RegistryUpdateReport::default()
-            });
-        };
-        upsert_pump(&mut state.pump, route);
-        state.updated_slot = update.slot;
-        return Ok(RegistryUpdateReport {
-            applied: true,
-            applied_kind: Some(PoolKind::Pump),
-            applied_mint: Some(mint),
-            applied_pool: Some(applied_pool),
-            applied_base_liquidity_lamports,
-            ..RegistryUpdateReport::default()
-        });
-    }
-
-    Ok(RegistryUpdateReport {
-        ignored_not_allowlisted: true,
-        ..RegistryUpdateReport::default()
-    })
-}
-
-fn apply_dlmm_update(
-    registry: &mut RuntimeRegistry,
-    update: PoolAccountUpdate,
-    liquidity: impl Fn(Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
-    mint_uses_token_2022: impl Fn(Pubkey) -> anyhow::Result<bool>,
-    dlmm_bitmap_extension: impl Fn(Pubkey) -> anyhow::Result<Option<Pubkey>>,
-) -> anyhow::Result<RegistryUpdateReport> {
-    for mint in registry.allowed_mints().collect::<Vec<_>>() {
-        let route = match dlmm_route_state_from_account(
-            mint,
-            update.pubkey,
-            &update.account,
-            |base_vault| liquidity(base_vault),
-            |pair| dlmm_bitmap_extension(pair),
-            |mint| mint_uses_token_2022(mint),
-        ) {
-            Ok(Some(route)) => route,
-            Ok(None) => continue,
-            Err(_) => {
-                return Ok(RegistryUpdateReport {
-                    ignored_not_pool_account: true,
-                    ..RegistryUpdateReport::default()
-                });
-            }
-        };
-        let mut route = route;
-
-        route.last_update_slot = update.slot;
-        let applied_pool = route.lb_pair;
-        let applied_base_liquidity_lamports =
-            route.liquidity.map(|liquidity| liquidity.base_lamports);
-        let Some(state) = registry.get_mut(&mint) else {
-            return Ok(RegistryUpdateReport {
-                ignored_missing_mint_state: true,
-                ..RegistryUpdateReport::default()
-            });
-        };
-        upsert_dlmm(&mut state.dlmms, route);
-        state.updated_slot = update.slot;
-        return Ok(RegistryUpdateReport {
-            applied: true,
-            applied_kind: Some(PoolKind::MeteoraDlmm),
-            applied_mint: Some(mint),
-            applied_pool: Some(applied_pool),
-            applied_base_liquidity_lamports,
-            ..RegistryUpdateReport::default()
-        });
-    }
-
-    Ok(RegistryUpdateReport {
-        ignored_not_allowlisted: true,
-        ..RegistryUpdateReport::default()
-    })
+    let allowed_mints: Vec<Pubkey> = registry.allowed_mints().collect();
+    let slot = update.slot;
+    let plan = prepare_pool_account_update(
+        &allowed_mints,
+        &update,
+        pump_liquidity,
+        base_liquidity,
+        mint_uses_token_2022,
+        dlmm_bitmap_extension,
+    )?;
+    Ok(apply_prepared_pool_update(registry, plan, slot))
 }
 
 fn upsert_pump(
