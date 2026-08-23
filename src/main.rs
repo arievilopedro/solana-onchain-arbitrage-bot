@@ -1517,6 +1517,7 @@ fn prepare_route_runtime_accounts_for_mint(
         config.execution.min_pool_base_liquidity_lamports,
         config.execution.max_pool_state_age_ms,
         now_ms,
+        None,
     );
     let mut prepared = 0usize;
     let mut seen_atas = HashSet::<Pubkey>::new();
@@ -1595,6 +1596,7 @@ fn compile_controlled_mint_routes(
         config.execution.min_pool_base_liquidity_lamports,
         config.execution.max_pool_state_age_ms,
         now_ms,
+        None,
     );
 
     for route in route_groups {
@@ -1640,28 +1642,31 @@ fn compile_controlled_mint_routes_cached(
 
     let now_ms = now_ms();
     let mut compilation = ControlledMintCompilation::default();
+
+    // Resolve the route shard ALT up-front so we can (a) filter DLMMs to those
+    // actually addressable via the ALT and (b) avoid re-resolving inside the loop.
+    let Some(shard) = route_execution_cache.route_resolver.shard_for_mint(mint)? else {
+        compilation.summary.missing_route_shard += 1;
+        return Ok(compilation);
+    };
+    let Some(route_alt) = route_execution_cache.route_alts.get(&shard) else {
+        compilation.summary.missing_route_shard += 1;
+        return Ok(compilation);
+    };
+    let alt_addresses: HashSet<Pubkey> = route_alt.addresses.iter().copied().collect();
+    let lookup_tables = lookup_tables_for_route(&route_execution_cache.protocol_alt, route_alt);
+
     let route_groups = pack_execution_route_groups(
         &route_execution_cache.packer,
         mint_state,
         config.execution.min_pool_base_liquidity_lamports,
         config.execution.max_pool_state_age_ms,
         now_ms,
+        Some(&alt_addresses),
     );
 
     for route in route_groups {
         compilation.summary.routes += 1;
-        let Some(shard) = route_execution_cache
-            .route_resolver
-            .shard_for_mint(route.mint)?
-        else {
-            compilation.summary.missing_route_shard += 1;
-            continue;
-        };
-        let Some(route_alt) = route_execution_cache.route_alts.get(&shard) else {
-            compilation.summary.missing_route_shard += 1;
-            continue;
-        };
-        let lookup_tables = lookup_tables_for_route(&route_execution_cache.protocol_alt, route_alt);
         let params = controlled_execution_params_with_tip(
             config,
             route_execution_cache.params.sender_tip.clone(),
@@ -1717,19 +1722,99 @@ fn pack_execution_route_groups(
     min_base_liquidity_lamports: u64,
     max_state_age_ms: u64,
     now_ms: u128,
+    alt_addresses: Option<&HashSet<Pubkey>>,
 ) -> Vec<RouteGroup<PumpRouteState, DlmmRouteState>> {
-    let route_groups = packer.pack_mint_state(
+    let route_groups = pack_with_optional_alt_filter(
+        packer,
         mint_state,
         min_base_liquidity_lamports,
         max_state_age_ms,
         now_ms,
+        alt_addresses,
     );
     if !route_groups.is_empty() {
         return route_groups;
     }
 
     // Do not drop a trigger only because one side of a known route missed the short freshness window.
-    packer.pack_mint_state(mint_state, min_base_liquidity_lamports, u64::MAX, now_ms)
+    pack_with_optional_alt_filter(
+        packer,
+        mint_state,
+        min_base_liquidity_lamports,
+        u64::MAX,
+        now_ms,
+        alt_addresses,
+    )
+}
+
+#[cfg(feature = "geyser")]
+fn pack_with_optional_alt_filter(
+    packer: &FixedDlmmRoutePacker,
+    mint_state: &solana_onchain_arbitrage_bot::registry::MintRuntimeState,
+    min_base_liquidity_lamports: u64,
+    max_state_age_ms: u64,
+    now_ms: u128,
+    alt_addresses: Option<&HashSet<Pubkey>>,
+) -> Vec<RouteGroup<PumpRouteState, DlmmRouteState>> {
+    let Some(alt) = alt_addresses else {
+        return packer.pack_mint_state(
+            mint_state,
+            min_base_liquidity_lamports,
+            max_state_age_ms,
+            now_ms,
+        );
+    };
+
+    // Filtered path: drop DLMMs whose critical accounts are not in the route
+    // shard ALT. Without this filter those DLMMs land in the tx as static
+    // 32-byte keys and push the tx past the 1232-byte wire limit, causing
+    // Helius to reject with `base64 encoded too large`.
+    let Some(pump) = mint_state
+        .eligible_pumps(min_base_liquidity_lamports, max_state_age_ms, now_ms)
+        .into_iter()
+        .next()
+        .cloned()
+    else {
+        return Vec::new();
+    };
+
+    let eligible_dlmms =
+        mint_state.eligible_dlmms(min_base_liquidity_lamports, max_state_age_ms, now_ms);
+    let total_eligible = eligible_dlmms.len();
+    let filtered: Vec<DlmmRouteState> = eligible_dlmms
+        .into_iter()
+        .filter(|dlmm| {
+            alt.contains(&dlmm.lb_pair)
+                && alt.contains(&dlmm.token_vault)
+                && alt.contains(&dlmm.base_vault)
+        })
+        .cloned()
+        .collect();
+
+    if filtered.len() < total_eligible {
+        tracing::debug!(
+            "route shard filter dropped {} dlmm(s) for mint {} (eligible={}, addressable={})",
+            total_eligible - filtered.len(),
+            mint_state.mint,
+            total_eligible,
+            filtered.len(),
+        );
+    }
+
+    if filtered.is_empty() {
+        return Vec::new();
+    }
+
+    packer
+        .pack(&filtered)
+        .into_iter()
+        .filter(|group| !group.is_empty())
+        .map(|dlmms| RouteGroup {
+            mint: mint_state.mint,
+            pump: pump.clone(),
+            dlmms,
+        })
+        .collect()
 }
 
 fn pump_route_atas_to_prepare(
@@ -1833,6 +1918,7 @@ fn live_route_candidate_summary(
         config.execution.min_pool_base_liquidity_lamports,
         config.execution.max_pool_state_age_ms,
         now_ms,
+        None,
     )
     .len();
     if route_groups > 0 && (eligible_pump == 0 || eligible_dlmm == 0) {
