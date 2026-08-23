@@ -7,6 +7,7 @@ pub mod constants;
 pub mod dex;
 pub mod discovery;
 pub mod execution;
+pub mod fomo;
 pub mod metrics;
 pub mod nonce;
 pub mod pool_refreshers;

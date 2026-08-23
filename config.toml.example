@@ -28,6 +28,15 @@ program_id = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9"
 min_sol = 1.0
 cooldown_ms = 0
 
+[fomo]
+# Set true to also treat FOMO/TradeonFomo txs as triggers. Filter is
+# `signer[0] == signer_pubkey AND (touches pump-amm OR Meteora DLMM)`, so
+# router changes (DFLOW / Jupiter V6 / future) don't matter.
+enabled = false
+signer_pubkey = "AgmLJBMDCqWynYnQiPCuj9ewsNNsBJXyzoUhD9LJzN51"
+min_sol = 1.0
+cooldown_ms = 0
+
 [mev]
 program_id = "MEViEnscUm6tsQRoGd9h6nLQaQspKj7DB2M5FwM3Xvz"
 

@@ -434,6 +434,17 @@ async fn run_stream_workers(
     run_rabbitstream_trigger_worker(
         config.clone(),
         rpc_client.clone(),
+        blockhash_cache.clone(),
+        route_execution_cache.clone(),
+        wallet.clone(),
+        registry.clone(),
+        rabbitstream_plan.clone(),
+        allowed_mints.clone(),
+    )?;
+
+    run_fomo_trigger_worker(
+        config.clone(),
+        rpc_client.clone(),
         blockhash_cache,
         route_execution_cache.clone(),
         wallet.clone(),
@@ -657,6 +668,260 @@ fn run_rabbitstream_trigger_worker(
             backoff_ms = (backoff_ms.saturating_mul(2)).min(MAX_BACKOFF_MS);
         }
     });
+
+    Ok(())
+}
+
+#[cfg(feature = "geyser")]
+fn run_fomo_trigger_worker(
+    config: AppConfig,
+    rpc_client: Arc<RpcClient>,
+    blockhash_cache: Arc<BlockhashCache>,
+    route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
+    wallet: Arc<solana_sdk::signature::Keypair>,
+    registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
+    rabbitstream_plan: Option<RabbitStreamPlan>,
+    allowed_mints: Vec<Pubkey>,
+) -> anyhow::Result<()> {
+    use solana_onchain_arbitrage_bot::streams::rabbitstream::yellowstone::run_fomo_trigger_stream;
+    let Some(plan) = rabbitstream_plan else {
+        info!("RabbitStream FOMO trigger worker not started: rabbitstream.enabled=false");
+        return Ok(());
+    };
+    if !config.fomo.enabled {
+        info!(
+            "RabbitStream FOMO trigger worker not started: url={} reason=fomo_disabled",
+            plan.url
+        );
+        return Ok(());
+    }
+    let fomo_signer = Pubkey::from_str(&config.fomo.signer_pubkey)?;
+    let allowed_mints = allowed_mints.into_iter().collect::<HashSet<_>>();
+    let helius_sender = if config.sender.primary == "helius" {
+        HeliusSenderPlan::from_config(&config.sender.helius)?
+            .map(HeliusSenderClient::new)
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(sender) = &helius_sender {
+        sender.start_connection_warmer();
+    }
+    info!(
+        "starting RabbitStream FOMO trigger worker: url={} signer={} allowed_mints={} min_sol={:.6}",
+        plan.url,
+        fomo_signer,
+        allowed_mints.len(),
+        config.fomo.min_sol
+    );
+
+    tokio::spawn(async move {
+        let url = plan.url.clone();
+        let seen_signatures = Arc::new(Mutex::new(HashSet::<String>::new()));
+        let seen_signature_order = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let last_trigger_by_mint = Arc::new(Mutex::new(HashMap::<Pubkey, Instant>::new()));
+
+        const INITIAL_BACKOFF_MS: u64 = 250;
+        const MAX_BACKOFF_MS: u64 = 30_000;
+        const HEALTHY_UPTIME_MS: u128 = 30_000;
+        let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
+
+        loop {
+            let plan_iter = plan.clone();
+            let fomo_signer_iter = fomo_signer;
+            let allowed_mints_iter = allowed_mints.clone();
+            let config_iter = config.clone();
+            let rpc_client_iter = rpc_client.clone();
+            let blockhash_cache_iter = blockhash_cache.clone();
+            let route_execution_cache_iter = route_execution_cache.clone();
+            let wallet_iter = wallet.clone();
+            let registry_iter = registry.clone();
+            let helius_sender_iter = helius_sender.clone();
+            let seen_signatures_iter = seen_signatures.clone();
+            let seen_signature_order_iter = seen_signature_order.clone();
+            let last_trigger_by_mint_iter = last_trigger_by_mint.clone();
+
+            let started_at = Instant::now();
+            let result = run_fomo_trigger_stream(
+                plan_iter,
+                fomo_signer_iter,
+                allowed_mints_iter,
+                move |fomo_signal| {
+                    let trigger_received_at = Instant::now();
+                    {
+                        let mut seen = seen_signatures_iter
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("seen_signatures mutex poisoned"))?;
+                        if !seen.insert(fomo_signal.signature.clone()) {
+                            return Ok(());
+                        }
+                        let mut order = seen_signature_order_iter.lock().map_err(|_| {
+                            anyhow::anyhow!("seen_signature_order mutex poisoned")
+                        })?;
+                        order.push_back(fomo_signal.signature.clone());
+                        while order.len() > 4096 {
+                            if let Some(old_signature) = order.pop_front() {
+                                seen.remove(&old_signature);
+                            }
+                        }
+                    }
+                    let (sol_amount, volume_source) = adjusted_trigger_sol_amount(
+                        &config_iter,
+                        registry_iter.as_ref(),
+                        fomo_signal.mint,
+                        fomo_signal.sol_amount,
+                        fomo_signal.volume_source,
+                        fomo_signal.side,
+                        fomo_signal.raw_amount,
+                    )?;
+                    if sol_amount < config_iter.fomo.min_sol {
+                        tracing::debug!(
+                            "rabbitstream fomo trigger filtered: mint={} slot={} sig={} router={} sol_amount={:.6} min_sol={:.6} volume_source={} side={} raw_amount={}",
+                            fomo_signal.mint,
+                            fomo_signal.slot,
+                            fomo_signal.signature,
+                            fomo_signal.router_kind,
+                            sol_amount,
+                            config_iter.fomo.min_sol,
+                            volume_source,
+                            fomo_signal.side.unwrap_or("unknown"),
+                            fomo_signal
+                                .raw_amount
+                                .map(|amount| amount.to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        );
+                        return Ok(());
+                    }
+                    if config_iter.fomo.cooldown_ms > 0 {
+                        let now = Instant::now();
+                        let mut cooldown = last_trigger_by_mint_iter.lock().map_err(|_| {
+                            anyhow::anyhow!("last_trigger_by_mint mutex poisoned")
+                        })?;
+                        if let Some(last_trigger) = cooldown.get(&fomo_signal.mint) {
+                            if now.duration_since(*last_trigger)
+                                < Duration::from_millis(config_iter.fomo.cooldown_ms)
+                            {
+                                tracing::debug!(
+                                    "rabbitstream fomo trigger skipped: mint={} slot={} sig={} reason=cooldown cooldown_ms={}",
+                                    fomo_signal.mint,
+                                    fomo_signal.slot,
+                                    fomo_signal.signature,
+                                    config_iter.fomo.cooldown_ms
+                                );
+                                return Ok(());
+                            }
+                        }
+                        cooldown.insert(fomo_signal.mint, now);
+                    }
+                    // Convert FomoTriggerSignal → AxionTriggerSignal on the
+                    // boundary so we reuse `process_axion_trigger` untouched.
+                    // Downstream only reads mint/signature/slot/sol_amount/
+                    // volume_source (and partially side/raw_amount); the
+                    // axiom-specific bools are never consumed.
+                    let axion_signal = solana_onchain_arbitrage_bot::axion::AxionTriggerSignal {
+                        signature: fomo_signal.signature.clone(),
+                        slot: fomo_signal.slot,
+                        mint: fomo_signal.mint,
+                        sol_amount: fomo_signal.sol_amount,
+                        volume_source: fomo_signal.volume_source,
+                        side: fomo_signal.side,
+                        raw_amount: fomo_signal.raw_amount,
+                        axion_program_seen: false,
+                        cu_limit_axiom: false,
+                        axiom_alt_seen: false,
+                        axiom_vanity_seen: false,
+                    };
+                    tracing::debug!(
+                        "rabbitstream fomo trigger accepted: mint={} slot={} sig={} router={} sol_amount={:.6}",
+                        fomo_signal.mint,
+                        fomo_signal.slot,
+                        fomo_signal.signature,
+                        fomo_signal.router_kind,
+                        sol_amount
+                    );
+                    let config = config_iter.clone();
+                    let rpc_client = rpc_client_iter.clone();
+                    let blockhash_cache = blockhash_cache_iter.clone();
+                    let route_execution_cache = route_execution_cache_iter.clone();
+                    let wallet = wallet_iter.clone();
+                    let registry = registry_iter.clone();
+                    let helius_sender = helius_sender_iter.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = process_axion_trigger(
+                            config,
+                            rpc_client,
+                            blockhash_cache,
+                            route_execution_cache,
+                            wallet,
+                            registry,
+                            helius_sender,
+                            axion_signal,
+                            sol_amount,
+                            volume_source,
+                            trigger_received_at,
+                        )
+                        .await
+                        {
+                            tracing::error!("fomo trigger processing failed: {}", error);
+                        }
+                    });
+                    Ok(())
+                },
+            )
+            .await;
+
+            let uptime_ms = started_at.elapsed().as_millis();
+            if uptime_ms >= HEALTHY_UPTIME_MS {
+                backoff_ms = INITIAL_BACKOFF_MS;
+            }
+
+            match result {
+                Ok(()) => {
+                    tracing::warn!(
+                        "RabbitStream FOMO trigger stream ended: url={} uptime_ms={} reconnect_in_ms={}",
+                        url,
+                        uptime_ms,
+                        backoff_ms
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        "RabbitStream FOMO trigger stream error: url={} uptime_ms={} reconnect_in_ms={} error={}",
+                        url,
+                        uptime_ms,
+                        backoff_ms,
+                        error
+                    );
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(MAX_BACKOFF_MS);
+        }
+    });
+
+    Ok(())
+}
+
+#[cfg(not(feature = "geyser"))]
+fn run_fomo_trigger_worker(
+    _config: AppConfig,
+    _rpc_client: Arc<RpcClient>,
+    _blockhash_cache: Arc<BlockhashCache>,
+    _route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
+    _wallet: Arc<solana_sdk::signature::Keypair>,
+    _registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
+    rabbitstream_plan: Option<RabbitStreamPlan>,
+    _allowed_mints: Vec<Pubkey>,
+) -> anyhow::Result<()> {
+    if let Some(plan) = rabbitstream_plan {
+        info!(
+            "RabbitStream FOMO worker not started: url={} reason=build_without_geyser_feature",
+            plan.url
+        );
+    } else {
+        info!("RabbitStream FOMO worker not started: rabbitstream.enabled=false");
+    }
 
     Ok(())
 }

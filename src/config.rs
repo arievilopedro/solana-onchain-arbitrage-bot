@@ -62,6 +62,8 @@ pub struct AppConfig {
     pub rabbitstream: StreamEndpointConfig,
     pub runtime: RuntimeConfig,
     pub axion: AxionConfig,
+    #[serde(default)]
+    pub fomo: FomoConfig,
     pub mev: ProgramConfig,
     pub wallet: WalletConfig,
     pub execution: ExecutionConfig,
@@ -102,6 +104,37 @@ pub struct AxionConfig {
     pub program_id: String,
     pub min_sol: f64,
     pub cooldown_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FomoConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_fomo_signer")]
+    pub signer_pubkey: String,
+    #[serde(default = "default_fomo_min_sol")]
+    pub min_sol: f64,
+    #[serde(default)]
+    pub cooldown_ms: u64,
+}
+
+impl Default for FomoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            signer_pubkey: default_fomo_signer(),
+            min_sol: default_fomo_min_sol(),
+            cooldown_ms: 0,
+        }
+    }
+}
+
+fn default_fomo_signer() -> String {
+    "AgmLJBMDCqWynYnQiPCuj9ewsNNsBJXyzoUhD9LJzN51".to_string()
+}
+
+fn default_fomo_min_sol() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -324,6 +357,9 @@ impl AppConfig {
 
     pub fn validate_controlled_v1(&self) -> anyhow::Result<()> {
         validate_pubkey("axion.program_id", &self.axion.program_id)?;
+        if self.fomo.enabled {
+            validate_pubkey("fomo.signer_pubkey", &self.fomo.signer_pubkey)?;
+        }
         validate_pubkey("mev.program_id", &self.mev.program_id)?;
         validate_pubkey(
             "lookup_tables.protocol_alt",

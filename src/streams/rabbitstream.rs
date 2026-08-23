@@ -17,6 +17,8 @@ pub mod yellowstone {
     use super::RabbitStreamPlan;
     use crate::axion::yellowstone::axion_trigger_signals;
     use crate::axion::AxionTriggerSignal;
+    use crate::fomo::yellowstone::fomo_trigger_signals;
+    use crate::fomo::FomoTriggerSignal;
     use futures::{SinkExt, StreamExt};
     use solana_program::pubkey::Pubkey;
     use std::collections::{HashMap, HashSet};
@@ -81,6 +83,74 @@ pub mod yellowstone {
                 txn,
                 info_tx.meta.as_ref(),
                 axion_program,
+                &allowed_mints,
+            ) {
+                on_trigger(signal)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn run_fomo_trigger_stream(
+        plan: RabbitStreamPlan,
+        fomo_signer: Pubkey,
+        allowed_mints: HashSet<Pubkey>,
+        mut on_trigger: impl FnMut(FomoTriggerSignal) -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let mut client = GeyserGrpcClient::build_from_shared(plan.url.clone())?
+            .x_token(Some(plan.x_token.clone()))?
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .connect()
+            .await?;
+
+        let (mut tx, mut stream) = client.subscribe().await?;
+        let mut transactions = HashMap::new();
+        transactions.insert(
+            "fomo-triggers".to_string(),
+            SubscribeRequestFilterTransactions {
+                vote: Some(false),
+                failed: Some(false),
+                signature: None,
+                // Yellowstone `account_include` matches any tx that references
+                // the given account, including as fee-payer signer. The FOMO
+                // wallet is always signer[0], so this catches every FOMO tx
+                // regardless of router (DFLOW/Jupiter V6/future).
+                account_include: vec![fomo_signer.to_string()],
+                account_exclude: vec![],
+                account_required: vec![],
+                ..Default::default()
+            },
+        );
+
+        tx.send(SubscribeRequest {
+            transactions,
+            commitment: Some(CommitmentLevel::Processed as i32),
+            ..Default::default()
+        })
+        .await?;
+
+        while let Some(update) = stream.next().await {
+            let update = update?;
+            let Some(UpdateOneof::Transaction(transaction_update)) = update.update_oneof else {
+                continue;
+            };
+            let Some(info_tx) = transaction_update.transaction else {
+                continue;
+            };
+            if info_tx.meta.as_ref().is_some_and(|meta| meta.err.is_some()) {
+                continue;
+            }
+            let Some(txn) = info_tx.transaction.as_ref() else {
+                continue;
+            };
+            let signature = bs58::encode(info_tx.signature.as_slice()).into_string();
+            for signal in fomo_trigger_signals(
+                signature.clone(),
+                transaction_update.slot,
+                txn,
+                info_tx.meta.as_ref(),
+                fomo_signer,
                 &allowed_mints,
             ) {
                 on_trigger(signal)?;
