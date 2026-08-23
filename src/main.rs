@@ -1643,18 +1643,32 @@ fn compile_controlled_mint_routes_cached(
     let now_ms = now_ms();
     let mut compilation = ControlledMintCompilation::default();
 
-    // Resolve the route shard ALT up-front so we can (a) filter DLMMs to those
-    // actually addressable via the ALT and (b) avoid re-resolving inside the loop.
-    let Some(shard) = route_execution_cache.route_resolver.shard_for_mint(mint)? else {
+    // Resolve every route shard ALT up-front (primary + extensions) so we can
+    // (a) filter DLMMs to those actually addressable via ANY attached ALT and
+    // (b) attach all ALTs to the compiled transaction.
+    let shard_keys = route_execution_cache
+        .route_resolver
+        .shards_for_mint(mint)?;
+    if shard_keys.is_empty() {
         compilation.summary.missing_route_shard += 1;
         return Ok(compilation);
-    };
-    let Some(route_alt) = route_execution_cache.route_alts.get(&shard) else {
-        compilation.summary.missing_route_shard += 1;
-        return Ok(compilation);
-    };
-    let alt_addresses: HashSet<Pubkey> = route_alt.addresses.iter().copied().collect();
-    let lookup_tables = lookup_tables_for_route(&route_execution_cache.protocol_alt, route_alt);
+    }
+    let mut route_alt_refs: Vec<&AddressLookupTableAccount> = Vec::with_capacity(shard_keys.len());
+    for shard in &shard_keys {
+        let Some(alt) = route_execution_cache.route_alts.get(shard) else {
+            compilation.summary.missing_route_shard += 1;
+            return Ok(compilation);
+        };
+        route_alt_refs.push(alt);
+    }
+    let mut alt_addresses: HashSet<Pubkey> = HashSet::new();
+    for alt in &route_alt_refs {
+        alt_addresses.extend(alt.addresses.iter().copied());
+    }
+    let lookup_tables = lookup_tables_for_route_multi(
+        &route_execution_cache.protocol_alt,
+        &route_alt_refs,
+    );
 
     let route_groups = pack_execution_route_groups(
         &route_execution_cache.packer,
@@ -1881,6 +1895,25 @@ fn lookup_tables_for_route(
     } else {
         vec![protocol_alt.clone(), route_alt.clone()]
     }
+}
+
+#[cfg(feature = "geyser")]
+fn lookup_tables_for_route_multi(
+    protocol_alt: &AddressLookupTableAccount,
+    route_alts: &[&AddressLookupTableAccount],
+) -> Vec<AddressLookupTableAccount> {
+    let mut out = Vec::with_capacity(1 + route_alts.len());
+    out.push(protocol_alt.clone());
+    for route_alt in route_alts {
+        if route_alt.key == protocol_alt.key {
+            continue;
+        }
+        if out.iter().any(|existing| existing.key == route_alt.key) {
+            continue;
+        }
+        out.push((*route_alt).clone());
+    }
+    out
 }
 
 #[cfg(feature = "geyser")]

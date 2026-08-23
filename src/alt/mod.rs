@@ -62,6 +62,39 @@ pub struct MintRouteBlockRecord {
     pub shard: String,
     pub base: RouteBaseBlockRecord,
     pub dlmm: Vec<DlmmAltBlockRecord>,
+    /// DLMMs recorded in secondary shards because the primary shard filled up
+    /// before those DLMMs were discovered by the runtime. Empty for v1 state
+    /// files; populated by Fix B when the planner extends into new shards.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<MintRouteExtension>,
+}
+
+impl MintRouteBlockRecord {
+    /// Iterate over every shard this mint touches (primary + extensions),
+    /// in the order they were recorded. Useful for the trigger hot path
+    /// which needs to attach all ALTs to the transaction and union their
+    /// addresses for the Fix A filter.
+    pub fn all_shard_keys(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.shard.as_str())
+            .chain(self.extensions.iter().map(|ext| ext.shard.as_str()))
+    }
+
+    /// True if any known DLMM (primary or extension) has this lb_pair.
+    pub fn contains_dlmm(&self, lb_pair: &Pubkey) -> bool {
+        let target = lb_pair.to_string();
+        self.dlmm.iter().any(|record| record.lb_pair == target)
+            || self.extensions.iter().any(|ext| {
+                ext.dlmm.iter().any(|record| record.lb_pair == target)
+            })
+    }
+}
+
+/// A secondary shard record for a mint whose primary shard filled up. Only
+/// stores DLMM triples (no base); the base always lives in the primary shard.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MintRouteExtension {
+    pub shard: String,
+    pub dlmm: Vec<DlmmAltBlockRecord>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -140,6 +173,49 @@ impl RouteShardStore {
                     anyhow::bail!("mint {} dlmm {} must have 3 indexes", mint, dlmm.lb_pair);
                 }
             }
+            let mut seen_extension_shards: HashSet<&str> = HashSet::new();
+            seen_extension_shards.insert(block.shard.as_str());
+            for extension in &block.extensions {
+                parse_pubkey(&extension.shard)?;
+                if extension.shard == block.shard {
+                    anyhow::bail!(
+                        "mint {} extension duplicates primary shard {}",
+                        mint,
+                        extension.shard
+                    );
+                }
+                if !seen_extension_shards.insert(extension.shard.as_str()) {
+                    anyhow::bail!(
+                        "mint {} has duplicate extension shard {}",
+                        mint,
+                        extension.shard
+                    );
+                }
+                if !self.shards.contains_key(&extension.shard) {
+                    anyhow::bail!(
+                        "mint {} extension references missing shard {}",
+                        mint,
+                        extension.shard
+                    );
+                }
+                if extension.dlmm.is_empty() {
+                    anyhow::bail!(
+                        "mint {} extension shard {} must contain at least one DLMM",
+                        mint,
+                        extension.shard
+                    );
+                }
+                for dlmm in &extension.dlmm {
+                    parse_pubkey(&dlmm.lb_pair)?;
+                    if dlmm.indexes.len() != 3 {
+                        anyhow::bail!(
+                            "mint {} extension dlmm {} must have 3 indexes",
+                            mint,
+                            dlmm.lb_pair
+                        );
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -167,6 +243,13 @@ pub enum PendingRouteShardOperationKind {
     },
     ExtendShard {
         shard: String,
+        mint: String,
+        addresses: Vec<String>,
+    },
+    /// Allocate a brand-new lookup table dedicated to holding additional
+    /// DLMM triples for a mint whose primary (and any prior extension) shard
+    /// is out of capacity. Addresses must contain only DLMM triples.
+    CreateShardExtension {
         mint: String,
         addresses: Vec<String>,
     },
@@ -205,6 +288,18 @@ impl PendingRouteShardOperation {
                     validate_mint_block_addresses(parse_pubkey(mint)?, &addresses)?;
                 }
             }
+            PendingRouteShardOperationKind::CreateShardExtension { mint, addresses } => {
+                parse_pubkey(mint)?;
+                let addresses = parse_pubkeys(addresses)?;
+                if addresses.is_empty() || addresses.len() % 3 != 0 {
+                    anyhow::bail!(
+                        "extension shard addresses must be a non-empty multiple of 3 DLMM triples"
+                    );
+                }
+                for chunk in addresses.chunks(3) {
+                    let _ = stable_dlmm_from_addresses(chunk)?;
+                }
+            }
         }
         Ok(())
     }
@@ -236,6 +331,15 @@ impl PendingRouteShardOperation {
                 Ok(RouteShardInstructions {
                     shard,
                     instructions: vec![extend_ix],
+                })
+            }
+            PendingRouteShardOperationKind::CreateShardExtension { mint: _, addresses } => {
+                let addresses = parse_pubkeys(addresses)?;
+                let (create_ix, shard) = create_lookup_table(authority, payer, recent_slot);
+                let extend_ix = extend_lookup_table(shard, authority, Some(payer), addresses);
+                Ok(RouteShardInstructions {
+                    shard,
+                    instructions: vec![create_ix, extend_ix],
                 })
             }
         }
@@ -276,6 +380,21 @@ impl RouteShardLookupResolver {
             .get(&mint.to_string())
             .map(|block| parse_pubkey(&block.shard))
             .transpose()
+    }
+
+    /// Return every shard a mint has accounts in: primary first, then any
+    /// extension shards in the order they were confirmed. Empty vec if the
+    /// mint has no route block yet.
+    pub fn shards_for_mint(&self, mint: Pubkey) -> anyhow::Result<Vec<Pubkey>> {
+        let Some(block) = self.store.mints.get(&mint.to_string()) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(1 + block.extensions.len());
+        out.push(parse_pubkey(&block.shard)?);
+        for extension in &block.extensions {
+            out.push(parse_pubkey(&extension.shard)?);
+        }
+        Ok(out)
     }
 
     pub fn block_for_mint(&self, mint: Pubkey) -> Option<&MintRouteBlockRecord> {
@@ -357,6 +476,8 @@ pub struct RouteShardIncrementalReport {
     pub mint_blocks: usize,
     pub create_shard: usize,
     pub extend_shard: usize,
+    pub extend_shard_extension: usize,
+    pub create_shard_extension: usize,
     pub skipped_disabled: usize,
     pub attempted: usize,
     pub confirmed: Vec<ConfirmedRouteShardOperation>,
@@ -402,8 +523,8 @@ pub fn maintain_route_shards_incremental(
         planner.store().save(state_file)?;
     }
 
-    for route in routes {
-        let Some(plan) = planner.plan_mint_block(&route)? else {
+    for route in &routes {
+        let Some(plan) = planner.plan_mint_block(route)? else {
             continue;
         };
 
@@ -422,38 +543,120 @@ pub fn maintain_route_shards_incremental(
                 }
                 report.extend_shard += 1;
             }
+            PlannedRouteShardExtension::CreateShardExtension { .. } => {
+                // plan_mint_block never emits CreateShardExtension.
+                anyhow::bail!("plan_mint_block returned unexpected CreateShardExtension");
+            }
         }
         report.mint_blocks += 1;
 
-        let pending = plan.pending_operation();
-        for operation in split_route_shard_operation(pending)? {
-            report.attempted += 1;
-            let blockhash = rpc_client.get_latest_blockhash()?;
-            let (built, tx) = build_simulated_route_shard_transaction(
+        execute_planned_extension(
+            &mut planner,
+            plan,
+            rpc_client,
+            wallet,
+            state_file,
+            recent_slot_candidates,
+            &mut report,
+        )?;
+    }
+
+    // Second pass: for every already-blocked mint whose route reveals new
+    // DLMMs, plan an extension. Loop until no further extension is planned so
+    // very large mints get their tail flushed across multiple iterations.
+    let mut skipped_mints: HashSet<Pubkey> = HashSet::new();
+    loop {
+        let mut made_progress = false;
+        for route in &routes {
+            if skipped_mints.contains(&route.mint) {
+                continue;
+            }
+            let Some(plan) = planner.plan_next_dlmm_extension(route)? else {
+                continue;
+            };
+
+            match &plan {
+                PlannedRouteShardExtension::ExtendShard { .. } => {
+                    if !auto_extend {
+                        report.skipped_disabled += 1;
+                        skipped_mints.insert(route.mint);
+                        continue;
+                    }
+                    report.extend_shard_extension += 1;
+                }
+                PlannedRouteShardExtension::CreateShardExtension { .. } => {
+                    if !auto_create {
+                        report.skipped_disabled += 1;
+                        skipped_mints.insert(route.mint);
+                        continue;
+                    }
+                    report.create_shard_extension += 1;
+                }
+                PlannedRouteShardExtension::CreateShard { .. } => {
+                    // plan_next_dlmm_extension never emits CreateShard.
+                    anyhow::bail!(
+                        "plan_next_dlmm_extension returned unexpected CreateShard"
+                    );
+                }
+            }
+
+            execute_planned_extension(
+                &mut planner,
+                plan,
                 rpc_client,
-                &operation,
                 wallet,
-                blockhash,
+                state_file,
                 recent_slot_candidates,
+                &mut report,
             )?;
-            let signature = rpc_client.send_and_confirm_transaction(&tx)?;
-            let confirmed_slot = rpc_client.get_slot()?;
-            planner.apply_confirmed_operation(&operation, built.shard, confirmed_slot)?;
-            planner.store().save(state_file)?;
-            report.confirmed.push(ConfirmedRouteShardOperation {
-                shard: built.shard,
-                signature,
-                slot: confirmed_slot,
-            });
+            made_progress = true;
+        }
+        if !made_progress {
+            break;
         }
     }
 
     Ok(report)
 }
 
+fn execute_planned_extension(
+    planner: &mut RouteShardPlanner,
+    plan: PlannedRouteShardExtension,
+    rpc_client: &RpcClient,
+    wallet: &Keypair,
+    state_file: &Path,
+    recent_slot_candidates: &[u64],
+    report: &mut RouteShardIncrementalReport,
+) -> anyhow::Result<()> {
+    let pending = plan.pending_operation();
+    for operation in split_route_shard_operation(pending)? {
+        report.attempted += 1;
+        let blockhash = rpc_client.get_latest_blockhash()?;
+        let (built, tx) = build_simulated_route_shard_transaction(
+            rpc_client,
+            &operation,
+            wallet,
+            blockhash,
+            recent_slot_candidates,
+        )?;
+        let signature = rpc_client.send_and_confirm_transaction(&tx)?;
+        let confirmed_slot = rpc_client.get_slot()?;
+        planner.apply_confirmed_operation(&operation, built.shard, confirmed_slot)?;
+        planner.store().save(state_file)?;
+        report.confirmed.push(ConfirmedRouteShardOperation {
+            shard: built.shard,
+            signature,
+            slot: confirmed_slot,
+        });
+    }
+    Ok(())
+}
+
 fn split_route_shard_operation(
     operation: PendingRouteShardOperation,
 ) -> anyhow::Result<Vec<PendingRouteShardOperation>> {
+    // CreateShard and CreateShardExtension are always sized by the planner to
+    // fit in a single tx, so we only ever split ExtendShard here.
     let PendingRouteShardOperationKind::ExtendShard {
         shard,
         mint,
@@ -656,6 +859,12 @@ pub enum PlannedRouteShardExtension {
         addresses: Vec<Pubkey>,
         start_index: u8,
     },
+    /// Create a brand-new lookup table dedicated to holding additional DLMM
+    /// triples for a mint whose known shards are all full.
+    CreateShardExtension {
+        mint: Pubkey,
+        addresses: Vec<Pubkey>,
+    },
 }
 
 impl PlannedRouteShardExtension {
@@ -677,6 +886,12 @@ impl PlannedRouteShardExtension {
                 mint: mint.to_string(),
                 addresses: pubkeys_to_strings(addresses),
             },
+            PlannedRouteShardExtension::CreateShardExtension { mint, addresses } => {
+                PendingRouteShardOperationKind::CreateShardExtension {
+                    mint: mint.to_string(),
+                    addresses: pubkeys_to_strings(addresses),
+                }
+            }
         };
 
         PendingRouteShardOperation {
@@ -831,11 +1046,7 @@ impl RouteShardPlanner {
             anyhow::bail!("mint {} is not allocated in a route shard", mint);
         };
 
-        if block
-            .dlmm
-            .iter()
-            .any(|record| record.lb_pair == dlmm.lb_pair.to_string())
-        {
+        if block.contains_dlmm(&dlmm.lb_pair) {
             return Ok(None);
         }
 
@@ -855,6 +1066,95 @@ impl RouteShardPlanner {
             mint,
             addresses,
             start_index: checked_u8(shard.used)?,
+        }))
+    }
+
+    /// For an already-blocked mint, plan the next batch of DLMMs to append.
+    /// This is the cumulative counterpart to `plan_mint_block`: called each
+    /// maintenance cycle to catch DLMMs discovered after the initial mint
+    /// block was committed. Returns None if the block already contains every
+    /// DLMM in `route`.
+    ///
+    /// Shard selection preference:
+    ///   1. Primary shard if Active with capacity for at least one triple.
+    ///   2. Any existing extension shard for this mint with capacity.
+    ///   3. Any other Active shard in the store with capacity (creates a new
+    ///      extension entry on confirm).
+    ///   4. Otherwise, a brand new `CreateShardExtension` sized to fit as
+    ///      many missing triples as one create+extend tx allows.
+    pub fn plan_next_dlmm_extension(
+        &self,
+        route: &StableMintRouteAccounts,
+    ) -> anyhow::Result<Option<PlannedRouteShardExtension>> {
+        self.ensure_allowed(route.mint)?;
+        let Some(block) = self.store.mints.get(&route.mint.to_string()) else {
+            return Ok(None);
+        };
+
+        // Collect missing DLMMs in the original order to preserve routing
+        // priorities.
+        let missing: Vec<&StableDlmmRouteAccounts> = route
+            .dlmms
+            .iter()
+            .filter(|dlmm| !block.contains_dlmm(&dlmm.lb_pair))
+            .collect();
+        if missing.is_empty() {
+            return Ok(None);
+        }
+
+        // Candidate shards to append to, in preference order.
+        let mut candidate_shard_keys: Vec<String> = Vec::new();
+        candidate_shard_keys.push(block.shard.clone());
+        for ext in &block.extensions {
+            if !candidate_shard_keys.iter().any(|k| k == &ext.shard) {
+                candidate_shard_keys.push(ext.shard.clone());
+            }
+        }
+        // Fall through to any other Active shard the store knows about.
+        for shard_key in self.store.shards.keys() {
+            if !candidate_shard_keys.iter().any(|k| k == shard_key) {
+                candidate_shard_keys.push(shard_key.clone());
+            }
+        }
+
+        for shard_key in &candidate_shard_keys {
+            let Some(record) = self.store.shards.get(shard_key) else {
+                continue;
+            };
+            if record.status != RouteShardStatus::Active {
+                continue;
+            }
+            let remaining_triples = record.remaining_capacity() / 3;
+            if remaining_triples == 0 {
+                continue;
+            }
+            let take = missing.len().min(remaining_triples);
+            let addresses: Vec<Pubkey> = missing[..take]
+                .iter()
+                .flat_map(|dlmm| dlmm.stable_addresses().to_vec())
+                .collect();
+            return Ok(Some(PlannedRouteShardExtension::ExtendShard {
+                shard: parse_pubkey(shard_key)?,
+                mint: route.mint,
+                addresses,
+                start_index: checked_u8(record.used)?,
+            }));
+        }
+
+        // No existing shard has capacity. Create a brand-new extension ALT
+        // sized to fit within a single create+extend tx.
+        let max_triples_per_create = (ROUTE_SHARD_EXTEND_ADDRESSES_PER_TX - 1) / 3;
+        if max_triples_per_create == 0 {
+            anyhow::bail!("ROUTE_SHARD_EXTEND_ADDRESSES_PER_TX too small for CreateShardExtension");
+        }
+        let take = missing.len().min(max_triples_per_create);
+        let addresses: Vec<Pubkey> = missing[..take]
+            .iter()
+            .flat_map(|dlmm| dlmm.stable_addresses().to_vec())
+            .collect();
+        Ok(Some(PlannedRouteShardExtension::CreateShardExtension {
+            mint: route.mint,
+            addresses,
         }))
     }
 
@@ -911,6 +1211,7 @@ impl RouteShardPlanner {
                     indexes: base_indexes,
                 },
                 dlmm: dlmm_records,
+                extensions: Vec::new(),
             },
         );
         self.store.validate()
@@ -922,31 +1223,75 @@ impl RouteShardPlanner {
         dlmm: &StableDlmmRouteAccounts,
         slot: u64,
     ) -> anyhow::Result<()> {
-        self.ensure_allowed(mint)?;
-        let block =
-            self.store.mints.get_mut(&mint.to_string()).ok_or_else(|| {
+        let shard_key = {
+            let block = self.store.mints.get(&mint.to_string()).ok_or_else(|| {
                 anyhow::anyhow!("mint {} is not allocated in a route shard", mint)
             })?;
-        let shard = self
+            parse_pubkey(&block.shard)?
+        };
+        self.apply_confirmed_dlmm_on_shard(shard_key, mint, dlmm, slot)
+    }
+
+    /// Append a new DLMM triple to a mint block on the specified shard. The
+    /// shard may be the mint's primary shard, an existing extension shard, or
+    /// an entirely new extension shard (in which case an extension entry is
+    /// created).
+    pub fn apply_confirmed_dlmm_on_shard(
+        &mut self,
+        shard: Pubkey,
+        mint: Pubkey,
+        dlmm: &StableDlmmRouteAccounts,
+        slot: u64,
+    ) -> anyhow::Result<()> {
+        self.ensure_allowed(mint)?;
+        let shard_key = shard.to_string();
+
+        // Validate the mint block exists and figure out whether the target
+        // shard is the primary shard, an existing extension, or a new
+        // extension.
+        let block = self.store.mints.get(&mint.to_string()).ok_or_else(|| {
+            anyhow::anyhow!("mint {} is not allocated in a route shard", mint)
+        })?;
+        let is_primary = block.shard == shard_key;
+        let existing_extension_idx = block
+            .extensions
+            .iter()
+            .position(|ext| ext.shard == shard_key);
+
+        let shard_record = self
             .store
             .shards
-            .get_mut(&block.shard)
-            .ok_or_else(|| anyhow::anyhow!("mint {} references missing shard", mint))?;
-
-        let start = shard.used;
+            .get_mut(&shard_key)
+            .ok_or_else(|| anyhow::anyhow!("shard {} is not recorded in the store", shard))?;
+        let start = shard_record.used;
         let end = start + 3;
-        if end > shard.capacity {
+        if end > shard_record.capacity {
             anyhow::bail!("confirmed DLMM exceeds route shard capacity");
         }
+        shard_record.used = end;
+        shard_record.last_extended_slot = slot;
+        if shard_record.used == shard_record.capacity {
+            shard_record.status = RouteShardStatus::Full;
+        }
 
-        block.dlmm.push(DlmmAltBlockRecord {
+        let block = self
+            .store
+            .mints
+            .get_mut(&mint.to_string())
+            .expect("mint block existed above");
+        let record = DlmmAltBlockRecord {
             lb_pair: dlmm.lb_pair.to_string(),
             indexes: index_range(start, 3)?,
-        });
-        shard.used = end;
-        shard.last_extended_slot = slot;
-        if shard.used == shard.capacity {
-            shard.status = RouteShardStatus::Full;
+        };
+        if is_primary {
+            block.dlmm.push(record);
+        } else if let Some(idx) = existing_extension_idx {
+            block.extensions[idx].dlmm.push(record);
+        } else {
+            block.extensions.push(MintRouteExtension {
+                shard: shard_key,
+                dlmm: vec![record],
+            });
         }
         self.store.validate()
     }
@@ -985,7 +1330,7 @@ impl RouteShardPlanner {
                     }
                     for chunk in addresses.chunks(3) {
                         let dlmm = stable_dlmm_from_addresses(chunk)?;
-                        self.apply_confirmed_dlmm(mint, &dlmm, slot)?;
+                        self.apply_confirmed_dlmm_on_shard(shard, mint, &dlmm, slot)?;
                     }
                     Ok(())
                 } else {
@@ -999,6 +1344,47 @@ impl RouteShardPlanner {
                     }
                     self.apply_confirmed_mint_block(shard, &route, slot)
                 }
+            }
+            PendingRouteShardOperationKind::CreateShardExtension { mint, addresses } => {
+                let mint = parse_pubkey(mint)?;
+                self.ensure_allowed(mint)?;
+                if !self.store.mints.contains_key(&mint.to_string()) {
+                    anyhow::bail!(
+                        "cannot apply CreateShardExtension for unallocated mint {}",
+                        mint
+                    );
+                }
+                let addresses = parse_pubkeys(addresses)?;
+                if addresses.is_empty() || addresses.len() % 3 != 0 {
+                    anyhow::bail!("CreateShardExtension addresses must be DLMM triples");
+                }
+
+                // Register the newly created shard.
+                let shard_key = confirmed_shard.to_string();
+                let capacity = self.shard_capacity;
+                let shard_record =
+                    self.store
+                        .shards
+                        .entry(shard_key.clone())
+                        .or_insert(RouteShardRecord {
+                            used: 0,
+                            capacity,
+                            created_slot: slot,
+                            last_extended_slot: 0,
+                            status: RouteShardStatus::Active,
+                        });
+                if shard_record.used != 0 {
+                    anyhow::bail!(
+                        "CreateShardExtension target shard {} is not empty",
+                        confirmed_shard
+                    );
+                }
+
+                for chunk in addresses.chunks(3) {
+                    let dlmm = stable_dlmm_from_addresses(chunk)?;
+                    self.apply_confirmed_dlmm_on_shard(confirmed_shard, mint, &dlmm, slot)?;
+                }
+                Ok(())
             }
         }
     }
@@ -1444,5 +1830,258 @@ mod tests {
         assert_eq!(stable.mint, mint);
         assert_eq!(stable.pump_pool, pk(2));
         assert_eq!(stable.dlmms[0].lb_pair, pk(12));
+    }
+
+    /// Schema v2 must accept v1 JSON (no `extensions` field) via serde
+    /// default. Ensures a state file written by an older bot deploys cleanly
+    /// after the upgrade without a migration step.
+    #[test]
+    fn schema_v2_loads_v1_json_without_extensions_field() {
+        let mint = pk(1);
+        let shard = pk(90);
+        let v1_json = format!(
+            r#"{{
+              "version": 1,
+              "active_shard": "{shard}",
+              "shards": {{
+                "{shard}": {{
+                  "used": 10,
+                  "capacity": 256,
+                  "created_slot": 100,
+                  "last_extended_slot": 100,
+                  "status": "active"
+                }}
+              }},
+              "mints": {{
+                "{mint}": {{
+                  "shard": "{shard}",
+                  "base": {{ "indexes": [0, 1, 2, 3] }},
+                  "dlmm": [
+                    {{ "lb_pair": "{}", "indexes": [4, 5, 6] }},
+                    {{ "lb_pair": "{}", "indexes": [7, 8, 9] }}
+                  ]
+                }}
+              }}
+            }}"#,
+            pk(10),
+            pk(20),
+        );
+        let store: RouteShardStore = serde_json::from_str(&v1_json).unwrap();
+        store.validate().unwrap();
+        let block = store.mints.get(&mint.to_string()).unwrap();
+        assert_eq!(block.dlmm.len(), 2);
+        assert!(block.extensions.is_empty());
+    }
+
+    /// When primary shard has capacity for the missing DLMM,
+    /// plan_next_dlmm_extension should ExtendShard into it.
+    #[test]
+    fn plan_next_dlmm_extension_uses_primary_when_it_has_capacity() {
+        let mint = pk(1);
+        let shard = pk(90);
+        let initial = mint_route(mint, 1);
+        let mut planner = RouteShardPlanner::new(RouteShardStore::empty(), [mint], 256).unwrap();
+        planner
+            .apply_confirmed_mint_block(shard, &initial, 100)
+            .unwrap();
+
+        let mut extended = initial.clone();
+        extended.dlmms.push(StableDlmmRouteAccounts {
+            lb_pair: pk(40),
+            token_vault: pk(41),
+            base_vault: pk(42),
+        });
+
+        let plan = planner.plan_next_dlmm_extension(&extended).unwrap().unwrap();
+        match plan {
+            PlannedRouteShardExtension::ExtendShard {
+                shard: got_shard,
+                addresses,
+                start_index,
+                ..
+            } => {
+                assert_eq!(got_shard, shard);
+                assert_eq!(addresses.len(), 3);
+                assert_eq!(start_index, 7);
+            }
+            other => panic!("expected ExtendShard, got {:?}", other),
+        }
+    }
+
+    /// When all Active shards are full, plan_next_dlmm_extension must return
+    /// CreateShardExtension sized to fit in a single create+extend tx.
+    #[test]
+    fn plan_next_dlmm_extension_creates_extension_when_all_shards_full() {
+        let mint = pk(1);
+        let shard = pk(90);
+        // Small capacity so the primary shard fills after the initial block.
+        let initial = mint_route(mint, 1); // uses 7 addresses
+        let mut planner = RouteShardPlanner::new(RouteShardStore::empty(), [mint], 7).unwrap();
+        planner
+            .apply_confirmed_mint_block(shard, &initial, 100)
+            .unwrap();
+        // Primary shard is now full (7/7).
+
+        let mut extended = initial.clone();
+        for i in 0..3 {
+            extended.dlmms.push(StableDlmmRouteAccounts {
+                lb_pair: pk(40 + i * 3),
+                token_vault: pk(41 + i * 3),
+                base_vault: pk(42 + i * 3),
+            });
+        }
+
+        let plan = planner.plan_next_dlmm_extension(&extended).unwrap().unwrap();
+        match plan {
+            PlannedRouteShardExtension::CreateShardExtension {
+                mint: got_mint,
+                addresses,
+            } => {
+                assert_eq!(got_mint, mint);
+                assert!(!addresses.is_empty());
+                assert_eq!(addresses.len() % 3, 0);
+                // Should fit in a single create+extend tx.
+                assert!(addresses.len() <= ROUTE_SHARD_EXTEND_ADDRESSES_PER_TX - 1);
+            }
+            other => panic!("expected CreateShardExtension, got {:?}", other),
+        }
+    }
+
+    /// If every requested DLMM is already recorded (primary or extensions),
+    /// plan_next_dlmm_extension returns None.
+    #[test]
+    fn plan_next_dlmm_extension_returns_none_when_all_dlmms_present() {
+        let mint = pk(1);
+        let shard = pk(90);
+        let route = mint_route(mint, 2);
+        let mut planner = RouteShardPlanner::new(RouteShardStore::empty(), [mint], 256).unwrap();
+        planner
+            .apply_confirmed_mint_block(shard, &route, 100)
+            .unwrap();
+
+        let plan = planner.plan_next_dlmm_extension(&route).unwrap();
+        assert!(plan.is_none());
+    }
+
+    /// Applying a confirmed CreateShardExtension must register the new shard,
+    /// append an extension entry to the mint block, and record the DLMM
+    /// indexes starting at zero in the new shard.
+    #[test]
+    fn apply_confirmed_create_shard_extension_records_extension() {
+        let mint = pk(1);
+        let primary = pk(90);
+        let extension = pk(91);
+        let initial = mint_route(mint, 1);
+        let mut planner = RouteShardPlanner::new(RouteShardStore::empty(), [mint], 7).unwrap();
+        planner
+            .apply_confirmed_mint_block(primary, &initial, 100)
+            .unwrap();
+
+        let new_dlmm = StableDlmmRouteAccounts {
+            lb_pair: pk(40),
+            token_vault: pk(41),
+            base_vault: pk(42),
+        };
+        let plan = PlannedRouteShardExtension::CreateShardExtension {
+            mint,
+            addresses: new_dlmm.stable_addresses().to_vec(),
+        };
+
+        planner
+            .apply_confirmed_operation(&plan.pending_operation(), extension, 101)
+            .unwrap();
+
+        let block = planner.store().mints.get(&mint.to_string()).unwrap();
+        assert_eq!(block.shard, primary.to_string());
+        assert_eq!(block.dlmm.len(), 1);
+        assert_eq!(block.extensions.len(), 1);
+        assert_eq!(block.extensions[0].shard, extension.to_string());
+        assert_eq!(block.extensions[0].dlmm.len(), 1);
+        assert_eq!(block.extensions[0].dlmm[0].lb_pair, pk(40).to_string());
+        assert_eq!(block.extensions[0].dlmm[0].indexes, vec![0, 1, 2]);
+
+        // Extension shard is registered and its used counter advanced.
+        let ext_record = planner.store().shards.get(&extension.to_string()).unwrap();
+        assert_eq!(ext_record.used, 3);
+    }
+
+    /// The resolver must return every shard associated with a mint
+    /// (primary + all extensions) so the hot path can attach them all as
+    /// lookup tables.
+    #[test]
+    fn resolver_returns_primary_and_extension_shards_for_mint() {
+        let mint = pk(1);
+        let primary = pk(90);
+        let extension = pk(91);
+        let initial = mint_route(mint, 1);
+        let mut planner = RouteShardPlanner::new(RouteShardStore::empty(), [mint], 7).unwrap();
+        planner
+            .apply_confirmed_mint_block(primary, &initial, 100)
+            .unwrap();
+        let new_dlmm = StableDlmmRouteAccounts {
+            lb_pair: pk(40),
+            token_vault: pk(41),
+            base_vault: pk(42),
+        };
+        let plan = PlannedRouteShardExtension::CreateShardExtension {
+            mint,
+            addresses: new_dlmm.stable_addresses().to_vec(),
+        };
+        planner
+            .apply_confirmed_operation(&plan.pending_operation(), extension, 101)
+            .unwrap();
+
+        let resolver = RouteShardLookupResolver::new(planner.store().clone()).unwrap();
+        let shards = resolver.shards_for_mint(mint).unwrap();
+        assert_eq!(shards, vec![primary, extension]);
+    }
+
+    /// After a CreateShardExtension is applied, contains_dlmm must recognize
+    /// DLMMs from the extension so subsequent plan_next_dlmm_extension calls
+    /// treat them as already recorded.
+    #[test]
+    fn contains_dlmm_covers_primary_and_extension_records() {
+        let mint = pk(1);
+        let primary = pk(90);
+        let extension = pk(91);
+        let initial = mint_route(mint, 1); // dlmm at pk(10)
+        let mut planner = RouteShardPlanner::new(RouteShardStore::empty(), [mint], 7).unwrap();
+        planner
+            .apply_confirmed_mint_block(primary, &initial, 100)
+            .unwrap();
+        let new_dlmm = StableDlmmRouteAccounts {
+            lb_pair: pk(40),
+            token_vault: pk(41),
+            base_vault: pk(42),
+        };
+        planner
+            .apply_confirmed_operation(
+                &PlannedRouteShardExtension::CreateShardExtension {
+                    mint,
+                    addresses: new_dlmm.stable_addresses().to_vec(),
+                }
+                .pending_operation(),
+                extension,
+                101,
+            )
+            .unwrap();
+
+        let block = planner.store().mints.get(&mint.to_string()).unwrap();
+        assert!(block.contains_dlmm(&pk(10)));
+        assert!(block.contains_dlmm(&pk(40)));
+        assert!(!block.contains_dlmm(&pk(99)));
+
+        // Full route now including both DLMMs must return None.
+        let full_route = StableMintRouteAccounts {
+            mint,
+            pump_pool: initial.pump_pool,
+            pump_token_vault: initial.pump_token_vault,
+            pump_base_vault: initial.pump_base_vault,
+            dlmms: vec![
+                initial.dlmms[0].clone(),
+                new_dlmm.clone(),
+            ],
+        };
+        assert!(planner.plan_next_dlmm_extension(&full_route).unwrap().is_none());
     }
 }
