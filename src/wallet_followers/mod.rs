@@ -15,6 +15,7 @@
 
 use crate::axion::pump_amm_pubkey;
 use crate::config::{WalletFollowerEntry, WalletFollowersConfig};
+use crate::constants::{sol_mint, usd1_mint, usdc_mint};
 use crate::dex::meteora::constants::dlmm_program_id;
 use crate::hot_mints::HotMintTracker;
 use anyhow::Context;
@@ -31,9 +32,26 @@ use solana_transaction_status::{
 };
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep;
+
+/// Common quote tokens that appear as the counterparty in every pump-amm /
+/// DLMM swap (WSOL, USDC, USD1). If we let them into the tracker they
+/// dominate the top-N because every followed trade records them, which then
+/// makes the promoter try to discover WSOL / USDC pools — WSOL alone
+/// returns a >32 MB `getProgramAccounts` reply (RPC -32008) and burns the
+/// budget for the real target mints. Filter at extraction time.
+fn quote_token_mints() -> &'static HashSet<Pubkey> {
+    static CELL: OnceLock<HashSet<Pubkey>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut s = HashSet::new();
+        s.insert(sol_mint());
+        s.insert(usdc_mint());
+        s.insert(usd1_mint());
+        s
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct WalletTarget {
@@ -424,17 +442,22 @@ fn fetch_tx_details(
 }
 
 fn extract_mints_from_meta(meta: &UiTransactionStatusMeta, out: &mut Vec<Pubkey>) {
+    let quote = quote_token_mints();
     if let OptionSerializer::Some(balances) = &meta.post_token_balances {
         for b in balances {
             if let Ok(pk) = Pubkey::from_str(&b.mint) {
-                out.push(pk);
+                if !quote.contains(&pk) {
+                    out.push(pk);
+                }
             }
         }
     }
     if let OptionSerializer::Some(balances) = &meta.pre_token_balances {
         for b in balances {
             if let Ok(pk) = Pubkey::from_str(&b.mint) {
-                out.push(pk);
+                if !quote.contains(&pk) {
+                    out.push(pk);
+                }
             }
         }
     }
@@ -502,6 +525,52 @@ mod tests {
             }],
         };
         assert!(parse_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn quote_token_mints_covers_wsol_usdc_usd1() {
+        let quote = quote_token_mints();
+        assert!(quote.contains(&sol_mint()));
+        assert!(quote.contains(&usdc_mint()));
+        assert!(quote.contains(&usd1_mint()));
+        assert_eq!(quote.len(), 3);
+    }
+
+    #[test]
+    fn extract_mints_drops_quote_tokens_keeps_targets() {
+        use solana_account_decoder::parse_token::UiTokenAmount;
+        use solana_transaction_status::{
+            TransactionStatusMeta, TransactionTokenBalance,
+        };
+
+        let target = "GPzpoXpD74E2C4CJNayuoyBqPQJEsPtdse3nhntrpump";
+        let amount = UiTokenAmount {
+            ui_amount: Some(0.0),
+            decimals: 6,
+            amount: "0".into(),
+            ui_amount_string: "0".into(),
+        };
+        let mk = |mint: &str| TransactionTokenBalance {
+            account_index: 0,
+            mint: mint.into(),
+            ui_token_amount: amount.clone(),
+            owner: String::new(),
+            program_id: String::new(),
+        };
+        let raw = TransactionStatusMeta {
+            post_token_balances: Some(vec![
+                mk(crate::constants::SOL_MINT),
+                mk(target),
+                mk(crate::constants::USDC_MINT),
+            ]),
+            pre_token_balances: Some(vec![mk(crate::constants::USD1_MINT)]),
+            ..TransactionStatusMeta::default()
+        };
+        let meta: UiTransactionStatusMeta = raw.into();
+        let mut out = Vec::new();
+        extract_mints_from_meta(&meta, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], Pubkey::from_str(target).unwrap());
     }
 
     #[test]
