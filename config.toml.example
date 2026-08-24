@@ -57,6 +57,23 @@ enabled = false
 max_signatures = 1000
 budget_ms = 30000
 
+[runtime.wallet_followers]
+# Poll `getSignaturesForAddress` for one or more trader wallets and feed the
+# mints they touched into HotMintTracker. Each new tx that hits any program
+# in `programs` counts as `weight` synthetic hits, so a wallet that trades a
+# mint biases the top-N heavily toward that mint on the next promoter tick.
+# Requires `runtime.hot_mints.enabled=true`.
+enabled = false
+poll_interval_ms = 60000          # per-cycle sleep between full wallet passes
+lookback_signatures = 100         # max signatures fetched per wallet per poll
+weight = 20                       # synthetic hits per matched tx
+programs = ["pump_amm", "dlmm"]   # empty = accept every tx
+
+# Repeat this block for each wallet (1-3 recommended).
+# [[runtime.wallet_followers.wallets]]
+# address = "TraderWalletPubkeyBase58"
+# label = "trader_alpha"
+
 [axion]
 enabled = true
 program_id = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9"

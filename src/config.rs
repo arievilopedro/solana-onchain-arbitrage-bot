@@ -100,6 +100,64 @@ pub struct RuntimeConfig {
     pub hot_mints: HotMintsConfig,
     #[serde(default)]
     pub promoter: PromoterConfig,
+    #[serde(default)]
+    pub wallet_followers: WalletFollowersConfig,
+}
+
+/// Wallet-follower loop: poll `getSignaturesForAddress` for one or more
+/// trader wallets, extract mints from `postTokenBalances`, and feed them
+/// into `HotMintTracker::record_all` weighted by `weight` (equivalent to
+/// N synthetic hits per new tx). Programs listed in `programs` filter
+/// txs — only interactions with those programs count.
+#[derive(Debug, Deserialize, Clone)]
+pub struct WalletFollowersConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_wallet_followers_poll_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_wallet_followers_lookback")]
+    pub lookback_signatures: usize,
+    /// Number of synthetic `record_all` hits injected per new tx observed.
+    #[serde(default = "default_wallet_followers_weight")]
+    pub weight: u32,
+    /// Program aliases: `pump_amm`, `pump`, `dlmm`. Empty = no program filter.
+    #[serde(default = "default_wallet_followers_programs")]
+    pub programs: Vec<String>,
+    #[serde(default)]
+    pub wallets: Vec<WalletFollowerEntry>,
+}
+
+impl Default for WalletFollowersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_ms: default_wallet_followers_poll_ms(),
+            lookback_signatures: default_wallet_followers_lookback(),
+            weight: default_wallet_followers_weight(),
+            programs: default_wallet_followers_programs(),
+            wallets: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WalletFollowerEntry {
+    pub address: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+fn default_wallet_followers_poll_ms() -> u64 {
+    60_000
+}
+fn default_wallet_followers_lookback() -> usize {
+    100
+}
+fn default_wallet_followers_weight() -> u32 {
+    20
+}
+fn default_wallet_followers_programs() -> Vec<String> {
+    vec!["pump_amm".to_string(), "dlmm".to_string()]
 }
 
 /// Promoter (M3b): auto-populate the active allowlist from `HotMintTracker`
@@ -625,6 +683,51 @@ impl AppConfig {
                 anyhow::bail!(
                     "runtime.promoter.coldstart.budget_ms must be > 0 when coldstart enabled"
                 );
+            }
+        }
+
+        if self.runtime.wallet_followers.enabled {
+            if !self.runtime.hot_mints.enabled {
+                anyhow::bail!(
+                    "runtime.wallet_followers.enabled requires runtime.hot_mints.enabled=true"
+                );
+            }
+            if self.runtime.wallet_followers.wallets.is_empty() {
+                anyhow::bail!(
+                    "runtime.wallet_followers.wallets must contain at least one entry when enabled"
+                );
+            }
+            if self.runtime.wallet_followers.poll_interval_ms == 0 {
+                anyhow::bail!(
+                    "runtime.wallet_followers.poll_interval_ms must be > 0 when enabled"
+                );
+            }
+            if self.runtime.wallet_followers.lookback_signatures == 0 {
+                anyhow::bail!(
+                    "runtime.wallet_followers.lookback_signatures must be >= 1 when enabled"
+                );
+            }
+            if self.runtime.wallet_followers.weight == 0 {
+                anyhow::bail!(
+                    "runtime.wallet_followers.weight must be >= 1 when enabled"
+                );
+            }
+            for entry in &self.runtime.wallet_followers.wallets {
+                if entry.address.trim().is_empty() {
+                    anyhow::bail!(
+                        "runtime.wallet_followers.wallets entry has empty address"
+                    );
+                }
+                validate_pubkey("runtime.wallet_followers.wallets.address", &entry.address)?;
+            }
+            for program in &self.runtime.wallet_followers.programs {
+                match program.as_str() {
+                    "pump_amm" | "pump" | "dlmm" => {}
+                    other => anyhow::bail!(
+                        "runtime.wallet_followers.programs contains unknown alias `{}` (expected `pump_amm`, `pump`, or `dlmm`)",
+                        other
+                    ),
+                }
             }
         }
 

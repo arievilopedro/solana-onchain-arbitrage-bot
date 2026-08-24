@@ -41,6 +41,9 @@ use solana_onchain_arbitrage_bot::streams::grpc::GeyserAccountStreamPlan;
 use solana_onchain_arbitrage_bot::streams::rabbitstream::RabbitStreamPlan;
 use solana_onchain_arbitrage_bot::transaction::derive_vault_token_account;
 use solana_onchain_arbitrage_bot::wallet::load_keypair;
+use solana_onchain_arbitrage_bot::wallet_followers::{
+    parse_config as parse_wallet_followers_config, run_wallet_follower_loop,
+};
 use solana_program::program_pack::Pack;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
@@ -300,6 +303,33 @@ async fn main() -> anyhow::Result<()> {
                 report.transaction_errors
             ),
             Err(e) => tracing::warn!(error = %e, "cold-start scan failed; proceeding without seed"),
+        }
+    }
+
+    // Wallet-follower loop: poll `getSignaturesForAddress` for configured
+    // trader wallets and feed the mints they trade into the tracker weighted
+    // by `weight`. No-op when disabled or when the tracker itself is off.
+    if let (Some(tracker), true) = (
+        hot_tracker.as_ref(),
+        config.runtime.wallet_followers.enabled,
+    ) {
+        match parse_wallet_followers_config(&config.runtime.wallet_followers) {
+            Ok(runtime_cfg) => {
+                let tracker = tracker.clone();
+                let rpc = rpc_client.clone();
+                tokio::spawn(async move {
+                    run_wallet_follower_loop(rpc, tracker, runtime_cfg).await;
+                });
+                info!(
+                    "wallet_followers spawned: wallets={} poll_ms={} weight={}",
+                    config.runtime.wallet_followers.wallets.len(),
+                    config.runtime.wallet_followers.poll_interval_ms,
+                    config.runtime.wallet_followers.weight,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "wallet_followers disabled: config parse failed");
+            }
         }
     }
 
