@@ -4,14 +4,14 @@
 //! `HotMintTracker::record_all` weighted by `weight` (equivalent to N
 //! synthetic hits per new tx observed).
 //!
-//! Design goals:
-//! - Simple polling loop; blocking RPC via `tokio::task::spawn_blocking`.
-//! - Bounded memory: per-wallet `seen: HashSet<Signature>` is replaced with
-//!   the current lookback batch on every poll.
-//! - No state persistence: on restart, the first poll may re-record recent
-//!   sigs (idempotent from the tracker's perspective).
-//! - Isolated failures: a single wallet's RPC failure does not abort the
-//!   loop; per-tx failures are logged at debug and skipped.
+//! Two entry points:
+//! - `bootstrap_wallet_followers`: **blocking**, one-shot scan called at
+//!   boot (via `spawn_blocking`). Populates the tracker synchronously so
+//!   the promoter's first tick already sees the wallet's recent mints.
+//!   Returns the per-wallet dedup set that `run_wallet_follower_loop`
+//!   must inherit to avoid reprocessing the same sigs.
+//! - `run_wallet_follower_loop`: **async**, infinite polling loop for
+//!   subsequent cycles.
 
 use crate::axion::pump_amm_pubkey;
 use crate::config::{WalletFollowerEntry, WalletFollowersConfig};
@@ -49,6 +49,30 @@ pub struct WalletFollowerRuntimeConfig {
     pub wallets: Vec<WalletTarget>,
     /// Empty = no program filter (accept every tx).
     pub target_programs: HashSet<Pubkey>,
+}
+
+/// Per-wallet outcome of a single scan cycle (sync or async).
+#[derive(Debug, Clone, Default)]
+pub struct WalletScanOutcome {
+    pub signatures_seen: usize,
+    pub new_signatures: usize,
+    pub matched_transactions: usize,
+    pub mints_recorded: usize,
+    pub tx_errors: usize,
+    /// Full current batch of sigs so the caller can seed dedup for the
+    /// next cycle.
+    pub current_batch: HashSet<Signature>,
+}
+
+/// Aggregate report returned by `bootstrap_wallet_followers`.
+#[derive(Debug, Clone, Default)]
+pub struct WalletFollowerBootstrapReport {
+    pub wallets_scanned: usize,
+    pub signatures_examined: usize,
+    pub matched_transactions: usize,
+    pub mints_recorded: usize,
+    /// Per-wallet dedup sets. Feed into `run_wallet_follower_loop`.
+    pub seen: HashMap<Pubkey, HashSet<Signature>>,
 }
 
 /// Parse the raw TOML config into a validated runtime shape.
@@ -96,14 +120,67 @@ fn parse_wallet(entry: &WalletFollowerEntry) -> anyhow::Result<WalletTarget> {
     Ok(WalletTarget { address, label })
 }
 
-/// Main entry: infinite loop. Each iteration polls every configured wallet
-/// in sequence, feeds new mints into the tracker, then sleeps
+/// Blocking one-shot scan of every configured wallet. Called at boot from
+/// `tokio::task::spawn_blocking` so the tracker is populated **before** the
+/// promoter's first tick, letting it promote the wallet's recent mints
+/// immediately instead of waiting one `tick_ms` for the async loop.
+pub fn bootstrap_wallet_followers(
+    rpc: &RpcClient,
+    tracker: &HotMintTracker,
+    cfg: &WalletFollowerRuntimeConfig,
+) -> anyhow::Result<WalletFollowerBootstrapReport> {
+    let mut report = WalletFollowerBootstrapReport::default();
+    if cfg.wallets.is_empty() {
+        return Ok(report);
+    }
+
+    let empty: HashSet<Signature> = HashSet::new();
+    for target in &cfg.wallets {
+        report.wallets_scanned += 1;
+        match process_wallet_sync(rpc, target, cfg, &empty, tracker) {
+            Ok(outcome) => {
+                report.signatures_examined += outcome.signatures_seen;
+                report.matched_transactions += outcome.matched_transactions;
+                report.mints_recorded += outcome.mints_recorded;
+                report.seen.insert(target.address, outcome.current_batch);
+
+                tracing::info!(
+                    wallet = %target.address,
+                    label = %target.label,
+                    signatures = outcome.signatures_seen,
+                    matched = outcome.matched_transactions,
+                    mints = outcome.mints_recorded,
+                    tx_errors = outcome.tx_errors,
+                    "wallet_followers bootstrap: wallet scan complete"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    wallet = %target.address,
+                    label = %target.label,
+                    error = %err,
+                    "wallet_followers bootstrap: wallet scan failed"
+                );
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// Main async entry: infinite loop. Each iteration polls every configured
+/// wallet in sequence, feeds new mints into the tracker, then sleeps
 /// `poll_interval`. Blocking RPC calls are dispatched via `spawn_blocking`
-/// so this can run on the shared tokio runtime.
+/// so this runs on the shared tokio runtime.
+///
+/// `initial_seen` should be the `WalletFollowerBootstrapReport::seen` map
+/// from the bootstrap phase so we don't re-record the sigs we already
+/// processed synchronously.
 pub async fn run_wallet_follower_loop(
     rpc: Arc<RpcClient>,
     tracker: Arc<HotMintTracker>,
     cfg: WalletFollowerRuntimeConfig,
+    initial_seen: HashMap<Pubkey, HashSet<Signature>>,
 ) {
     if cfg.wallets.is_empty() {
         tracing::warn!("wallet_followers: no wallets configured, exiting");
@@ -116,18 +193,27 @@ pub async fn run_wallet_follower_loop(
         lookback = cfg.lookback_signatures,
         weight = cfg.weight,
         target_programs = cfg.target_programs.len(),
+        seeded_wallets = initial_seen.len(),
         "wallet_followers: starting loop"
     );
 
     // Per-wallet dedup: last batch of sigs we already processed. Replaced
     // (not merged) on every poll so memory stays bounded at
     // `lookback_signatures` entries per wallet.
-    let mut seen: HashMap<Pubkey, HashSet<Signature>> = HashMap::new();
+    let mut seen: HashMap<Pubkey, HashSet<Signature>> = initial_seen;
 
     loop {
+        // Sleep FIRST when we already had a bootstrap; otherwise the loop
+        // would re-scan the same sigs immediately. `seen` non-empty means
+        // bootstrap ran; empty means either no bootstrap or bootstrap
+        // returned nothing (fresh wallet).
+        if !seen.is_empty() {
+            sleep(cfg.poll_interval).await;
+        }
+
         for target in &cfg.wallets {
             let previous = seen.entry(target.address).or_default().clone();
-            match poll_wallet(&rpc, target, &cfg, &previous, &tracker).await {
+            match poll_wallet_async(&rpc, target, &cfg, &previous, &tracker).await {
                 Ok(current_batch) => {
                     seen.insert(target.address, current_batch);
                 }
@@ -142,15 +228,16 @@ pub async fn run_wallet_follower_loop(
             }
         }
 
-        sleep(cfg.poll_interval).await;
+        // Sleep AFTER a fresh (no bootstrap) first pass.
+        if seen.values().all(|s| s.is_empty()) {
+            sleep(cfg.poll_interval).await;
+        }
     }
 }
 
-/// Fetch the last `lookback_signatures` sigs for one wallet, filter for
-/// new-since-last-poll, fetch each tx, feed passing mints into the tracker.
-/// Returns the full current batch (regardless of "new" status) so the
-/// caller can update its dedup set.
-async fn poll_wallet(
+/// Async wrapper: dispatches the blocking work to a `spawn_blocking`
+/// worker so the runtime stays responsive.
+async fn poll_wallet_async(
     rpc: &Arc<RpcClient>,
     target: &WalletTarget,
     cfg: &WalletFollowerRuntimeConfig,
@@ -158,31 +245,78 @@ async fn poll_wallet(
     tracker: &Arc<HotMintTracker>,
 ) -> anyhow::Result<HashSet<Signature>> {
     let rpc_clone = Arc::clone(rpc);
-    let wallet = target.address;
-    let limit = cfg.lookback_signatures;
-    let sigs = tokio::task::spawn_blocking(move || fetch_signatures(&rpc_clone, &wallet, limit))
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))??;
+    let tracker_clone = Arc::clone(tracker);
+    let target_clone = target.clone();
+    let cfg_clone = cfg.clone();
+    let previous_clone = previous.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        process_wallet_sync(
+            &rpc_clone,
+            &target_clone,
+            &cfg_clone,
+            &previous_clone,
+            &tracker_clone,
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))??;
 
-    let current_batch: HashSet<Signature> = sigs.iter().copied().collect();
-    let new_sigs: Vec<Signature> = sigs.iter().copied().filter(|s| !previous.contains(s)).collect();
-
-    if new_sigs.is_empty() {
-        return Ok(current_batch);
+    if outcome.matched_transactions > 0 {
+        tracing::info!(
+            wallet = %target.address,
+            label = %target.label,
+            new_signatures = outcome.new_signatures,
+            matched_transactions = outcome.matched_transactions,
+            mints = outcome.mints_recorded,
+            weight = cfg.weight,
+            "wallet_followers: recorded batch"
+        );
+    } else {
+        tracing::debug!(
+            wallet = %target.address,
+            label = %target.label,
+            new_signatures = outcome.new_signatures,
+            "wallet_followers: no matching transactions"
+        );
     }
 
-    let mut tx_count = 0usize;
-    let mut mint_hits = 0usize;
+    Ok(outcome.current_batch)
+}
+
+/// Core blocking logic: fetch signatures, dedup vs `previous`, fetch tx
+/// details for new sigs, filter by target_programs, record weighted hits
+/// into the tracker. Used by both `bootstrap_wallet_followers` (direct)
+/// and `poll_wallet_async` (via `spawn_blocking`).
+fn process_wallet_sync(
+    rpc: &RpcClient,
+    target: &WalletTarget,
+    cfg: &WalletFollowerRuntimeConfig,
+    previous: &HashSet<Signature>,
+    tracker: &HotMintTracker,
+) -> anyhow::Result<WalletScanOutcome> {
+    let mut outcome = WalletScanOutcome::default();
+
+    let sigs = fetch_signatures(rpc, &target.address, cfg.lookback_signatures)?;
+    outcome.signatures_seen = sigs.len();
+    outcome.current_batch = sigs.iter().copied().collect();
+
+    let new_sigs: Vec<Signature> = sigs
+        .iter()
+        .copied()
+        .filter(|s| !previous.contains(s))
+        .collect();
+    outcome.new_signatures = new_sigs.len();
+
+    if new_sigs.is_empty() {
+        return Ok(outcome);
+    }
+
     for sig in &new_sigs {
-        let rpc_clone = Arc::clone(rpc);
-        let sig_owned = *sig;
-        let details = match tokio::task::spawn_blocking(move || {
-            fetch_tx_details(&rpc_clone, &sig_owned)
-        })
-        .await
-        {
-            Ok(Ok(details)) => details,
-            Ok(Err(err)) => {
+        let details = match fetch_tx_details(rpc, sig) {
+            Ok(Some(d)) => d,
+            Ok(None) => continue,
+            Err(err) => {
+                outcome.tx_errors += 1;
                 tracing::debug!(
                     wallet = %target.address,
                     signature = %sig,
@@ -191,19 +325,6 @@ async fn poll_wallet(
                 );
                 continue;
             }
-            Err(join_err) => {
-                tracing::debug!(
-                    wallet = %target.address,
-                    signature = %sig,
-                    error = %join_err,
-                    "wallet_followers: spawn_blocking failed"
-                );
-                continue;
-            }
-        };
-
-        let Some(details) = details else {
-            continue;
         };
 
         if !cfg.target_programs.is_empty()
@@ -216,34 +337,15 @@ async fn poll_wallet(
             continue;
         }
 
-        tx_count += 1;
-        mint_hits += details.mints.len();
+        outcome.matched_transactions += 1;
+        outcome.mints_recorded += details.mints.len();
 
         for _ in 0..cfg.weight {
             tracker.record_all(details.mints.iter().copied());
         }
     }
 
-    if tx_count > 0 {
-        tracing::info!(
-            wallet = %target.address,
-            label = %target.label,
-            new_signatures = new_sigs.len(),
-            matched_transactions = tx_count,
-            mints_per_match = mint_hits,
-            weight = cfg.weight,
-            "wallet_followers: recorded batch"
-        );
-    } else {
-        tracing::debug!(
-            wallet = %target.address,
-            label = %target.label,
-            new_signatures = new_sigs.len(),
-            "wallet_followers: no matching transactions"
-        );
-    }
-
-    Ok(current_batch)
+    Ok(outcome)
 }
 
 fn fetch_signatures(

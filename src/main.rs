@@ -42,7 +42,8 @@ use solana_onchain_arbitrage_bot::streams::rabbitstream::RabbitStreamPlan;
 use solana_onchain_arbitrage_bot::transaction::derive_vault_token_account;
 use solana_onchain_arbitrage_bot::wallet::load_keypair;
 use solana_onchain_arbitrage_bot::wallet_followers::{
-    parse_config as parse_wallet_followers_config, run_wallet_follower_loop,
+    bootstrap_wallet_followers, parse_config as parse_wallet_followers_config,
+    run_wallet_follower_loop,
 };
 use solana_program::program_pack::Pack;
 use solana_program::pubkey::Pubkey;
@@ -306,19 +307,51 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Wallet-follower loop: poll `getSignaturesForAddress` for configured
-    // trader wallets and feed the mints they trade into the tracker weighted
-    // by `weight`. No-op when disabled or when the tracker itself is off.
+    // Wallet-follower: sync bootstrap scan first so the tracker is populated
+    // BEFORE the promoter's first tick, then spawn the async loop for
+    // subsequent polls. No-op when disabled or when the tracker itself is off.
     if let (Some(tracker), true) = (
         hot_tracker.as_ref(),
         config.runtime.wallet_followers.enabled,
     ) {
         match parse_wallet_followers_config(&config.runtime.wallet_followers) {
             Ok(runtime_cfg) => {
-                let tracker = tracker.clone();
+                let tracker_arc = tracker.clone();
                 let rpc = rpc_client.clone();
+                let cfg_for_bootstrap = runtime_cfg.clone();
+                let bootstrap = tokio::task::spawn_blocking(move || {
+                    bootstrap_wallet_followers(&rpc, tracker_arc.as_ref(), &cfg_for_bootstrap)
+                })
+                .await
+                .context("wallet_followers bootstrap task join failed")?;
+
+                let initial_seen = match bootstrap {
+                    Ok(report) => {
+                        info!(
+                            "wallet_followers bootstrap complete: wallets_scanned={} signatures_examined={} matched={} mints_recorded={}",
+                            report.wallets_scanned,
+                            report.signatures_examined,
+                            report.matched_transactions,
+                            report.mints_recorded,
+                        );
+                        report.seen
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "wallet_followers bootstrap failed; proceeding without seed");
+                        std::collections::HashMap::new()
+                    }
+                };
+
+                let tracker_for_loop = tracker.clone();
+                let rpc_for_loop = rpc_client.clone();
                 tokio::spawn(async move {
-                    run_wallet_follower_loop(rpc, tracker, runtime_cfg).await;
+                    run_wallet_follower_loop(
+                        rpc_for_loop,
+                        tracker_for_loop,
+                        runtime_cfg,
+                        initial_seen,
+                    )
+                    .await;
                 });
                 info!(
                     "wallet_followers spawned: wallets={} poll_ms={} weight={}",
