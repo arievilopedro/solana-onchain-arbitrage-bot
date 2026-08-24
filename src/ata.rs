@@ -100,7 +100,7 @@ pub async fn ensure_ata_async(
                     warn!(
                         mint = %mint,
                         attempt = attempt + 1,
-                        error = %err,
+                        error = ?err,
                         retry_in_ms = delay.as_millis() as u64,
                         "ATA creation failed, retrying"
                     );

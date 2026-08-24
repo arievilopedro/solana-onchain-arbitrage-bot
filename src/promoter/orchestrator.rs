@@ -319,7 +319,7 @@ impl PromoterOrchestrator {
                         }
                     }
                     Err(e) => {
-                        self.record_err(mint, FailureKind::Discovery, format!("{}", e), now_ms);
+                        self.record_err(mint, FailureKind::Discovery, format!("{:#}", e), now_ms);
                     }
                 }
             }
@@ -333,7 +333,7 @@ impl PromoterOrchestrator {
                         }
                     }
                     Err(e) => {
-                        self.record_err(mint, FailureKind::AtaCreation, format!("{}", e), now_ms);
+                        self.record_err(mint, FailureKind::AtaCreation, format!("{:#}", e), now_ms);
                     }
                 }
             }
@@ -353,7 +353,7 @@ impl PromoterOrchestrator {
                         }
                     }
                     Err(e) => {
-                        self.record_err(mint, FailureKind::AltExtension, format!("{}", e), now_ms);
+                        self.record_err(mint, FailureKind::AltExtension, format!("{:#}", e), now_ms);
                     }
                 }
             }
@@ -375,7 +375,7 @@ impl PromoterOrchestrator {
                         self.record_err(
                             mint,
                             FailureKind::RegistryAdmit,
-                            format!("{}", e),
+                            format!("{:#}", e),
                             now_ms,
                         );
                     }
