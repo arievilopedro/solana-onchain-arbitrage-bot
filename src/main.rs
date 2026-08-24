@@ -10,6 +10,7 @@ use solana_onchain_arbitrage_bot::config::AppConfig;
 use solana_onchain_arbitrage_bot::constants::sol_mint;
 use solana_onchain_arbitrage_bot::dex::pump::pump_program_id;
 use solana_onchain_arbitrage_bot::discovery::{ControlledRpcBootstrap, RpcBootstrapConfig};
+use solana_onchain_arbitrage_bot::hot_mints::HotMintTracker;
 use solana_onchain_arbitrage_bot::execution::{
     build_controlled_transaction, build_controlled_transaction_with_nonce,
     ControlledExecutionParams,
@@ -201,6 +202,54 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let hot_tracker = if config.runtime.hot_mints.enabled {
+        let cfg = &config.runtime.hot_mints;
+        // Round-up so window fits at least `ceil(window / rotate)` buckets.
+        let num_buckets =
+            ((cfg.window_ms + cfg.rotate_ms - 1) / cfg.rotate_ms).max(1) as usize;
+        let tracker = Arc::new(HotMintTracker::new(num_buckets));
+        info!(
+            "hot_mints tracker started: top_n={} window_ms={} rotate_ms={} buckets={}",
+            cfg.top_n, cfg.window_ms, cfg.rotate_ms, num_buckets
+        );
+        let tracker_rot = tracker.clone();
+        let rotate_ms = cfg.rotate_ms;
+        let top_n = cfg.top_n;
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_millis(rotate_ms));
+            // Skip the immediate first tick to let real data accumulate first.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let top = tracker_rot.top_n(top_n);
+                let unique = tracker_rot.unique_mint_count();
+                if top.is_empty() {
+                    info!(
+                        "hot_mints rotate: top_n=0 unique_tracked={} note=no_activity_yet",
+                        unique
+                    );
+                } else {
+                    let summary: Vec<String> = top
+                        .iter()
+                        .take(top_n)
+                        .map(|(m, c)| format!("{}={}", m, c))
+                        .collect();
+                    info!(
+                        "hot_mints rotate: top_n={} unique_tracked={} top=[{}]",
+                        top.len(),
+                        unique,
+                        summary.join(",")
+                    );
+                }
+                tracker_rot.rotate();
+            }
+        });
+        Some(tracker)
+    } else {
+        None
+    };
+
     info!("supervisor bootstrap complete; starting configured stream workers");
     run_stream_workers(
         &config,
@@ -213,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
         registry.clone(),
         grpc_plans,
         rabbitstream_plan,
+        hot_tracker,
     )
     .await?;
 
@@ -430,6 +480,7 @@ async fn run_stream_workers(
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     grpc_plans: Vec<GeyserAccountStreamPlan>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
+    hot_tracker: Option<Arc<HotMintTracker>>,
 ) -> anyhow::Result<()> {
     run_rabbitstream_trigger_worker(
         config.clone(),
@@ -440,6 +491,7 @@ async fn run_stream_workers(
         registry.clone(),
         rabbitstream_plan.clone(),
         allowed_mints.clone(),
+        hot_tracker.clone(),
     )?;
 
     run_fomo_trigger_worker(
@@ -451,6 +503,7 @@ async fn run_stream_workers(
         registry.clone(),
         rabbitstream_plan,
         allowed_mints,
+        hot_tracker,
     )?;
 
     run_geyser_account_worker(
@@ -475,6 +528,7 @@ fn run_rabbitstream_trigger_worker(
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
     allowed_mints: Vec<Pubkey>,
+    hot_tracker: Option<Arc<HotMintTracker>>,
 ) -> anyhow::Result<()> {
     use solana_onchain_arbitrage_bot::streams::rabbitstream::yellowstone::run_axion_trigger_stream;
     let Some(plan) = rabbitstream_plan else {
@@ -542,6 +596,7 @@ fn run_rabbitstream_trigger_worker(
                 plan_iter,
                 axion_program_iter,
                 allowed_mints_iter,
+                hot_tracker.clone(),
                 move |signal| {
                     let trigger_received_at = Instant::now();
                     {
@@ -682,6 +737,7 @@ fn run_fomo_trigger_worker(
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
     allowed_mints: Vec<Pubkey>,
+    hot_tracker: Option<Arc<HotMintTracker>>,
 ) -> anyhow::Result<()> {
     use solana_onchain_arbitrage_bot::streams::rabbitstream::yellowstone::run_fomo_trigger_stream;
     let Some(plan) = rabbitstream_plan else {
@@ -746,6 +802,7 @@ fn run_fomo_trigger_worker(
                 plan_iter,
                 fomo_signer_iter,
                 allowed_mints_iter,
+                hot_tracker.clone(),
                 move |fomo_signal| {
                     let trigger_received_at = Instant::now();
                     {
@@ -913,6 +970,7 @@ fn run_fomo_trigger_worker(
     _registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
     _allowed_mints: Vec<Pubkey>,
+    _hot_tracker: Option<Arc<HotMintTracker>>,
 ) -> anyhow::Result<()> {
     if let Some(plan) = rabbitstream_plan {
         info!(
@@ -1025,7 +1083,16 @@ async fn process_axion_trigger(
         return Ok(());
     }
 
-    let max_transactions = config.execution.trigger_send_max_transactions.max(1);
+    // When spam is enabled, expand the send cap by the spam multiplier so a
+    // user asking for e.g. trigger_send_max_transactions=1 with spam.copies=5
+    // gets all 5 copies out. Users can still hard-cap by setting spam.copies=1
+    // (or spam.enabled=false).
+    let spam_copies = spam_copies_per_route(config);
+    let max_transactions = config
+        .execution
+        .trigger_send_max_transactions
+        .max(1)
+        .saturating_mul(spam_copies);
     let txs: Vec<_> = txs.into_iter().take(max_transactions).collect();
     if txs.is_empty() {
         tracing::debug!(
@@ -1044,7 +1111,15 @@ async fn process_axion_trigger(
     let trigger_signature = signal.signature.clone();
     let trigger_mint = signal.mint;
     let trigger_slot = signal.slot;
+    let stagger_us = if config.execution.spam.enabled {
+        config.execution.spam.stagger_us
+    } else {
+        0
+    };
     for (tx_index, tx) in txs.into_iter().enumerate() {
+        if stagger_us > 0 && tx_index > 0 {
+            tokio::time::sleep(std::time::Duration::from_micros(stagger_us)).await;
+        }
         let sender = sender.clone();
         let trigger_signature = trigger_signature.clone();
         let trigger_to_spawn_ms = trigger_received_at.elapsed().as_millis();
@@ -1327,6 +1402,7 @@ fn run_rabbitstream_trigger_worker(
     _registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
     _allowed_mints: Vec<Pubkey>,
+    _hot_tracker: Option<Arc<HotMintTracker>>,
 ) -> anyhow::Result<()> {
     if let Some(plan) = rabbitstream_plan {
         info!(
@@ -1945,6 +2021,7 @@ fn compile_controlled_mint_routes(
         None,
     );
 
+    let spam_copies = spam_copies_per_route(config);
     for route in route_groups {
         compilation.summary.routes += 1;
         let Some(route_alt) = route_resolver.load_lookup_for_mint(rpc_client, route.mint)? else {
@@ -1952,25 +2029,36 @@ fn compile_controlled_mint_routes(
             continue;
         };
         let lookup_tables = lookup_tables_for_route(&protocol_alt, &route_alt);
-        match build_controlled_transaction(
-            wallet,
-            &route,
-            mint_state.token_program,
-            recent_blockhash,
-            &lookup_tables,
-            params.clone(),
-        ) {
-            Ok(tx) => {
-                compilation.summary.compiled += 1;
-                compilation.transactions.push(tx);
-            }
-            Err(_) => {
-                compilation.summary.compile_failed += 1;
+        for _copy in 0..spam_copies {
+            match build_controlled_transaction(
+                wallet,
+                &route,
+                mint_state.token_program,
+                recent_blockhash,
+                &lookup_tables,
+                params.clone(),
+            ) {
+                Ok(tx) => {
+                    compilation.summary.compiled += 1;
+                    compilation.transactions.push(tx);
+                }
+                Err(_) => {
+                    compilation.summary.compile_failed += 1;
+                }
             }
         }
     }
 
     Ok(compilation)
+}
+
+#[cfg(feature = "geyser")]
+fn spam_copies_per_route(config: &AppConfig) -> usize {
+    if config.execution.spam.enabled {
+        config.execution.spam.copies.max(1)
+    } else {
+        1
+    }
 }
 
 #[cfg(feature = "geyser")]
@@ -2025,49 +2113,52 @@ fn compile_controlled_mint_routes_cached(
         Some(&alt_addresses),
     );
 
+    let spam_copies = spam_copies_per_route(config);
     for route in route_groups {
         compilation.summary.routes += 1;
-        let params = controlled_execution_params_with_tip(
-            config,
-            route_execution_cache.params.sender_tip.clone(),
-        );
-        let build_result = if let Some(nonce_mgr) = &route_execution_cache.nonce_manager {
-            if let Some((nonce_pubkey, nonce_hash, _authority)) = nonce_mgr.next_nonce() {
-                nonce_mgr.mark_in_flight(&nonce_pubkey);
-                build_controlled_transaction_with_nonce(
+        for _copy in 0..spam_copies {
+            let params = controlled_execution_params_with_tip(
+                config,
+                route_execution_cache.params.sender_tip.clone(),
+            );
+            let build_result = if let Some(nonce_mgr) = &route_execution_cache.nonce_manager {
+                if let Some((nonce_pubkey, nonce_hash, _authority)) = nonce_mgr.next_nonce() {
+                    nonce_mgr.mark_in_flight(&nonce_pubkey);
+                    build_controlled_transaction_with_nonce(
+                        wallet,
+                        &route,
+                        mint_state.token_program,
+                        nonce_hash,
+                        nonce_pubkey,
+                        &lookup_tables,
+                        params,
+                    )
+                } else {
+                    tracing::warn!(
+                        "trigger nonce unavailable: mint={} reason=all_nonces_in_flight",
+                        mint
+                    );
+                    compilation.summary.compile_failed += 1;
+                    continue;
+                }
+            } else {
+                build_controlled_transaction(
                     wallet,
                     &route,
                     mint_state.token_program,
-                    nonce_hash,
-                    nonce_pubkey,
+                    recent_blockhash,
                     &lookup_tables,
                     params,
                 )
-            } else {
-                tracing::warn!(
-                    "trigger nonce unavailable: mint={} reason=all_nonces_in_flight",
-                    mint
-                );
-                compilation.summary.compile_failed += 1;
-                continue;
-            }
-        } else {
-            build_controlled_transaction(
-                wallet,
-                &route,
-                mint_state.token_program,
-                recent_blockhash,
-                &lookup_tables,
-                params,
-            )
-        };
-        match build_result {
-            Ok(tx) => {
-                compilation.summary.compiled += 1;
-                compilation.transactions.push(tx);
-            }
-            Err(_) => {
-                compilation.summary.compile_failed += 1;
+            };
+            match build_result {
+                Ok(tx) => {
+                    compilation.summary.compiled += 1;
+                    compilation.transactions.push(tx);
+                }
+                Err(_) => {
+                    compilation.summary.compile_failed += 1;
+                }
             }
         }
     }

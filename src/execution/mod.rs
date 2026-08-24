@@ -88,7 +88,9 @@ fn build_controlled_transaction_internal(
     }
 
     instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(params.compute_unit_limit));
-    instructions.push(ComputeBudgetInstruction::set_compute_unit_price(params.compute_unit_price));
+    if params.compute_unit_price > 0 {
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_price(params.compute_unit_price));
+    }
 
     if let Some(tip) = &params.sender_tip {
         let lamports = tip.random_lamports();

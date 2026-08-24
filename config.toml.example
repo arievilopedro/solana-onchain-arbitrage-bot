@@ -22,6 +22,18 @@ allowed_mints = [
   "11111111111111111111111111111111",
 ]
 
+[runtime.hot_mints]
+# Observability-only (M3a): when enabled, mints touched in Axion/FOMO trigger
+# streams are counted BEFORE the allowlist filter, and a background task logs
+# the current top_n every rotate_ms. Does NOT auto-update `allowed_mints` yet
+# (that would require restarting the gRPC subscription; slated for M3b).
+# Operator flow: watch logs -> pick top mints -> restart bot with updated
+# `allowed_mints`.
+enabled = false
+top_n = 27
+window_ms = 900000    # 15 minutes (must be >= rotate_ms)
+rotate_ms = 300000    # 5 minutes
+
 [axion]
 enabled = true
 program_id = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9"
@@ -54,6 +66,20 @@ max_pool_state_age_ms = 1500
 send_live_transactions = false
 live_route_refresh_cooldown_ms = 1000
 trigger_send_max_transactions = 1
+
+[execution.spam]
+# When enabled, rebuild `copies` variant transactions per compiled route.
+# Each variant re-randomizes tip lamports/account and unit_price using the
+# ranges configured in [sender.helius] and [compute]. Set ranges (min < max)
+# to get distinct signatures per copy — otherwise Solana dedupes.
+# Total txs sent = routes * copies (trigger_send_max_transactions is
+# multiplied by copies internally so the cap doesn't accidentally clip spam).
+enabled = false
+copies = 1
+# Micro-seconds to wait between spawning each subsequent send. 0 = all
+# spawned back-to-back. Non-zero adds ordered latency but can spread
+# arrivals across validator RX buffers.
+stagger_us = 0
 
 [routes]
 max_dlmm_per_tx = 3
@@ -95,6 +121,8 @@ tip_accounts = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE,D2L6yPZ2FmmmTKPgzaM
 [compute]
 default_limit = 600000
 # Fixed fallback. If min/max are set, each tx randomizes in that range.
+# Set unit_price = 0 (and omit min/max, or set both to 0) to skip the
+# SetComputeUnitPrice instruction entirely (no priority fee).
 unit_price = 10000
 unit_price_min = 10000
 unit_price_max = 50000

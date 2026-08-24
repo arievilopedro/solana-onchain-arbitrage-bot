@@ -15,13 +15,15 @@ pub struct RabbitStreamPlan {
 #[cfg(feature = "geyser")]
 pub mod yellowstone {
     use super::RabbitStreamPlan;
-    use crate::axion::yellowstone::axion_trigger_signals;
+    use crate::axion::yellowstone::{axion_trigger_signals, token_balance_mints};
     use crate::axion::AxionTriggerSignal;
     use crate::fomo::yellowstone::fomo_trigger_signals;
     use crate::fomo::FomoTriggerSignal;
+    use crate::hot_mints::HotMintTracker;
     use futures::{SinkExt, StreamExt};
     use solana_program::pubkey::Pubkey;
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
     use yellowstone_grpc_client::GeyserGrpcClient;
     use yellowstone_grpc_proto::prelude::{
         subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
@@ -32,6 +34,7 @@ pub mod yellowstone {
         plan: RabbitStreamPlan,
         axion_program: Pubkey,
         allowed_mints: HashSet<Pubkey>,
+        hot_tracker: Option<Arc<HotMintTracker>>,
         mut on_trigger: impl FnMut(AxionTriggerSignal) -> anyhow::Result<()> + Send + 'static,
     ) -> anyhow::Result<()> {
         let mut client = GeyserGrpcClient::build_from_shared(plan.url.clone())?
@@ -77,6 +80,9 @@ pub mod yellowstone {
                 continue;
             };
             let signature = bs58::encode(info_tx.signature.as_slice()).into_string();
+            if let Some(tracker) = &hot_tracker {
+                tracker.record_all(token_balance_mints(info_tx.meta.as_ref()));
+            }
             for signal in axion_trigger_signals(
                 signature.clone(),
                 transaction_update.slot,
@@ -96,6 +102,7 @@ pub mod yellowstone {
         plan: RabbitStreamPlan,
         fomo_signer: Pubkey,
         allowed_mints: HashSet<Pubkey>,
+        hot_tracker: Option<Arc<HotMintTracker>>,
         mut on_trigger: impl FnMut(FomoTriggerSignal) -> anyhow::Result<()> + Send + 'static,
     ) -> anyhow::Result<()> {
         let mut client = GeyserGrpcClient::build_from_shared(plan.url.clone())?
@@ -145,6 +152,9 @@ pub mod yellowstone {
                 continue;
             };
             let signature = bs58::encode(info_tx.signature.as_slice()).into_string();
+            if let Some(tracker) = &hot_tracker {
+                tracker.record_all(token_balance_mints(info_tx.meta.as_ref()));
+            }
             for signal in fomo_trigger_signals(
                 signature.clone(),
                 transaction_update.slot,

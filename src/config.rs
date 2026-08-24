@@ -96,6 +96,51 @@ pub struct StreamEndpointConfig {
 pub struct RuntimeConfig {
     pub environment: String,
     pub allowed_mints: Vec<String>,
+    #[serde(default)]
+    pub hot_mints: HotMintsConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HotMintsConfig {
+    /// When true, mint activity is counted from Axion/FOMO trigger streams
+    /// (before the allowlist filter) and a rotator logs the current top N.
+    /// M3a is observability-only: does NOT mutate `allowed_mints` at runtime.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How many mints to track/log per rotation. Matches the Shyft gRPC
+    /// 27-mint budget by default.
+    #[serde(default = "default_hot_mints_top_n")]
+    pub top_n: usize,
+    /// Total sliding-window duration. Mints outside this window are evicted.
+    #[serde(default = "default_hot_mints_window_ms")]
+    pub window_ms: u64,
+    /// Interval at which the rotator advances the ring buffer AND logs the
+    /// current top-N. Must divide `window_ms` evenly for clean semantics.
+    #[serde(default = "default_hot_mints_rotate_ms")]
+    pub rotate_ms: u64,
+}
+
+impl Default for HotMintsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            top_n: default_hot_mints_top_n(),
+            window_ms: default_hot_mints_window_ms(),
+            rotate_ms: default_hot_mints_rotate_ms(),
+        }
+    }
+}
+
+fn default_hot_mints_top_n() -> usize {
+    27
+}
+
+fn default_hot_mints_window_ms() -> u64 {
+    900_000 // 15 minutes
+}
+
+fn default_hot_mints_rotate_ms() -> u64 {
+    300_000 // 5 minutes
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -156,6 +201,32 @@ pub struct ExecutionConfig {
     pub live_route_refresh_cooldown_ms: u64,
     #[serde(default = "default_trigger_send_max_transactions")]
     pub trigger_send_max_transactions: usize,
+    #[serde(default)]
+    pub spam: ExecutionSpamConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ExecutionSpamConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_spam_copies")]
+    pub copies: usize,
+    #[serde(default)]
+    pub stagger_us: u64,
+}
+
+impl Default for ExecutionSpamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            copies: default_spam_copies(),
+            stagger_us: 0,
+        }
+    }
+}
+
+fn default_spam_copies() -> usize {
+    1
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -386,6 +457,26 @@ impl AppConfig {
             anyhow::bail!("execution.sol_only must be true for V1");
         }
 
+        if self.execution.spam.enabled && self.execution.spam.copies == 0 {
+            anyhow::bail!(
+                "execution.spam.copies must be >= 1 when execution.spam.enabled=true"
+            );
+        }
+
+        if self.runtime.hot_mints.enabled {
+            if self.runtime.hot_mints.top_n == 0 {
+                anyhow::bail!("runtime.hot_mints.top_n must be >= 1 when enabled");
+            }
+            if self.runtime.hot_mints.rotate_ms == 0 {
+                anyhow::bail!("runtime.hot_mints.rotate_ms must be > 0 when enabled");
+            }
+            if self.runtime.hot_mints.window_ms < self.runtime.hot_mints.rotate_ms {
+                anyhow::bail!(
+                    "runtime.hot_mints.window_ms must be >= rotate_ms when enabled"
+                );
+            }
+        }
+
         if self.routes.max_dlmm_per_tx == 0 {
             anyhow::bail!("routes.max_dlmm_per_tx must be greater than zero");
         }
@@ -441,11 +532,6 @@ impl AppConfig {
             }
 
             let (compute_price_min, compute_price_max) = self.compute.unit_price_range();
-            if compute_price_min == 0 || compute_price_max == 0 {
-                anyhow::bail!(
-                    "compute unit price lamports must be greater than zero for Helius Sender"
-                );
-            }
             if compute_price_min > compute_price_max {
                 anyhow::bail!("compute.unit_price_min must be <= compute.unit_price_max");
             }
