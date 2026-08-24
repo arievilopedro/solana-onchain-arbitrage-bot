@@ -10,11 +10,42 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account_idempotent,
+    get_associated_token_address_with_program_id,
+    instruction::create_associated_token_account_idempotent,
 };
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
+
+/// SPL Token-2022 program id. Kept as a local constant to avoid pulling
+/// the `spl-token-2022` crate as a dependency just for the program id;
+/// this is the same value used by `discovery::token_2022_program_id`.
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+fn token_2022_program_id() -> Pubkey {
+    TOKEN_2022_PROGRAM_ID.parse().unwrap()
+}
+
+/// Return the token program id (SPL Token v1 or Token-2022) that owns the
+/// given mint account. `create_associated_token_account_idempotent` and
+/// `get_associated_token_address_with_program_id` both need this to derive
+/// the correct ATA address and CPI into the right token program.
+fn resolve_mint_token_program(rpc_client: &RpcClient, mint: &Pubkey) -> Result<Pubkey> {
+    let account = rpc_client
+        .get_account(mint)
+        .context(format!("Failed to fetch mint account for {}", mint))?;
+    let owner = account.owner;
+    let t2022 = token_2022_program_id();
+    if owner == spl_token::id() || owner == t2022 {
+        Ok(owner)
+    } else {
+        anyhow::bail!(
+            "Mint {} has unexpected owner {}, expected SPL Token or Token-2022",
+            mint,
+            owner
+        )
+    }
+}
 
 /// Pull the preflight simulation payload out of a `ClientError`, if present.
 /// The default `Display` of `RpcResponseErrorData::SendTransactionPreflightFailure`
@@ -67,9 +98,13 @@ pub fn ensure_ata_exists(
     mint_name: &str,
 ) -> Result<Pubkey> {
     let wallet = wallet_kp.pubkey();
-    let ata = get_associated_token_address(&wallet, mint);
+    let token_program = resolve_mint_token_program(rpc_client, mint)?;
+    let ata = get_associated_token_address_with_program_id(&wallet, mint, &token_program);
 
-    info!("Checking {} ATA: {}", mint_name, ata);
+    info!(
+        "Checking {} ATA: {} (token_program={})",
+        mint_name, ata, token_program
+    );
 
     match rpc_client.get_account(&ata) {
         Ok(_) => {
@@ -83,7 +118,7 @@ pub fn ensure_ata_exists(
                 &wallet,
                 &wallet,
                 mint,
-                &spl_token::id(),
+                &token_program,
             );
 
             let blockhash = rpc_client
