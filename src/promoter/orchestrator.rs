@@ -518,9 +518,21 @@ impl PromoterOrchestrator {
             now_ms,
         );
         let Some(route) = route_opt else {
+            // "No eligible pump+dlmm pair" is deterministic given the cached
+            // discovery state -- retrying won't change the outcome without a
+            // fresh discovery run. Park the mint immediately in
+            // `Failed(AltExtension)` instead of burning through the retry
+            // budget (each retry re-fires on every event via `drive_pending`,
+            // spamming the log with N copies of the same error).
             let msg = "no eligible pump+dlmm pair for ALT promotion";
+            warn!(mint = %mint, kind = ?FailureKind::AltExtension, error = %msg, "promoter phase permanent failure");
+            let err: Arc<str> = Arc::from(msg);
             self.clear_pending(mint);
-            self.record_err(mint, FailureKind::AltExtension, msg.to_string(), now_ms);
+            let mut lifecycles = self.lifecycles.lock().unwrap();
+            if let Some(lc) = lifecycles.get_mut(&mint) {
+                fail(lc, FailureKind::AltExtension, err, now_ms);
+                self.metrics.record_failure(FailureKind::AltExtension);
+            }
             return;
         };
 
