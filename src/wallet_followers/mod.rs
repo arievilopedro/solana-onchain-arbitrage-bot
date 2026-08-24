@@ -396,6 +396,12 @@ fn fetch_tx_details(
     extract_mints_from_meta(&meta, &mut mints);
     dedup_preserving_order(&mut mints);
 
+    // CRITICAL: v0 transactions load most of their accounts (including the
+    // pump-amm and DLMM program pubkeys) via Address Lookup Tables, so they
+    // never appear in `UiMessage::Raw.account_keys`. We MUST also read
+    // `meta.loaded_addresses.{writable,readonly}` to correctly identify
+    // which programs the tx invoked. Without this the program filter drops
+    // essentially every real trader tx (routers, MEV bots, etc.).
     let mut programs: Vec<Pubkey> = Vec::new();
     if let EncodedTransaction::Json(ui_tx) = tx.transaction.transaction {
         if let UiMessage::Raw(raw) = ui_tx.message {
@@ -403,6 +409,13 @@ fn fetch_tx_details(
                 if let Ok(pk) = Pubkey::from_str(key) {
                     programs.push(pk);
                 }
+            }
+        }
+    }
+    if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
+        for key in loaded.writable.iter().chain(loaded.readonly.iter()) {
+            if let Ok(pk) = Pubkey::from_str(key) {
+                programs.push(pk);
             }
         }
     }
