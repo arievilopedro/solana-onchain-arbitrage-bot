@@ -1159,7 +1159,7 @@ async fn process_axion_trigger(
     // user asking for e.g. trigger_send_max_transactions=1 with spam.copies=5
     // gets all 5 copies out. Users can still hard-cap by setting spam.copies=1
     // (or spam.enabled=false).
-    let spam_copies = spam_copies_per_route(config);
+    let spam_copies = spam_copies_per_route(&config);
     let max_transactions = config
         .execution
         .trigger_send_max_transactions
