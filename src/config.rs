@@ -199,6 +199,13 @@ pub struct PromoterConfig {
     pub retire_ata_on_evict: bool,
     #[serde(default)]
     pub retire_alt_on_evict: bool,
+    /// Upper bound on the number of RPC-heavy promoter phase tasks
+    /// (Discovery / ATA / ALT) that may run in parallel. Prevents bursting
+    /// past the shared RPC quota when a large batch of mints gets promoted
+    /// in the same tick. Each phase acquires one permit before touching
+    /// the RPC.
+    #[serde(default = "default_promoter_max_concurrent_rpc_ops")]
+    pub max_concurrent_rpc_ops: usize,
 }
 
 impl Default for PromoterConfig {
@@ -215,6 +222,7 @@ impl Default for PromoterConfig {
             coldstart: PromoterColdStartConfig::default(),
             retire_ata_on_evict: false,
             retire_alt_on_evict: false,
+            max_concurrent_rpc_ops: default_promoter_max_concurrent_rpc_ops(),
         }
     }
 }
@@ -259,6 +267,12 @@ fn default_promoter_top_n() -> usize {
 }
 fn default_promoter_grpc_ack_timeout_ms() -> u64 {
     5_000
+}
+fn default_promoter_max_concurrent_rpc_ops() -> usize {
+    // Conservative default sized for the Shyft "Build" tier (100 RPC/s).
+    // Each promoter phase issues 2-5 sub-RPCs; 4 concurrent phases keeps
+    // steady-state well under quota.
+    4
 }
 fn default_coldstart_max_sigs() -> usize {
     1_000
@@ -668,6 +682,11 @@ impl AppConfig {
             if self.runtime.promoter.grpc_ack_timeout_ms == 0 {
                 anyhow::bail!(
                     "runtime.promoter.grpc_ack_timeout_ms must be > 0 when enabled"
+                );
+            }
+            if self.runtime.promoter.max_concurrent_rpc_ops == 0 {
+                anyhow::bail!(
+                    "runtime.promoter.max_concurrent_rpc_ops must be >= 1 when enabled"
                 );
             }
             if self.runtime.promoter.top_n_target < self.runtime.allowed_mints.len() {

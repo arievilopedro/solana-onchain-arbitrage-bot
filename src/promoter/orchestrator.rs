@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::alt::{promote_mint_into_shard_async, PromoteMintReport, StableMintRouteAccounts};
@@ -99,6 +99,11 @@ pub struct PromoterOrchestrator {
     pending_ops: Arc<Mutex<HashSet<Pubkey>>>,
     /// Gate: at most one Replace in flight per slot.
     in_flight_slots: Arc<Mutex<HashSet<ShardSlot>>>,
+    /// Global throttle: bounds the number of concurrent RPC-heavy phase
+    /// tasks (Discovery / ATA / ALT) so a big promotion batch cannot
+    /// burst past the shared RPC quota. Sized from
+    /// `PromoterConfig::max_concurrent_rpc_ops`.
+    rpc_semaphore: Arc<Semaphore>,
     event_tx: mpsc::UnboundedSender<InternalEvent>,
     metrics: Arc<PromoterMetrics>,
 }
@@ -108,12 +113,14 @@ impl PromoterOrchestrator {
     /// receiver is passed back into `run`.
     pub fn new(inputs: PromoterInputs) -> (Self, mpsc::UnboundedReceiver<InternalEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let permits = inputs.config.max_concurrent_rpc_ops.max(1);
         let this = Self {
             inputs,
             lifecycles: Arc::new(Mutex::new(HashMap::new())),
             pending_states: Arc::new(Mutex::new(HashMap::new())),
             pending_ops: Arc::new(Mutex::new(HashSet::new())),
             in_flight_slots: Arc::new(Mutex::new(HashSet::new())),
+            rpc_semaphore: Arc::new(Semaphore::new(permits)),
             event_tx,
             metrics: Arc::new(PromoterMetrics::new()),
         };
@@ -469,7 +476,9 @@ impl PromoterOrchestrator {
         }
         let bootstrap = Arc::clone(&self.inputs.bootstrap);
         let tx = self.event_tx.clone();
+        let sem = Arc::clone(&self.rpc_semaphore);
         tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
             let result = discover_mint_async(bootstrap, mint).await;
             let _ = tx.send(InternalEvent::Discovery { mint, result });
         });
@@ -482,7 +491,9 @@ impl PromoterOrchestrator {
         let rpc = Arc::clone(&self.inputs.rpc);
         let wallet = Arc::clone(&self.inputs.wallet);
         let tx = self.event_tx.clone();
+        let sem = Arc::clone(&self.rpc_semaphore);
         tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
             let result = ensure_ata_async(rpc, wallet, mint, mint.to_string()).await;
             let _ = tx.send(InternalEvent::Ata { mint, result });
         });
@@ -533,8 +544,10 @@ impl PromoterOrchestrator {
         let auto_extend = self.inputs.auto_extend;
         let alt_timeout = Duration::from_millis(self.inputs.config.alt_timeout_ms);
         let tx = self.event_tx.clone();
+        let sem = Arc::clone(&self.rpc_semaphore);
 
         tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
             let fut = promote_mint_into_shard_async(
                 rpc,
                 wallet,
