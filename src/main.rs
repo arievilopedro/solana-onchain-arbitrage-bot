@@ -1971,7 +1971,7 @@ fn process_geyser_route_action(
         Ok(dry_run) => dry_run,
         Err(error) => {
             tracing::error!(
-                "live controlled tx dry-run failed: mint={} error={}",
+                "live controlled tx dry-run failed: mint={} error={:#}",
                 action.mint,
                 error
             );
@@ -2012,7 +2012,7 @@ fn process_geyser_route_action(
                     }
                     Err(error) => {
                         tracing::error!(
-                            "route execution cache reload failed: mint={} error={}",
+                            "route execution cache reload failed: mint={} error={:#}",
                             action.mint,
                             error
                         );
@@ -2023,7 +2023,7 @@ fn process_geyser_route_action(
         Ok(_) => {}
         Err(error) => {
             tracing::error!(
-                "route shard live maintenance failed: mint={} error={}",
+                "route shard live maintenance failed: mint={} error={:#}",
                 action.mint,
                 error
             );
