@@ -325,18 +325,21 @@ impl PromoterOrchestrator {
                     Ok(disc) => {
                         // Early eligibility gate: reject mints that have no
                         // SOL-paired pump+dlmm pair BEFORE any rent is spent.
-                        // The check is the same one used in `spawn_alt`
-                        // (`StableMintRouteAccounts::from_mint_runtime_state`);
-                        // running it here avoids creating an ATA (~0.00204 SOL)
-                        // for a mint that would fail ALT promotion anyway.
-                        // Discovery already filters pools by min-liquidity and
-                        // SOL pairing, so a `None` outcome here means the mint
-                        // is structurally non-arbitrable (typically pump-only,
-                        // no Meteora DLMM listing yet).
+                        // Uses the same route-shape check as `spawn_alt`
+                        // (`StableMintRouteAccounts::from_mint_runtime_state`)
+                        // but passes `u64::MAX` for `max_state_age_ms` because
+                        // pool freshness is irrelevant for ALT promotion — we
+                        // only need to know that a SOL-paired pump+dlmm pair
+                        // exists so its pubkeys can be added to the lookup
+                        // table (pubkeys don't stale). Using the hot-path
+                        // freshness bound here would race the ATA-creation
+                        // latency (~12s for a fresh ATA) against the 1.5s
+                        // default staleness window and reject every mint that
+                        // needs a new ATA.
                         let route_opt = StableMintRouteAccounts::from_mint_runtime_state(
                             &disc.state,
                             self.inputs.min_pool_base_liquidity_lamports,
-                            self.inputs.max_pool_state_age_ms,
+                            u64::MAX,
                             now_ms,
                         );
                         if route_opt.is_none() {
@@ -554,20 +557,22 @@ impl PromoterOrchestrator {
             self.clear_pending(mint);
             return;
         };
+        // ALT promotion doesn't care about pool freshness (pubkeys are stable);
+        // pass `u64::MAX` for `max_state_age_ms` to avoid racing ATA-creation
+        // latency against the hot-path staleness bound. The Discovery event
+        // gate already validated the route shape (pump+dlmm SOL-paired with
+        // min liquidity) before an ATA was ever requested.
         let route_opt = StableMintRouteAccounts::from_mint_runtime_state(
             &state,
             self.inputs.min_pool_base_liquidity_lamports,
-            self.inputs.max_pool_state_age_ms,
+            u64::MAX,
             now_ms,
         );
         let Some(route) = route_opt else {
-            // "No eligible pump+dlmm pair" is deterministic given the cached
-            // discovery state -- retrying won't change the outcome without a
-            // fresh discovery run. Park the mint immediately in
-            // `Failed(AltExtension)` instead of burning through the retry
-            // budget (each retry re-fires on every event via `drive_pending`,
-            // spamming the log with N copies of the same error).
-            let msg = "no eligible pump+dlmm pair for ALT promotion";
+            // Should not happen: Discovery gate already validated this. If it
+            // does, treat as permanent (retrying won't change anything without
+            // fresh discovery).
+            let msg = "no eligible pump+dlmm pair for ALT promotion (post-Discovery)";
             warn!(mint = %mint, kind = ?FailureKind::AltExtension, error = %msg, "promoter phase permanent failure");
             let err: Arc<str> = Arc::from(msg);
             self.clear_pending(mint);
