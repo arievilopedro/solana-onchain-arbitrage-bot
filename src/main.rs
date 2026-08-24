@@ -139,20 +139,30 @@ async fn main() -> anyhow::Result<()> {
     );
     let registry = report.registry;
 
+    // Global lock serialising every writer that mutates the route-shard
+    // state file. See `promote_mint_into_shard_async` in `src/alt/mod.rs` for
+    // the race this defends against.
+    let state_file_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
     if config.lookup_tables.route_shards.enabled {
         let (routes, skipped_unready) = collect_stable_mint_routes(&config, &registry);
-        let maintenance = maintain_route_shards_incremental(
-            &rpc_client,
-            &wallet,
-            &config.lookup_tables.route_shards.state_file,
-            allowed_mints.iter().copied(),
-            config.lookup_tables.route_shards.max_addresses,
-            routes,
-            config.lookup_tables.route_shards.auto_create,
-            config.lookup_tables.route_shards.auto_extend,
-            &[],
-        )
-        .context("route shard maintenance failed")?;
+        let maintenance = {
+            let _guard = state_file_lock
+                .lock()
+                .map_err(|e| anyhow::anyhow!("state_file_lock poisoned: {e}"))?;
+            maintain_route_shards_incremental(
+                &rpc_client,
+                &wallet,
+                &config.lookup_tables.route_shards.state_file,
+                allowed_mints.iter().copied(),
+                config.lookup_tables.route_shards.max_addresses,
+                routes,
+                config.lookup_tables.route_shards.auto_create,
+                config.lookup_tables.route_shards.auto_extend,
+                &[],
+            )
+            .context("route shard maintenance failed")?
+        };
         info!(
             "route shard maintenance OK: reconciled_checked={} reconciled_updated_used={} reconciled_marked_full={} reconciled_marked_deactivated={} mint_blocks={} create_shard={} extend_shard={} skipped_unready={} skipped_disabled={} attempted={} confirmed={}",
             maintenance.reconciled_checked,
@@ -379,6 +389,7 @@ async fn main() -> anyhow::Result<()> {
         grpc_plans,
         rabbitstream_plan,
         hot_tracker,
+        state_file_lock,
         #[cfg(feature = "geyser")]
         bootstrap,
     )
@@ -599,6 +610,7 @@ async fn run_stream_workers(
     grpc_plans: Vec<GeyserAccountStreamPlan>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
     hot_tracker: Option<Arc<HotMintTracker>>,
+    state_file_lock: Arc<Mutex<()>>,
     #[cfg(feature = "geyser")] bootstrap: Arc<ControlledRpcBootstrap>,
 ) -> anyhow::Result<()> {
     run_rabbitstream_trigger_worker(
@@ -636,6 +648,7 @@ async fn run_stream_workers(
             allowed_mints,
             registry,
             hot_tracker,
+            state_file_lock,
             bootstrap,
         )
         .await;
@@ -649,6 +662,7 @@ async fn run_stream_workers(
         wallet,
         registry,
         grpc_plans,
+        state_file_lock,
     )
     .await
 }
@@ -1560,6 +1574,7 @@ async fn run_geyser_account_worker(
     wallet: Arc<solana_sdk::signature::Keypair>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     grpc_plans: Vec<GeyserAccountStreamPlan>,
+    state_file_lock: Arc<Mutex<()>>,
 ) -> anyhow::Result<()> {
     if grpc_plans.is_empty() {
         info!("gRPC account worker not started: grpc.enabled=false");
@@ -1573,6 +1588,7 @@ async fn run_geyser_account_worker(
         let runtime_account_cache = runtime_account_cache.clone();
         let wallet = wallet.clone();
         let registry = registry.clone();
+        let state_file_lock = state_file_lock.clone();
         tokio::spawn(async move {
             if let Err(error) = run_single_geyser_account_worker(
                 config,
@@ -1584,6 +1600,7 @@ async fn run_geyser_account_worker(
                 plan,
                 worker_index,
                 None,
+                state_file_lock,
             )
             .await
             {
@@ -1612,6 +1629,7 @@ async fn run_promoter_geyser_stack(
     allowed_mints: Vec<Pubkey>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     hot_tracker: Option<Arc<HotMintTracker>>,
+    state_file_lock: Arc<Mutex<()>>,
     bootstrap: Arc<ControlledRpcBootstrap>,
 ) -> anyhow::Result<()> {
     if !config.grpc.enabled {
@@ -1665,6 +1683,7 @@ async fn run_promoter_geyser_stack(
         let rac = runtime_account_cache.clone();
         let wallet_c = wallet.clone();
         let registry_c = registry.clone();
+        let lock_c = state_file_lock.clone();
         tokio::spawn(async move {
             if let Err(error) = run_single_geyser_account_worker(
                 cfg,
@@ -1676,6 +1695,7 @@ async fn run_promoter_geyser_stack(
                 plan,
                 slot_idx,
                 Some(command_rx),
+                lock_c,
             )
             .await
             {
@@ -1700,6 +1720,7 @@ async fn run_promoter_geyser_stack(
         shard_alloc: Arc::new(Mutex::new(allocator)),
         seed: Arc::new(seed_set),
         state_file: config.lookup_tables.route_shards.state_file.clone().into(),
+        state_file_lock: state_file_lock.clone(),
         shard_capacity: config.lookup_tables.route_shards.max_addresses,
         auto_create: config.lookup_tables.route_shards.auto_create,
         auto_extend: config.lookup_tables.route_shards.auto_extend,
@@ -1739,6 +1760,7 @@ async fn run_single_geyser_account_worker(
             solana_onchain_arbitrage_bot::streams::grpc::SubscriptionCommand,
         >,
     >,
+    state_file_lock: Arc<Mutex<()>>,
 ) -> anyhow::Result<()> {
     use solana_onchain_arbitrage_bot::streams::grpc::yellowstone::{
         run_account_stream, run_account_stream_with_commands, GeyserStreamUpdate,
@@ -1870,6 +1892,7 @@ async fn run_single_geyser_account_worker(
                         let wallet = wallet.clone();
                         let route_execution_cache = route_execution_cache.clone();
                         let runtime_account_cache = runtime_account_cache.clone();
+                        let state_file_lock = state_file_lock.clone();
                         tokio::task::spawn_blocking(move || {
                             process_geyser_route_action(
                                 config,
@@ -1878,6 +1901,7 @@ async fn run_single_geyser_account_worker(
                                 route_execution_cache,
                                 runtime_account_cache,
                                 action,
+                                state_file_lock,
                             );
                         });
                     }
@@ -1929,6 +1953,7 @@ fn process_geyser_route_action(
     route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
     runtime_account_cache: Arc<Mutex<RuntimeAccountCache>>,
     action: GeyserRouteAction,
+    state_file_lock: Arc<Mutex<()>>,
 ) {
     if let Some(mint_state) = action.mint_state.as_ref() {
         match prepare_route_runtime_accounts_for_mint(
@@ -1996,6 +2021,7 @@ fn process_geyser_route_action(
         wallet.as_ref(),
         &action.registry_snapshot,
         &action.recent_slot_candidates,
+        state_file_lock.as_ref(),
     ) {
         Ok(confirmed) if confirmed > 0 => {
             if let Some(cache) = &route_execution_cache {
@@ -2038,6 +2064,7 @@ fn maintain_live_route_shards(
     wallet: &solana_sdk::signature::Keypair,
     registry: &solana_onchain_arbitrage_bot::registry::RuntimeRegistry,
     recent_slot_candidates: &[u64],
+    state_file_lock: &Mutex<()>,
 ) -> anyhow::Result<usize> {
     if !config.lookup_tables.route_shards.enabled {
         return Ok(0);
@@ -2049,18 +2076,27 @@ fn maintain_live_route_shards(
     // reject any dynamically-promoted mint with "not allowlisted".
     let allowed_mints = registry.allowed_mints();
     let (routes, skipped_unready) = collect_stable_mint_routes(config, registry);
-    let maintenance = maintain_route_shards_incremental(
-        rpc_client,
-        wallet,
-        &config.lookup_tables.route_shards.state_file,
-        allowed_mints.iter().copied(),
-        config.lookup_tables.route_shards.max_addresses,
-        routes,
-        config.lookup_tables.route_shards.auto_create,
-        config.lookup_tables.route_shards.auto_extend,
-        recent_slot_candidates,
-    )
-    .context("live route shard maintenance failed")?;
+    // Serialise every writer that mutates the route-shard state file. The
+    // startup maintenance path and the promoter's ALT phase share this same
+    // mutex, so concurrent `load -> reconcile -> plan -> send -> apply -> save`
+    // cycles cannot race and corrupt the file with `local used > on-chain len`.
+    let maintenance = {
+        let _guard = state_file_lock
+            .lock()
+            .map_err(|e| anyhow::anyhow!("state_file_lock poisoned: {e}"))?;
+        maintain_route_shards_incremental(
+            rpc_client,
+            wallet,
+            &config.lookup_tables.route_shards.state_file,
+            allowed_mints.iter().copied(),
+            config.lookup_tables.route_shards.max_addresses,
+            routes,
+            config.lookup_tables.route_shards.auto_create,
+            config.lookup_tables.route_shards.auto_extend,
+            recent_slot_candidates,
+        )
+        .context("live route shard maintenance failed")?
+    };
 
     info!(
         "route shard live maintenance OK: reconciled_checked={} reconciled_updated_used={} reconciled_marked_full={} reconciled_marked_deactivated={} mint_blocks={} create_shard={} extend_shard={} skipped_unready={} skipped_disabled={} attempted={} confirmed={}",
@@ -2089,6 +2125,7 @@ async fn run_geyser_account_worker(
     _wallet: Arc<solana_sdk::signature::Keypair>,
     _registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     grpc_plans: Vec<GeyserAccountStreamPlan>,
+    _state_file_lock: Arc<Mutex<()>>,
 ) -> anyhow::Result<()> {
     if !grpc_plans.is_empty() {
         info!(

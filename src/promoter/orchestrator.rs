@@ -81,6 +81,13 @@ pub struct PromoterInputs {
     pub seed: Arc<HashSet<Pubkey>>,
     /// Route shard state file (single-mint promotion writes to it).
     pub state_file: PathBuf,
+    /// Global lock serializing every writer that mutates `state_file`.
+    /// The promoter's ALT phase, the startup maintenance path in main.rs and
+    /// the live gRPC-triggered `maintain_live_route_shards` all share this
+    /// mutex. Without it, concurrent `load -> reconcile -> plan -> send ->
+    /// apply -> save` cycles race and produce `local used > on-chain len`
+    /// corruption (see `RouteShardPlanner::reconcile_with_chain`).
+    pub state_file_lock: Arc<Mutex<()>>,
     pub shard_capacity: usize,
     pub auto_create: bool,
     pub auto_extend: bool,
@@ -551,6 +558,7 @@ impl PromoterOrchestrator {
         let rpc = Arc::clone(&self.inputs.rpc);
         let wallet = Arc::clone(&self.inputs.wallet);
         let state_file = self.inputs.state_file.clone();
+        let state_file_lock = Arc::clone(&self.inputs.state_file_lock);
         let shard_capacity = self.inputs.shard_capacity;
         let auto_create = self.inputs.auto_create;
         let auto_extend = self.inputs.auto_extend;
@@ -564,6 +572,7 @@ impl PromoterOrchestrator {
                 rpc,
                 wallet,
                 state_file,
+                state_file_lock,
                 allowed,
                 shard_capacity,
                 route,

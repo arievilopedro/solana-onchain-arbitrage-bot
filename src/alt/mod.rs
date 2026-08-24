@@ -690,11 +690,18 @@ pub fn promote_mint_into_shard(
 /// on-chain confirm on `spawn_blocking` so the promoter tick loop can drive
 /// multiple mints concurrently, and enforces the promoter's ALT timeout
 /// budget from the caller side.
+///
+/// `state_file_lock` is a global mutex shared with every other writer of the
+/// route-shard state file (startup maintenance, gRPC-triggered live
+/// maintenance). It is held for the entire load -> reconcile -> plan -> send
+/// -> apply -> save cycle to prevent racing writers from producing
+/// `local used > on-chain len` corruption.
 #[allow(clippy::too_many_arguments)]
 pub async fn promote_mint_into_shard_async(
     rpc_client: std::sync::Arc<RpcClient>,
     wallet: std::sync::Arc<Keypair>,
     state_file: std::path::PathBuf,
+    state_file_lock: std::sync::Arc<std::sync::Mutex<()>>,
     allowed_mints: Vec<Pubkey>,
     shard_capacity: usize,
     route: StableMintRouteAccounts,
@@ -704,6 +711,11 @@ pub async fn promote_mint_into_shard_async(
 ) -> anyhow::Result<PromoteMintReport> {
     let mint = route.mint;
     tokio::task::spawn_blocking(move || {
+        // Serialize all state-file writes. Any writer that ignores this lock
+        // races against the promoter and can corrupt `used` counters.
+        let _guard = state_file_lock
+            .lock()
+            .map_err(|e| anyhow::anyhow!("state_file_lock poisoned: {}", e))?;
         promote_mint_into_shard(
             rpc_client.as_ref(),
             wallet.as_ref(),
