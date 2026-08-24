@@ -323,6 +323,42 @@ impl PromoterOrchestrator {
                 self.clear_pending(mint);
                 match result {
                     Ok(disc) => {
+                        // Early eligibility gate: reject mints that have no
+                        // SOL-paired pump+dlmm pair BEFORE any rent is spent.
+                        // The check is the same one used in `spawn_alt`
+                        // (`StableMintRouteAccounts::from_mint_runtime_state`);
+                        // running it here avoids creating an ATA (~0.00204 SOL)
+                        // for a mint that would fail ALT promotion anyway.
+                        // Discovery already filters pools by min-liquidity and
+                        // SOL pairing, so a `None` outcome here means the mint
+                        // is structurally non-arbitrable (typically pump-only,
+                        // no Meteora DLMM listing yet).
+                        let route_opt = StableMintRouteAccounts::from_mint_runtime_state(
+                            &disc.state,
+                            self.inputs.min_pool_base_liquidity_lamports,
+                            self.inputs.max_pool_state_age_ms,
+                            now_ms,
+                        );
+                        if route_opt.is_none() {
+                            let msg = format!(
+                                "no eligible pump+dlmm pair: pump_pools={} dlmm_pools={}",
+                                disc.state.pump.len(),
+                                disc.state.dlmms.len()
+                            );
+                            warn!(
+                                mint = %mint,
+                                kind = ?FailureKind::Discovery,
+                                error = %msg,
+                                "promoter phase permanent failure (pre-ATA gate)"
+                            );
+                            let err: Arc<str> = Arc::from(msg);
+                            let mut lifecycles = self.lifecycles.lock().unwrap();
+                            if let Some(lc) = lifecycles.get_mut(&mint) {
+                                fail(lc, FailureKind::Discovery, err, now_ms);
+                                self.metrics.record_failure(FailureKind::Discovery);
+                            }
+                            return;
+                        }
                         self.pending_states
                             .lock()
                             .unwrap()

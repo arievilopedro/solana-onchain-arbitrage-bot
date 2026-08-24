@@ -20,6 +20,7 @@ pub mod yellowstone {
     use crate::fomo::yellowstone::fomo_trigger_signals;
     use crate::fomo::FomoTriggerSignal;
     use crate::hot_mints::HotMintTracker;
+    use arc_swap::ArcSwap;
     use futures::{SinkExt, StreamExt};
     use solana_program::pubkey::Pubkey;
     use std::collections::{HashMap, HashSet};
@@ -30,10 +31,16 @@ pub mod yellowstone {
         SubscribeRequestFilterTransactions,
     };
 
+    /// Shared handle to a runtime-mutable allowlist. The registry owns the
+    /// underlying `ArcSwap<HashSet<Pubkey>>`; the trigger streams reload a
+    /// fresh `Arc<HashSet<Pubkey>>` per transaction so mints admitted by
+    /// the promoter mid-session are observed without reconnect.
+    pub type AllowedMintsHandle = Arc<ArcSwap<HashSet<Pubkey>>>;
+
     pub async fn run_axion_trigger_stream(
         plan: RabbitStreamPlan,
         axion_program: Pubkey,
-        allowed_mints: HashSet<Pubkey>,
+        allowed_mints: AllowedMintsHandle,
         hot_tracker: Option<Arc<HotMintTracker>>,
         mut on_trigger: impl FnMut(AxionTriggerSignal) -> anyhow::Result<()> + Send + 'static,
     ) -> anyhow::Result<()> {
@@ -83,13 +90,17 @@ pub mod yellowstone {
             if let Some(tracker) = &hot_tracker {
                 tracker.record_all(token_balance_mints(info_tx.meta.as_ref()));
             }
+            // Reload the current allowlist per transaction so mints admitted
+            // by the promoter after this stream started are visible on the
+            // very next signal, without needing a reconnect.
+            let allowed = allowed_mints.load();
             for signal in axion_trigger_signals(
                 signature.clone(),
                 transaction_update.slot,
                 txn,
                 info_tx.meta.as_ref(),
                 axion_program,
-                &allowed_mints,
+                allowed.as_ref(),
             ) {
                 on_trigger(signal)?;
             }
@@ -101,7 +112,7 @@ pub mod yellowstone {
     pub async fn run_fomo_trigger_stream(
         plan: RabbitStreamPlan,
         fomo_signer: Pubkey,
-        allowed_mints: HashSet<Pubkey>,
+        allowed_mints: AllowedMintsHandle,
         hot_tracker: Option<Arc<HotMintTracker>>,
         mut on_trigger: impl FnMut(FomoTriggerSignal) -> anyhow::Result<()> + Send + 'static,
     ) -> anyhow::Result<()> {
@@ -155,13 +166,14 @@ pub mod yellowstone {
             if let Some(tracker) = &hot_tracker {
                 tracker.record_all(token_balance_mints(info_tx.meta.as_ref()));
             }
+            let allowed = allowed_mints.load();
             for signal in fomo_trigger_signals(
                 signature.clone(),
                 transaction_update.slot,
                 txn,
                 info_tx.meta.as_ref(),
                 fomo_signer,
-                &allowed_mints,
+                allowed.as_ref(),
             ) {
                 on_trigger(signal)?;
             }

@@ -692,7 +692,14 @@ fn run_rabbitstream_trigger_worker(
         return Ok(());
     }
     let axion_program = Pubkey::from_str(&config.axion.program_id)?;
-    let allowed_mints = allowed_mints.into_iter().collect::<HashSet<_>>();
+    // Consume the `allowed_mints` argument (unused now: registry is the
+    // single source of truth). Log the seed size for parity with prior logs.
+    let seed_len = allowed_mints.len();
+    drop(allowed_mints);
+    // Hot-reload allowlist per transaction so mints admitted by the promoter
+    // after this worker started (i.e. beyond the config seed) are trigger-
+    // eligible without a reconnect.
+    let allowed_mints_handle = registry.lock().unwrap().allowed_handle();
     let helius_sender = if config.sender.primary == "helius" {
         HeliusSenderPlan::from_config(&config.sender.helius)?
             .map(HeliusSenderClient::new)
@@ -704,10 +711,8 @@ fn run_rabbitstream_trigger_worker(
         sender.start_connection_warmer();
     }
     info!(
-        "starting RabbitStream Axion trigger worker: url={} allowed_mints={} min_sol={:.6}",
-        plan.url,
-        allowed_mints.len(),
-        config.axion.min_sol
+        "starting RabbitStream Axion trigger worker: url={} seed_mints={} min_sol={:.6}",
+        plan.url, seed_len, config.axion.min_sol
     );
 
     tokio::spawn(async move {
@@ -728,7 +733,7 @@ fn run_rabbitstream_trigger_worker(
         loop {
             let plan_iter = plan.clone();
             let axion_program_iter = axion_program;
-            let allowed_mints_iter = allowed_mints.clone();
+            let allowed_mints_iter = Arc::clone(&allowed_mints_handle);
             let config_iter = config.clone();
             let rpc_client_iter = rpc_client.clone();
             let blockhash_cache_iter = blockhash_cache.clone();
@@ -901,7 +906,10 @@ fn run_fomo_trigger_worker(
         return Ok(());
     }
     let fomo_signer = Pubkey::from_str(&config.fomo.signer_pubkey)?;
-    let allowed_mints = allowed_mints.into_iter().collect::<HashSet<_>>();
+    let seed_len = allowed_mints.len();
+    drop(allowed_mints);
+    // Hot-reload allowlist per transaction (see run_rabbitstream_trigger_worker).
+    let allowed_mints_handle = registry.lock().unwrap().allowed_handle();
     let helius_sender = if config.sender.primary == "helius" {
         HeliusSenderPlan::from_config(&config.sender.helius)?
             .map(HeliusSenderClient::new)
@@ -913,11 +921,8 @@ fn run_fomo_trigger_worker(
         sender.start_connection_warmer();
     }
     info!(
-        "starting RabbitStream FOMO trigger worker: url={} signer={} allowed_mints={} min_sol={:.6}",
-        plan.url,
-        fomo_signer,
-        allowed_mints.len(),
-        config.fomo.min_sol
+        "starting RabbitStream FOMO trigger worker: url={} signer={} seed_mints={} min_sol={:.6}",
+        plan.url, fomo_signer, seed_len, config.fomo.min_sol
     );
 
     tokio::spawn(async move {
@@ -934,7 +939,7 @@ fn run_fomo_trigger_worker(
         loop {
             let plan_iter = plan.clone();
             let fomo_signer_iter = fomo_signer;
-            let allowed_mints_iter = allowed_mints.clone();
+            let allowed_mints_iter = Arc::clone(&allowed_mints_handle);
             let config_iter = config.clone();
             let rpc_client_iter = rpc_client.clone();
             let blockhash_cache_iter = blockhash_cache.clone();
