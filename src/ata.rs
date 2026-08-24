@@ -1,6 +1,10 @@
 use crate::constants::{sol_mint, usd1_mint, usdc_mint};
 use anyhow::{Context, Result};
-use solana_client::rpc_client::RpcClient;
+use solana_client::{
+    client_error::{ClientError, ClientErrorKind},
+    rpc_client::RpcClient,
+    rpc_request::{RpcError, RpcResponseErrorData},
+};
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction, pubkey::Pubkey, signature::Keypair, signer::Signer,
     transaction::Transaction,
@@ -11,6 +15,40 @@ use spl_associated_token_account::{
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
+
+/// Pull the preflight simulation payload out of a `ClientError`, if present.
+/// The default `Display` of `RpcResponseErrorData::SendTransactionPreflightFailure`
+/// swallows the log lines behind the string "[N log messages]", which makes
+/// diagnosing simulation errors impossible from the outside. Return a
+/// human-readable summary that we can attach as an anyhow context.
+fn extract_preflight_details(err: &ClientError) -> Option<String> {
+    if let ClientErrorKind::RpcError(RpcError::RpcResponseError {
+        data: RpcResponseErrorData::SendTransactionPreflightFailure(result),
+        ..
+    }) = err.kind()
+    {
+        let mut out = String::new();
+        if let Some(tx_err) = &result.err {
+            out.push_str(&format!("tx_err={tx_err:?}"));
+        }
+        if let Some(logs) = &result.logs {
+            if !logs.is_empty() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str("simulation_logs:\n  ");
+                out.push_str(&logs.join("\n  "));
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    } else {
+        None
+    }
+}
 
 /// Backoff schedule for `ensure_ata_async` retries. Kept as a constant so
 /// the promoter's failure budget math (Phase 6) can reason about worst-case
@@ -62,9 +100,16 @@ pub fn ensure_ata_exists(
                 blockhash,
             );
 
-            let sig = rpc_client
-                .send_and_confirm_transaction(&tx)
-                .context(format!("Failed to create {} ATA", mint_name))?;
+            let sig = rpc_client.send_and_confirm_transaction(&tx).map_err(|err| {
+                let details = extract_preflight_details(&err);
+                let base = anyhow::Error::new(err);
+                match details {
+                    Some(d) => base
+                        .context(d)
+                        .context(format!("Failed to create {} ATA", mint_name)),
+                    None => base.context(format!("Failed to create {} ATA", mint_name)),
+                }
+            })?;
 
             info!("{} ATA created successfully. Signature: {}", mint_name, sig);
             Ok(ata)
