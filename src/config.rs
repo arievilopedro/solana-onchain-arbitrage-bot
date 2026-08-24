@@ -98,6 +98,115 @@ pub struct RuntimeConfig {
     pub allowed_mints: Vec<String>,
     #[serde(default)]
     pub hot_mints: HotMintsConfig,
+    #[serde(default)]
+    pub promoter: PromoterConfig,
+}
+
+/// Promoter (M3b): auto-populate the active allowlist from `HotMintTracker`
+/// top-N, driving discovery / ATA / ALT / registry / gRPC hot-swap in the
+/// background. The seed set from `runtime.allowed_mints` is preserved as an
+/// invariant.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PromoterConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Reconciliation cadence. Defaults align with `hot_mints.rotate_ms` (5 min).
+    #[serde(default = "default_promoter_tick_ms")]
+    pub tick_ms: u64,
+    /// Grace period a mint spends in `Cooling` before demotion.
+    #[serde(default = "default_promoter_cooling_ms")]
+    pub cooling_ms: u64,
+    /// Delay after `GrpcSubscribed` before force-promotion to `Active` when
+    /// no first update was observed.
+    #[serde(default = "default_promoter_warmup_ms")]
+    pub warmup_ms: u64,
+    /// Per-attempt timeout for a single ALT promote (create + extend confirm).
+    #[serde(default = "default_promoter_alt_timeout_ms")]
+    pub alt_timeout_ms: u64,
+    /// Max lifecycle retries per phase before parking the mint.
+    #[serde(default = "default_promoter_max_retries")]
+    pub max_lifecycle_retries: u32,
+    /// Desired total size of the active allowlist `A = seed ∪ top_(K−|S|)`.
+    /// Actual N passed to `HotMintTracker::top_n` is `max(0, top_n_target −
+    /// |seed|)`.
+    #[serde(default = "default_promoter_top_n")]
+    pub top_n_target: usize,
+    /// Timeout waiting for a `SubscriptionAck` after a `Replace`.
+    #[serde(default = "default_promoter_grpc_ack_timeout_ms")]
+    pub grpc_ack_timeout_ms: u64,
+    #[serde(default)]
+    pub coldstart: PromoterColdStartConfig,
+    /// Reserved for future work: close ATA / deactivate ALT on evict.
+    #[serde(default)]
+    pub retire_ata_on_evict: bool,
+    #[serde(default)]
+    pub retire_alt_on_evict: bool,
+}
+
+impl Default for PromoterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tick_ms: default_promoter_tick_ms(),
+            cooling_ms: default_promoter_cooling_ms(),
+            warmup_ms: default_promoter_warmup_ms(),
+            alt_timeout_ms: default_promoter_alt_timeout_ms(),
+            max_lifecycle_retries: default_promoter_max_retries(),
+            top_n_target: default_promoter_top_n(),
+            grpc_ack_timeout_ms: default_promoter_grpc_ack_timeout_ms(),
+            coldstart: PromoterColdStartConfig::default(),
+            retire_ata_on_evict: false,
+            retire_alt_on_evict: false,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PromoterColdStartConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_coldstart_max_sigs")]
+    pub max_signatures: usize,
+    #[serde(default = "default_coldstart_budget_ms")]
+    pub budget_ms: u64,
+}
+
+impl Default for PromoterColdStartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_signatures: default_coldstart_max_sigs(),
+            budget_ms: default_coldstart_budget_ms(),
+        }
+    }
+}
+
+fn default_promoter_tick_ms() -> u64 {
+    300_000
+}
+fn default_promoter_cooling_ms() -> u64 {
+    600_000
+}
+fn default_promoter_warmup_ms() -> u64 {
+    5_000
+}
+fn default_promoter_alt_timeout_ms() -> u64 {
+    60_000
+}
+fn default_promoter_max_retries() -> u32 {
+    3
+}
+fn default_promoter_top_n() -> usize {
+    27
+}
+fn default_promoter_grpc_ack_timeout_ms() -> u64 {
+    5_000
+}
+fn default_coldstart_max_sigs() -> usize {
+    1_000
+}
+fn default_coldstart_budget_ms() -> u64 {
+    30_000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -473,6 +582,48 @@ impl AppConfig {
             if self.runtime.hot_mints.window_ms < self.runtime.hot_mints.rotate_ms {
                 anyhow::bail!(
                     "runtime.hot_mints.window_ms must be >= rotate_ms when enabled"
+                );
+            }
+        }
+
+        if self.runtime.promoter.enabled {
+            if !self.runtime.hot_mints.enabled {
+                anyhow::bail!(
+                    "runtime.promoter.enabled requires runtime.hot_mints.enabled=true"
+                );
+            }
+            if !self.grpc.enabled {
+                anyhow::bail!("runtime.promoter.enabled requires grpc.enabled=true");
+            }
+            if self.runtime.promoter.tick_ms == 0 {
+                anyhow::bail!("runtime.promoter.tick_ms must be > 0 when enabled");
+            }
+            if self.runtime.promoter.warmup_ms == 0 {
+                anyhow::bail!("runtime.promoter.warmup_ms must be > 0 when enabled");
+            }
+            if self.runtime.promoter.top_n_target == 0 {
+                anyhow::bail!("runtime.promoter.top_n_target must be >= 1 when enabled");
+            }
+            if self.runtime.promoter.alt_timeout_ms == 0 {
+                anyhow::bail!("runtime.promoter.alt_timeout_ms must be > 0 when enabled");
+            }
+            if self.runtime.promoter.grpc_ack_timeout_ms == 0 {
+                anyhow::bail!(
+                    "runtime.promoter.grpc_ack_timeout_ms must be > 0 when enabled"
+                );
+            }
+            if self.runtime.promoter.top_n_target < self.runtime.allowed_mints.len() {
+                anyhow::bail!(
+                    "runtime.promoter.top_n_target ({}) must be >= |seed| ({}) so seed is preserved",
+                    self.runtime.promoter.top_n_target,
+                    self.runtime.allowed_mints.len()
+                );
+            }
+            if self.runtime.promoter.coldstart.enabled
+                && self.runtime.promoter.coldstart.budget_ms == 0
+            {
+                anyhow::bail!(
+                    "runtime.promoter.coldstart.budget_ms must be > 0 when coldstart enabled"
                 );
             }
         }

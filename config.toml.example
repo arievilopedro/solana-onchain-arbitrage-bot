@@ -34,6 +34,29 @@ top_n = 27
 window_ms = 900000    # 15 minutes (must be >= rotate_ms)
 rotate_ms = 300000    # 5 minutes
 
+[runtime.promoter]
+# M3b: auto-promote top-N hot mints into the runtime allowlist end-to-end
+# (discovery + ATA + ALT + registry + gRPC subscription hot-swap). Seed
+# (`runtime.allowed_mints`) is preserved as an invariant `A ⊇ S`.
+# Requires `runtime.hot_mints.enabled=true` and `grpc.enabled=true`.
+enabled = false
+tick_ms = 300000              # reconciliation cadence (match hot_mints.rotate_ms)
+cooling_ms = 600000           # grace after LeftTopN before demote
+warmup_ms = 5000              # GrpcSubscribed -> Active fallback delay
+alt_timeout_ms = 60000        # per-attempt ALT promote budget
+max_lifecycle_retries = 3
+top_n_target = 27             # |A| = seed ∪ top_(top_n_target − |seed|)
+grpc_ack_timeout_ms = 5000
+retire_ata_on_evict = false   # keep ATA rent parked on demote (recommended)
+retire_alt_on_evict = false   # keep ALT slot allocated on demote
+
+[runtime.promoter.coldstart]
+# One-shot RPC scan of pump-amm signatures at boot to seed HotMintTracker
+# without waiting 15 min of live trigger stream traffic.
+enabled = false
+max_signatures = 1000
+budget_ms = 30000
+
 [axion]
 enabled = true
 program_id = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9"

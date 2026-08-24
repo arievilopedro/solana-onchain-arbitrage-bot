@@ -15,6 +15,24 @@ use solana_onchain_arbitrage_bot::execution::{
     build_controlled_transaction, build_controlled_transaction_with_nonce,
     ControlledExecutionParams,
 };
+#[cfg(feature = "geyser")]
+use solana_onchain_arbitrage_bot::promoter::orchestrator::{
+    PromoterInputs, PromoterOrchestrator,
+};
+#[cfg(feature = "geyser")]
+use solana_onchain_arbitrage_bot::promoter::ShardSlot;
+#[cfg(feature = "geyser")]
+use solana_onchain_arbitrage_bot::promoter::coldstart::{
+    seed_hot_mint_tracker, ColdStartScanConfig,
+    rpc::RpcTransactionScanner,
+};
+#[cfg(feature = "geyser")]
+use solana_onchain_arbitrage_bot::streams::grpc::{
+    controlled_v1_subscriptions, GrpcWorkerHandle, CONTROLLED_FILTERS_PER_MINT,
+    CONTROLLED_MAX_FILTERS_PER_STREAM,
+};
+#[cfg(feature = "geyser")]
+use solana_onchain_arbitrage_bot::streams::shard_slot::ShardSlotAllocator;
 use solana_onchain_arbitrage_bot::nonce::{parse_nonce_pubkeys, NonceManager};
 use solana_onchain_arbitrage_bot::registry::{DlmmRouteState, PumpRouteState};
 use solana_onchain_arbitrage_bot::routes::{FixedDlmmRoutePacker, RouteGroup};
@@ -98,12 +116,12 @@ async fn main() -> anyhow::Result<()> {
 
     let rpc_client = Arc::new(RpcClient::new(config.rpc.http.clone()));
     ensure_base_atas_exist(&rpc_client, &wallet).context("failed to verify base token ATAs")?;
-    let bootstrap = ControlledRpcBootstrap::new(
+    let bootstrap = Arc::new(ControlledRpcBootstrap::new(
         rpc_client.clone(),
         RpcBootstrapConfig {
             min_pool_base_liquidity_lamports: config.execution.min_pool_base_liquidity_lamports,
         },
-    );
+    ));
     let report = bootstrap
         .bootstrap(&allowed_mints)
         .context("controlled RPC bootstrap failed")?;
@@ -250,6 +268,41 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Cold-start scan: pre-populate the tracker so promoter decisions don't
+    // wait for `window_ms` of live trigger traffic. No-op if disabled or if
+    // the tracker itself is disabled.
+    #[cfg(feature = "geyser")]
+    if let (Some(tracker), true) = (
+        hot_tracker.as_ref(),
+        config.runtime.promoter.enabled && config.runtime.promoter.coldstart.enabled,
+    ) {
+        let tracker = tracker.clone();
+        let rpc = rpc_client.clone();
+        let cfg = config.runtime.promoter.coldstart.clone();
+        let scan = tokio::task::spawn_blocking(move || {
+            let scanner = RpcTransactionScanner::new(rpc);
+            let scan_cfg = ColdStartScanConfig {
+                max_signatures: cfg.max_signatures,
+                budget: Duration::from_millis(cfg.budget_ms),
+                programs: vec![pump_program_id()],
+            };
+            seed_hot_mint_tracker(&scanner, tracker.as_ref(), &scan_cfg)
+        })
+        .await
+        .context("cold-start scan task join failed")?;
+        match scan {
+            Ok(report) => info!(
+                "cold-start scan complete: signatures_examined={} mints_recorded={} budget_exhausted={} elapsed_ms={} tx_errors={}",
+                report.signatures_examined,
+                report.mints_recorded,
+                report.budget_exhausted,
+                report.elapsed.as_millis(),
+                report.transaction_errors
+            ),
+            Err(e) => tracing::warn!(error = %e, "cold-start scan failed; proceeding without seed"),
+        }
+    }
+
     info!("supervisor bootstrap complete; starting configured stream workers");
     run_stream_workers(
         &config,
@@ -263,6 +316,8 @@ async fn main() -> anyhow::Result<()> {
         grpc_plans,
         rabbitstream_plan,
         hot_tracker,
+        #[cfg(feature = "geyser")]
+        bootstrap,
     )
     .await?;
 
@@ -481,6 +536,7 @@ async fn run_stream_workers(
     grpc_plans: Vec<GeyserAccountStreamPlan>,
     rabbitstream_plan: Option<RabbitStreamPlan>,
     hot_tracker: Option<Arc<HotMintTracker>>,
+    #[cfg(feature = "geyser")] bootstrap: Arc<ControlledRpcBootstrap>,
 ) -> anyhow::Result<()> {
     run_rabbitstream_trigger_worker(
         config.clone(),
@@ -502,9 +558,25 @@ async fn run_stream_workers(
         wallet.clone(),
         registry.clone(),
         rabbitstream_plan,
-        allowed_mints,
-        hot_tracker,
+        allowed_mints.clone(),
+        hot_tracker.clone(),
     )?;
+
+    #[cfg(feature = "geyser")]
+    if config.runtime.promoter.enabled {
+        return run_promoter_geyser_stack(
+            config,
+            rpc_client,
+            route_execution_cache,
+            runtime_account_cache,
+            wallet,
+            allowed_mints,
+            registry,
+            hot_tracker,
+            bootstrap,
+        )
+        .await;
+    }
 
     run_geyser_account_worker(
         config,
@@ -1448,6 +1520,7 @@ async fn run_geyser_account_worker(
                 registry,
                 plan,
                 worker_index,
+                None,
             )
             .await
             {
@@ -1464,6 +1537,130 @@ async fn run_geyser_account_worker(
     Ok(())
 }
 
+/// Promoter-mode gRPC stack: spawn N command-aware slot workers, hand their
+/// command_tx to a `PromoterOrchestrator`, then park until shutdown.
+#[cfg(feature = "geyser")]
+async fn run_promoter_geyser_stack(
+    config: &AppConfig,
+    rpc_client: Arc<RpcClient>,
+    route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
+    runtime_account_cache: Arc<Mutex<RuntimeAccountCache>>,
+    wallet: Arc<solana_sdk::signature::Keypair>,
+    allowed_mints: Vec<Pubkey>,
+    registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
+    hot_tracker: Option<Arc<HotMintTracker>>,
+    bootstrap: Arc<ControlledRpcBootstrap>,
+) -> anyhow::Result<()> {
+    if !config.grpc.enabled {
+        anyhow::bail!("runtime.promoter.enabled requires grpc.enabled=true");
+    }
+    let Some(tracker) = hot_tracker else {
+        anyhow::bail!("runtime.promoter.enabled requires runtime.hot_mints.enabled=true");
+    };
+
+    let per_slot_mints = CONTROLLED_MAX_FILTERS_PER_STREAM / CONTROLLED_FILTERS_PER_MINT;
+    let num_slots = (config.runtime.promoter.top_n_target + per_slot_mints - 1) / per_slot_mints;
+    let num_slots = num_slots.max(1);
+
+    // Allocator: preassign seed so restarts keep identical slot assignments.
+    let mut allocator = ShardSlotAllocator::new(num_slots, per_slot_mints)?;
+    allocator
+        .preassign_seed(&allowed_mints)
+        .map_err(|e| anyhow::anyhow!("shard slot preassign failed: {e}"))?;
+    info!(
+        "promoter shard allocator: slots={} per_slot={} seed_assigned={}",
+        num_slots,
+        per_slot_mints,
+        allowed_mints.len()
+    );
+
+    // Spawn one command-aware worker per slot. Initial subscription reflects
+    // the seed subset assigned to that slot (may be empty for high slot ids
+    // when |seed| < num_slots).
+    let mut worker_handles: Vec<GrpcWorkerHandle> = Vec::with_capacity(num_slots);
+    for slot_idx in 0..num_slots {
+        let slot = ShardSlot::new(slot_idx as u16);
+        let mints: Vec<Pubkey> = allocator
+            .mints_for_slot(slot)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
+        let subscriptions = controlled_v1_subscriptions(&mints);
+        let plan = GeyserAccountStreamPlan {
+            url: config.grpc.url.clone(),
+            x_token: config.grpc.x_token.clone(),
+            subscriptions,
+        };
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(16);
+        worker_handles.push(GrpcWorkerHandle {
+            slot,
+            command_tx,
+        });
+
+        let cfg = config.clone();
+        let rpc = rpc_client.clone();
+        let rec = route_execution_cache.clone();
+        let rac = runtime_account_cache.clone();
+        let wallet_c = wallet.clone();
+        let registry_c = registry.clone();
+        tokio::spawn(async move {
+            if let Err(error) = run_single_geyser_account_worker(
+                cfg,
+                rpc,
+                rec,
+                rac,
+                wallet_c,
+                registry_c,
+                plan,
+                slot_idx,
+                Some(command_rx),
+            )
+            .await
+            {
+                tracing::error!(
+                    "promoter gRPC slot worker stopped: slot={} error={}",
+                    slot_idx,
+                    error
+                );
+            }
+        });
+    }
+
+    let seed_set: std::collections::HashSet<Pubkey> = allowed_mints.iter().copied().collect();
+    let inputs = PromoterInputs {
+        config: config.runtime.promoter.clone(),
+        rpc: rpc_client.clone(),
+        wallet: wallet.clone(),
+        tracker,
+        registry: registry.clone(),
+        bootstrap,
+        grpc_workers: worker_handles,
+        shard_alloc: Arc::new(Mutex::new(allocator)),
+        seed: Arc::new(seed_set),
+        state_file: config.lookup_tables.route_shards.state_file.clone().into(),
+        shard_capacity: config.lookup_tables.route_shards.max_addresses,
+        auto_create: config.lookup_tables.route_shards.auto_create,
+        auto_extend: config.lookup_tables.route_shards.auto_extend,
+        min_pool_base_liquidity_lamports: config.execution.min_pool_base_liquidity_lamports,
+        max_pool_state_age_ms: config.execution.max_pool_state_age_ms,
+    };
+    let (orchestrator, event_rx) = PromoterOrchestrator::new(inputs);
+    let orchestrator = Arc::new(orchestrator);
+    let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn({
+        let orch = orchestrator.clone();
+        async move {
+            if let Err(error) = orch.run(event_rx, cancel_rx).await {
+                tracing::error!("promoter orchestrator stopped: error={}", error);
+            }
+        }
+    });
+    info!("promoter orchestrator spawned; parking main task");
+
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
 #[cfg(feature = "geyser")]
 async fn run_single_geyser_account_worker(
     config: AppConfig,
@@ -1474,9 +1671,14 @@ async fn run_single_geyser_account_worker(
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
     plan: GeyserAccountStreamPlan,
     worker_index: usize,
+    command_rx: Option<
+        tokio::sync::mpsc::Receiver<
+            solana_onchain_arbitrage_bot::streams::grpc::SubscriptionCommand,
+        >,
+    >,
 ) -> anyhow::Result<()> {
     use solana_onchain_arbitrage_bot::streams::grpc::yellowstone::{
-        run_account_stream, GeyserStreamUpdate,
+        run_account_stream, run_account_stream_with_commands, GeyserStreamUpdate,
     };
 
     let enricher = StreamRpcEnricher::new(rpc_client.clone());
@@ -1485,12 +1687,13 @@ async fn run_single_geyser_account_worker(
     let mut last_route_refresh_by_mint = HashMap::<Pubkey, Instant>::new();
     let mut slot_tracker = SlotTracker::new(150);
     info!(
-        "starting gRPC account worker: worker={} url={} subscriptions={}",
+        "starting gRPC account worker: worker={} url={} subscriptions={} command_aware={}",
         worker_index,
         plan.url,
-        plan.subscriptions.len()
+        plan.subscriptions.len(),
+        command_rx.is_some()
     );
-    run_account_stream(plan, |update| {
+    let handler = move |update: GeyserStreamUpdate| -> anyhow::Result<()> {
         let update = match update {
             GeyserStreamUpdate::Account(update) => update,
             GeyserStreamUpdate::Slot(slot_update) => {
@@ -1506,7 +1709,7 @@ async fn run_single_geyser_account_worker(
             let registry = registry
                 .lock()
                 .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
-            registry.allowed_mints().collect()
+            registry.allowed_mints()
         };
 
         let slot = update.slot;
@@ -1647,8 +1850,12 @@ async fn run_single_geyser_account_worker(
         }
 
         Ok(())
-    })
-    .await
+    };
+
+    match command_rx {
+        Some(rx) => run_account_stream_with_commands(plan, rx, handler).await,
+        None => run_account_stream(plan, handler).await,
+    }
 }
 
 #[cfg(feature = "geyser")]

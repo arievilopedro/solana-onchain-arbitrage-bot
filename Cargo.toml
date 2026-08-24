@@ -70,6 +70,7 @@ rand = "0.8"
 bs58 = "0.4"
 borsh = "0.10.3"
 dashmap = "5.5"
+arc-swap = "1"
 bytemuck = { version = "1.16.1", features = ["derive"] }
 base64 = "0.21"
 bincode = "1.3"

@@ -3,3 +3,8 @@
 Cargo.lock
 .env
 config.toml
+
+# Ad-hoc debug fixtures (raw tx / signature dumps)
+/fomo*.json
+/tx*.json
+/nul

@@ -36,6 +36,20 @@ pub struct RpcBootstrapReport {
     pub skipped_low_liquidity: usize,
 }
 
+/// Result of per-mint discovery: the freshly-built runtime state plus the
+/// per-mint accounting counters that the aggregate `bootstrap` report sums.
+///
+/// Split out from the internal loop body so the promoter (Phase 6) can call
+/// `discover_mint` directly for a single new hot mint without touching the
+/// registry.
+#[derive(Debug)]
+pub struct MintDiscoveryResult {
+    pub state: MintRuntimeState,
+    pub discovered_pump: usize,
+    pub discovered_dlmm: usize,
+    pub skipped_low_liquidity: usize,
+}
+
 pub struct ControlledRpcBootstrap {
     rpc: Arc<RpcClient>,
     config: RpcBootstrapConfig,
@@ -53,69 +67,89 @@ impl ControlledRpcBootstrap {
         let mut skipped_low_liquidity = 0usize;
 
         for mint in allowed_mints {
-            let token_program = self.rpc.get_account(mint)?.owner;
-            let mut state = MintRuntimeState::new(*mint, token_program);
-
-            let pump_accounts = self.discover_pump_pool_accounts(*mint)?;
-            for (pool, account) in pump_accounts {
-                let Some(route_state) = pump_route_state_from_account(
-                    *mint,
-                    pool,
-                    &account,
-                    |token_vault, base_vault| {
-                        self.pump_vault_liquidity(token_vault, base_vault)
-                            .with_context(|| {
-                                format!("failed to read Pump vault liquidity for pool {}", pool)
-                            })
-                    },
-                )?
-                else {
-                    continue;
-                };
-
-                if route_state
-                    .liquidity
-                    .map(|l| l.base_lamports >= self.config.min_pool_base_liquidity_lamports)
-                    .unwrap_or(false)
-                {
-                    discovered_pump += 1;
-                    state.pump.push(route_state);
-                } else {
-                    skipped_low_liquidity += 1;
-                }
-            }
-
-            let dlmm_accounts = self.discover_dlmm_accounts(*mint)?;
-            for (pair, account) in dlmm_accounts {
-                let Some(route_state) = dlmm_route_state_from_account(
-                    *mint,
-                    pair,
-                    &account,
-                    |base_vault| self.base_vault_liquidity(base_vault),
-                    |pair| self.dlmm_bitmap_extension(pair),
-                    |mint| mint_uses_token_2022(&self.rpc, mint),
-                )?
-                else {
-                    continue;
-                };
-
-                if route_state
-                    .liquidity
-                    .map(|l| l.base_lamports >= self.config.min_pool_base_liquidity_lamports)
-                    .unwrap_or(false)
-                {
-                    discovered_dlmm += 1;
-                    state.dlmms.push(route_state);
-                } else {
-                    skipped_low_liquidity += 1;
-                }
-            }
-
-            registry.upsert_mint(state)?;
+            let result = self.discover_mint(*mint)?;
+            discovered_pump += result.discovered_pump;
+            discovered_dlmm += result.discovered_dlmm;
+            skipped_low_liquidity += result.skipped_low_liquidity;
+            registry.upsert_mint(result.state)?;
         }
 
         Ok(RpcBootstrapReport {
             registry,
+            discovered_pump,
+            discovered_dlmm,
+            skipped_low_liquidity,
+        })
+    }
+
+    /// Discover every SOL-paired Pump AMM and Meteora DLMM pool for `mint` and
+    /// package them into a `MintRuntimeState`. Pure per-mint operation with no
+    /// registry interaction, used by both the bulk startup `bootstrap` and the
+    /// hot-mint promoter's on-demand path.
+    pub fn discover_mint(&self, mint: Pubkey) -> anyhow::Result<MintDiscoveryResult> {
+        let token_program = self.rpc.get_account(&mint)?.owner;
+        let mut state = MintRuntimeState::new(mint, token_program);
+        let mut discovered_pump = 0usize;
+        let mut discovered_dlmm = 0usize;
+        let mut skipped_low_liquidity = 0usize;
+
+        let pump_accounts = self.discover_pump_pool_accounts(mint)?;
+        for (pool, account) in pump_accounts {
+            let Some(route_state) = pump_route_state_from_account(
+                mint,
+                pool,
+                &account,
+                |token_vault, base_vault| {
+                    self.pump_vault_liquidity(token_vault, base_vault)
+                        .with_context(|| {
+                            format!("failed to read Pump vault liquidity for pool {}", pool)
+                        })
+                },
+            )?
+            else {
+                continue;
+            };
+
+            if route_state
+                .liquidity
+                .map(|l| l.base_lamports >= self.config.min_pool_base_liquidity_lamports)
+                .unwrap_or(false)
+            {
+                discovered_pump += 1;
+                state.pump.push(route_state);
+            } else {
+                skipped_low_liquidity += 1;
+            }
+        }
+
+        let dlmm_accounts = self.discover_dlmm_accounts(mint)?;
+        for (pair, account) in dlmm_accounts {
+            let Some(route_state) = dlmm_route_state_from_account(
+                mint,
+                pair,
+                &account,
+                |base_vault| self.base_vault_liquidity(base_vault),
+                |pair| self.dlmm_bitmap_extension(pair),
+                |mint| mint_uses_token_2022(&self.rpc, mint),
+            )?
+            else {
+                continue;
+            };
+
+            if route_state
+                .liquidity
+                .map(|l| l.base_lamports >= self.config.min_pool_base_liquidity_lamports)
+                .unwrap_or(false)
+            {
+                discovered_dlmm += 1;
+                state.dlmms.push(route_state);
+            } else {
+                skipped_low_liquidity += 1;
+            }
+        }
+
+        Ok(MintDiscoveryResult {
+            state,
             discovered_pump,
             discovered_dlmm,
             skipped_low_liquidity,
@@ -205,6 +239,25 @@ impl ControlledRpcBootstrap {
             _ => Ok(None),
         }
     }
+}
+
+/// Async wrapper around `ControlledRpcBootstrap::discover_mint`. Runs the
+/// blocking RPC discovery on `tokio::task::spawn_blocking` so the promoter's
+/// tick loop stays responsive. `bootstrap` is shared as an `Arc` because the
+/// blocking task must own its inputs.
+pub async fn discover_mint_async(
+    bootstrap: Arc<ControlledRpcBootstrap>,
+    mint: Pubkey,
+) -> anyhow::Result<MintDiscoveryResult> {
+    tokio::task::spawn_blocking(move || bootstrap.discover_mint(mint))
+        .await
+        .map_err(|join_err| {
+            anyhow::anyhow!(
+                "discover_mint_async join error for {}: {}",
+                mint,
+                join_err
+            )
+        })?
 }
 
 pub fn pump_route_state_from_account(

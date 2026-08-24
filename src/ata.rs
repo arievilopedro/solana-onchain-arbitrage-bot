@@ -8,10 +8,21 @@ use solana_sdk::{
 use spl_associated_token_account::{
     get_associated_token_address, instruction::create_associated_token_account_idempotent,
 };
-use tracing::info;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{info, warn};
 
-/// Ensures a single ATA exists, creating it if necessary
-fn ensure_ata_exists(
+/// Backoff schedule for `ensure_ata_async` retries. Kept as a constant so
+/// the promoter's failure budget math (Phase 6) can reason about worst-case
+/// latency without duplicating the values.
+pub const ATA_RETRY_DELAYS: &[Duration] = &[
+    Duration::from_millis(500),
+    Duration::from_millis(1_000),
+    Duration::from_millis(2_000),
+];
+
+/// Ensures a single ATA exists, creating it if necessary. Idempotent.
+pub fn ensure_ata_exists(
     rpc_client: &RpcClient,
     wallet_kp: &Keypair,
     mint: &Pubkey,
@@ -59,6 +70,55 @@ fn ensure_ata_exists(
             Ok(ata)
         }
     }
+}
+
+/// Async wrapper around `ensure_ata_exists` with a small retry budget suitable
+/// for the promoter's per-mint promotion flow. Runs the blocking RPC call on
+/// `spawn_blocking` and re-tries transient failures (network hiccups, blockhash
+/// races) with the schedule in `ATA_RETRY_DELAYS`.
+pub async fn ensure_ata_async(
+    rpc_client: Arc<RpcClient>,
+    wallet_kp: Arc<Keypair>,
+    mint: Pubkey,
+    mint_name: String,
+) -> Result<Pubkey> {
+    let mut last_err: Option<anyhow::Error> = None;
+    // One initial attempt plus one per retry delay.
+    for attempt in 0..=ATA_RETRY_DELAYS.len() {
+        let rpc = Arc::clone(&rpc_client);
+        let wallet = Arc::clone(&wallet_kp);
+        let label = mint_name.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            ensure_ata_exists(rpc.as_ref(), wallet.as_ref(), &mint, &label)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(ata)) => return Ok(ata),
+            Ok(Err(err)) => {
+                if let Some(delay) = ATA_RETRY_DELAYS.get(attempt) {
+                    warn!(
+                        mint = %mint,
+                        attempt = attempt + 1,
+                        error = %err,
+                        retry_in_ms = delay.as_millis() as u64,
+                        "ATA creation failed, retrying"
+                    );
+                    tokio::time::sleep(*delay).await;
+                }
+                last_err = Some(err);
+            }
+            Err(join_err) => {
+                return Err(anyhow::anyhow!(
+                    "ensure_ata_async join error for {}: {}",
+                    mint,
+                    join_err
+                ));
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| anyhow::anyhow!("ensure_ata_async exhausted retries for {}", mint)))
 }
 
 /// Ensures all base token ATAs (WSOL, USDC, USD1) exist.

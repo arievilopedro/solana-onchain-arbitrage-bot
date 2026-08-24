@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 pub mod grpc;
 pub mod rabbitstream;
 pub mod rpc;
+pub mod shard_slot;
 
 #[derive(Debug, Clone)]
 pub struct PoolAccountUpdate {
@@ -256,7 +257,7 @@ pub fn apply_pool_account_update(
     mint_uses_token_2022: impl Fn(Pubkey) -> anyhow::Result<bool>,
     dlmm_bitmap_extension: impl Fn(Pubkey) -> anyhow::Result<Option<Pubkey>>,
 ) -> anyhow::Result<RegistryUpdateReport> {
-    let allowed_mints: Vec<Pubkey> = registry.allowed_mints().collect();
+    let allowed_mints: Vec<Pubkey> = registry.allowed_mints();
     let slot = update.slot;
     let plan = prepare_pool_account_update(
         &allowed_mints,

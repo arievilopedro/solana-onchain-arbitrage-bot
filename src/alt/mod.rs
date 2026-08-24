@@ -619,6 +619,113 @@ pub fn maintain_route_shards_incremental(
     Ok(report)
 }
 
+/// Per-mint entry point used by the promoter. Reuses the incremental planner
+/// against a single-element route list so a newly-hot mint gets its primary
+/// shard (+ any extensions its DLMM count requires) installed and persisted
+/// without touching the batch code path.
+///
+/// The returned `PromoteMintReport` exposes the primary shard and any
+/// extension shards resolved from the freshly-persisted state file, along
+/// with `already_present` — true when no plan was emitted, meaning the mint's
+/// route block already covered every eligible DLMM.
+#[derive(Debug)]
+pub struct PromoteMintReport {
+    pub primary_shard: Pubkey,
+    pub extensions: Vec<Pubkey>,
+    pub confirmed: Vec<ConfirmedRouteShardOperation>,
+    pub already_present: bool,
+}
+
+pub fn promote_mint_into_shard(
+    rpc_client: &RpcClient,
+    wallet: &Keypair,
+    state_file: impl AsRef<Path>,
+    allowed_mints: impl IntoIterator<Item = Pubkey>,
+    shard_capacity: usize,
+    route: StableMintRouteAccounts,
+    auto_create: bool,
+    auto_extend: bool,
+    recent_slot_candidates: &[u64],
+) -> anyhow::Result<PromoteMintReport> {
+    let state_file = state_file.as_ref();
+    let mint = route.mint;
+
+    let report = maintain_route_shards_incremental(
+        rpc_client,
+        wallet,
+        state_file,
+        allowed_mints,
+        shard_capacity,
+        vec![route],
+        auto_create,
+        auto_extend,
+        recent_slot_candidates,
+    )?;
+
+    let already_present = report.mint_blocks == 0
+        && report.extend_shard_extension == 0
+        && report.create_shard_extension == 0
+        && report.skipped_disabled == 0;
+
+    let resolver = RouteShardLookupResolver::load(state_file)?;
+    let shards = resolver.shards_for_mint(mint)?;
+    let mut iter = shards.into_iter();
+    let primary_shard = iter.next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "promote_mint_into_shard: mint {} not present in state file after maintenance",
+            mint
+        )
+    })?;
+    let extensions: Vec<Pubkey> = iter.collect();
+
+    Ok(PromoteMintReport {
+        primary_shard,
+        extensions,
+        confirmed: report.confirmed,
+        already_present,
+    })
+}
+
+/// Async wrapper around `promote_mint_into_shard`. Runs the blocking planner +
+/// on-chain confirm on `spawn_blocking` so the promoter tick loop can drive
+/// multiple mints concurrently, and enforces the promoter's ALT timeout
+/// budget from the caller side.
+#[allow(clippy::too_many_arguments)]
+pub async fn promote_mint_into_shard_async(
+    rpc_client: std::sync::Arc<RpcClient>,
+    wallet: std::sync::Arc<Keypair>,
+    state_file: std::path::PathBuf,
+    allowed_mints: Vec<Pubkey>,
+    shard_capacity: usize,
+    route: StableMintRouteAccounts,
+    auto_create: bool,
+    auto_extend: bool,
+    recent_slot_candidates: Vec<u64>,
+) -> anyhow::Result<PromoteMintReport> {
+    let mint = route.mint;
+    tokio::task::spawn_blocking(move || {
+        promote_mint_into_shard(
+            rpc_client.as_ref(),
+            wallet.as_ref(),
+            &state_file,
+            allowed_mints,
+            shard_capacity,
+            route,
+            auto_create,
+            auto_extend,
+            &recent_slot_candidates,
+        )
+    })
+    .await
+    .map_err(|join_err| {
+        anyhow::anyhow!(
+            "promote_mint_into_shard_async join error for {}: {}",
+            mint,
+            join_err
+        )
+    })?
+}
+
 fn execute_planned_extension(
     planner: &mut RouteShardPlanner,
     plan: PlannedRouteShardExtension,

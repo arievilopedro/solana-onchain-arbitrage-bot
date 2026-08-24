@@ -10,8 +10,43 @@ use crate::dex::meteora::dlmm_info::DlmmInfo;
 use crate::dex::pump::amm_info::PUMP_BASE_MINT_GPA_OFFSET;
 use crate::dex::pump::pump_program_id;
 use solana_program::pubkey::Pubkey;
+use tokio::sync::oneshot;
 
-const CONTROLLED_MAX_FILTERS_PER_STREAM: usize = 9;
+pub const CONTROLLED_MAX_FILTERS_PER_STREAM: usize = 9;
+/// Number of subscription filters generated per mint (pump-base, dlmm-x,
+/// dlmm-y). Public so the shard slot allocator sizing stays honest.
+pub const CONTROLLED_FILTERS_PER_MINT: usize = 3;
+
+/// Command sent by the promoter orchestrator to a live gRPC subscription
+/// worker. `Replace` re-installs the full filter set for one shard slot;
+/// `Shutdown` drops the connection.
+#[derive(Debug)]
+pub enum SubscriptionCommand {
+    Replace {
+        mints: Vec<Pubkey>,
+        ack: oneshot::Sender<SubscriptionAck>,
+    },
+    Shutdown,
+}
+
+/// Acknowledgement for a `Replace`.
+#[derive(Debug, Clone)]
+pub enum SubscriptionAck {
+    Applied {
+        applied_at_ms: u128,
+        subscriptions: usize,
+    },
+    Failed(String),
+}
+
+/// Handle to a live gRPC subscription worker owned by the promoter. Carries
+/// the shard slot identifier and the command channel; callers keep this in a
+/// `Vec<GrpcWorkerHandle>` indexed by slot for O(1) Replace dispatch.
+#[derive(Debug, Clone)]
+pub struct GrpcWorkerHandle {
+    pub slot: crate::promoter::ShardSlot,
+    pub command_tx: tokio::sync::mpsc::Sender<SubscriptionCommand>,
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct GeyserAccountStreamPlan {
@@ -67,7 +102,10 @@ impl GeyserAccountStreamPlan {
     }
 }
 
-fn controlled_v1_subscriptions(allowed_mints: &[Pubkey]) -> Vec<GeyserAccountSubscription> {
+/// Build the pump-base + dlmm-x + dlmm-y filter set for the given mints.
+/// Publicly available so the promoter can compose per-slot filter batches on
+/// `SubscriptionCommand::Replace`.
+pub fn controlled_v1_subscriptions(allowed_mints: &[Pubkey]) -> Vec<GeyserAccountSubscription> {
     let mut subscriptions = Vec::with_capacity(allowed_mints.len() * 3);
     for mint in allowed_mints {
         subscriptions.push(GeyserAccountSubscription {
@@ -94,12 +132,17 @@ fn controlled_v1_subscriptions(allowed_mints: &[Pubkey]) -> Vec<GeyserAccountSub
 
 #[cfg(feature = "geyser")]
 pub mod yellowstone {
-    use super::GeyserAccountStreamPlan;
+    use super::{
+        controlled_v1_subscriptions, GeyserAccountStreamPlan, GeyserAccountSubscription,
+        SubscriptionAck, SubscriptionCommand,
+    };
     use crate::streams::{PoolAccountUpdate, SlotUpdate};
     use futures::{SinkExt, StreamExt};
     use solana_program::pubkey::Pubkey;
     use solana_sdk::account::Account;
     use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::mpsc;
     use yellowstone_grpc_client::GeyserGrpcClient;
     use yellowstone_grpc_proto::prelude::{
         subscribe_request_filter_accounts_filter::Filter,
@@ -115,8 +158,28 @@ pub mod yellowstone {
         Slot(SlotUpdate),
     }
 
+    /// Legacy entry point (no command channel). Preserved so the existing
+    /// worker in `main.rs` keeps compiling until Phase 7 migrates it to the
+    /// command-aware variant. Internally forwards to
+    /// `run_account_stream_with_commands` with an already-closed receiver so
+    /// no `Replace` traffic can arrive.
     pub async fn run_account_stream(
         plan: GeyserAccountStreamPlan,
+        on_update: impl FnMut(GeyserStreamUpdate) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let (_tx, rx) = mpsc::channel::<SubscriptionCommand>(1);
+        drop(_tx);
+        run_account_stream_with_commands(plan, rx, on_update).await
+    }
+
+    /// Command-aware account stream. In addition to forwarding gRPC updates
+    /// to `on_update`, listens on `command_rx` for `Replace` requests that
+    /// re-install the entire filter set (Yellowstone atomically swaps the
+    /// active filter map when a new `SubscribeRequest` is received on the
+    /// existing bi-di stream).
+    pub async fn run_account_stream_with_commands(
+        plan: GeyserAccountStreamPlan,
+        mut command_rx: mpsc::Receiver<SubscriptionCommand>,
         mut on_update: impl FnMut(GeyserStreamUpdate) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let mut builder = GeyserGrpcClient::build_from_shared(plan.url.clone())?;
@@ -129,8 +192,82 @@ pub mod yellowstone {
             .await?;
 
         let (mut tx, mut stream) = client.subscribe().await?;
+        let initial = build_subscribe_request(&plan.subscriptions);
+        if initial.accounts.is_empty() {
+            // Empty initial is legal only for command-aware (promoter) paths
+            // that will Replace the filter set before any updates are needed.
+            // The legacy `run_account_stream` closes its command_rx immediately,
+            // so an empty legacy stream will exit the select loop with no work
+            // — surfaced as a warning here so misconfigurations are visible.
+            tracing::warn!(
+                "gRPC subscribe request has no account filters; awaiting Replace command"
+            );
+        }
+        tx.send(initial).await?;
+
+        loop {
+            tokio::select! {
+                // Biased on commands so a burst of updates doesn't starve a
+                // pending Replace; ack latency is the metric the promoter
+                // measures.
+                biased;
+
+                cmd = command_rx.recv() => {
+                    match cmd {
+                        Some(SubscriptionCommand::Replace { mints, ack }) => {
+                            let subs = controlled_v1_subscriptions(&mints);
+                            let subscriptions_count = subs.len();
+                            let request = build_subscribe_request(&subs);
+                            let result = tx.send(request).await;
+                            let response = match result {
+                                Ok(()) => SubscriptionAck::Applied {
+                                    applied_at_ms: now_ms(),
+                                    subscriptions: subscriptions_count,
+                                },
+                                Err(err) => SubscriptionAck::Failed(err.to_string()),
+                            };
+                            // Ack failure means caller dropped the receiver;
+                            // that's benign, we can proceed.
+                            let _ = ack.send(response);
+                        }
+                        Some(SubscriptionCommand::Shutdown) | None => break,
+                    }
+                }
+
+                maybe_update = stream.next() => {
+                    let Some(update) = maybe_update else { break };
+                    let update = update?;
+                    match update.update_oneof {
+                        Some(UpdateOneof::Account(account_update)) => {
+                            let Some(pool_update) =
+                                pool_account_update_from_yellowstone(account_update)?
+                            else {
+                                continue;
+                            };
+                            on_update(GeyserStreamUpdate::Account(pool_update))?;
+                        }
+                        Some(UpdateOneof::Slot(slot_update)) => {
+                            if slot_update.status != CommitmentLevel::Processed as i32 {
+                                continue;
+                            }
+                            on_update(GeyserStreamUpdate::Slot(SlotUpdate {
+                                slot: slot_update.slot,
+                                parent: slot_update.parent,
+                                status: slot_update.status,
+                            }))?;
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn build_subscribe_request(subs: &[GeyserAccountSubscription]) -> SubscribeRequest {
         let mut accounts = HashMap::new();
-        for subscription in &plan.subscriptions {
+        for subscription in subs {
             accounts.insert(
                 subscription.label.clone(),
                 SubscribeRequestFilterAccounts {
@@ -139,18 +276,15 @@ pub mod yellowstone {
                     filters: vec![SubscribeRequestFilterAccountsFilter {
                         filter: Some(Filter::Memcmp(SubscribeRequestFilterAccountsFilterMemcmp {
                             offset: subscription.memcmp_offset as u64,
-                            data: Some(Data::Bytes(subscription.memcmp_pubkey.to_bytes().to_vec())),
+                            data: Some(Data::Bytes(
+                                subscription.memcmp_pubkey.to_bytes().to_vec(),
+                            )),
                         })),
                     }],
                 },
             );
         }
-
-        if accounts.is_empty() {
-            anyhow::bail!("gRPC account stream has no account filters");
-        }
-
-        tx.send(SubscribeRequest {
+        SubscribeRequest {
             accounts,
             slots: HashMap::from([(
                 "processed-slots".to_string(),
@@ -160,34 +294,14 @@ pub mod yellowstone {
             )]),
             commitment: Some(CommitmentLevel::Processed as i32),
             ..Default::default()
-        })
-        .await?;
-
-        while let Some(update) = stream.next().await {
-            let update = update?;
-            match update.update_oneof {
-                Some(UpdateOneof::Account(account_update)) => {
-                    let Some(pool_update) = pool_account_update_from_yellowstone(account_update)?
-                    else {
-                        continue;
-                    };
-                    on_update(GeyserStreamUpdate::Account(pool_update))?;
-                }
-                Some(UpdateOneof::Slot(slot_update)) => {
-                    if slot_update.status != CommitmentLevel::Processed as i32 {
-                        continue;
-                    }
-                    on_update(GeyserStreamUpdate::Slot(SlotUpdate {
-                        slot: slot_update.slot,
-                        parent: slot_update.parent,
-                        status: slot_update.status,
-                    }))?;
-                }
-                _ => continue,
-            }
         }
+    }
 
-        Ok(())
+    fn now_ms() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default()
     }
 
     fn pool_account_update_from_yellowstone(
