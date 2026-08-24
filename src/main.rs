@@ -2043,7 +2043,11 @@ fn maintain_live_route_shards(
         return Ok(0);
     }
 
-    let allowed_mints = parse_allowed_mints(config)?;
+    // Read the live allowlist from the registry so mints admitted by the
+    // promoter (Discovery -> ATA -> ALT -> RegistryLive) are honored. Reading
+    // from `parse_allowed_mints(config)` would return only the static seed and
+    // reject any dynamically-promoted mint with "not allowlisted".
+    let allowed_mints = registry.allowed_mints();
     let (routes, skipped_unready) = collect_stable_mint_routes(config, registry);
     let maintenance = maintain_route_shards_incremental(
         rpc_client,
