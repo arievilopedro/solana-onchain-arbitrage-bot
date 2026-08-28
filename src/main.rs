@@ -1572,6 +1572,28 @@ fn adjusted_trigger_sol_amount(
         return Ok((sol_amount, volume_source));
     };
 
+    // Safety clamp: if the Pump-derived estimate is dramatically smaller than
+    // the incoming `sol_amount`, treat it as a graduated / stale Pump pool
+    // (the bonding curve moved to Raydium/DAMM v2 and only the drained curve
+    // remains). Preferring the original trigger estimate avoids silently
+    // filtering real triggers that were sized against the deeper venue.
+    //
+    // Threshold: 50% of the incoming estimate. Log INFO so operators can
+    // audit false positives and re-tune if needed. Zero-cost when the
+    // estimator agrees (common case: pool still fresh on Pump).
+    if sol_amount > 0.0 && estimated_sol < sol_amount * 0.5 {
+        tracing::info!(
+            "pump_estimate_ignored: mint={} raw_sol={:.6} estimated_sol={:.6} ratio={:.3} source={} raw_amount={}",
+            mint,
+            sol_amount,
+            estimated_sol,
+            estimated_sol / sol_amount,
+            volume_source,
+            raw_token_amount,
+        );
+        return Ok((sol_amount, volume_source));
+    }
+
     Ok((estimated_sol, "pump_sell_registry_reserves"))
 }
 
@@ -1584,18 +1606,17 @@ fn estimate_pump_sell_sol_from_registry(
 ) -> Option<f64> {
     let mint_state = registry.get(&mint)?;
     let now_ms = now_ms();
-    let mut pumps = mint_state.eligible_pumps(
+    // Strictly honor `max_pool_state_age_ms`. The previous `u64::MAX`
+    // fallback silently accepted stale Pump reserves — problematic after
+    // bonding-curve graduation (Pump pool remains with drained reserves
+    // while the actual volume moved to Raydium/DAMM v2). Falling back to
+    // the trigger's original `sol_amount` (via `None` return) is safer
+    // than producing a 60x underestimate against a dead curve.
+    let pumps = mint_state.eligible_pumps(
         config.execution.min_pool_base_liquidity_lamports,
         config.execution.max_pool_state_age_ms,
         now_ms,
     );
-    if pumps.is_empty() {
-        pumps = mint_state.eligible_pumps(
-            config.execution.min_pool_base_liquidity_lamports,
-            u64::MAX,
-            now_ms,
-        );
-    }
 
     pumps
         .into_iter()
@@ -1980,6 +2001,124 @@ async fn run_promoter_geyser_stack(
         }
     });
     info!("promoter orchestrator spawned; parking main task");
+
+    // Periodic shard maintenance ticker.
+    //
+    // Problem: `maintain_live_route_shards` is only invoked reactively from
+    // `process_geyser_route_action` when a gRPC update on a specific mint
+    // observes `dry_run.missing_route_shard > 0`. DLMMs discovered by the
+    // promoter FSM (or by post-boot bootstrap) whose owning mint doesn't
+    // receive a same-tick gRPC update stay outside the shard ALT and get
+    // dropped by `pack_with_optional_alt_filter` (see "route shard filter
+    // dropped N dlmm(s) ... addressable=0" log).
+    //
+    // Fix: every 5s, snapshot the registry and run `maintain_live_route_shards`
+    // over the full route set. Idempotent for already-blocked mints (the
+    // planner returns None for entries whose DLMMs are all present).
+    //
+    // Also periodically emits a diagnostic INFO for DLMMs registered but
+    // never updated via gRPC (`last_update_slot=0`), so operators can
+    // identify subscription-coverage gaps (Issue #3).
+    tokio::spawn({
+        let config = config.clone();
+        let rpc_client = rpc_client.clone();
+        let wallet = wallet.clone();
+        let registry = registry.clone();
+        let state_file_lock = state_file_lock.clone();
+        async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            // Skip the immediate first tick: startup maintenance already
+            // ran, no need to hammer the state file lock right away.
+            ticker.tick().await;
+            let mut ticks_since_diag: u64 = 0;
+            loop {
+                ticker.tick().await;
+                ticks_since_diag += 1;
+
+                let config = config.clone();
+                let rpc_client = rpc_client.clone();
+                let wallet = wallet.clone();
+                let registry = registry.clone();
+                let state_file_lock = state_file_lock.clone();
+                let emit_diag = ticks_since_diag >= 6; // ~30s
+                if emit_diag {
+                    ticks_since_diag = 0;
+                }
+
+                let _ = tokio::task::spawn_blocking(move || {
+                    let registry_guard = match registry.lock() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            tracing::warn!("periodic shard maintenance: registry mutex poisoned");
+                            return;
+                        }
+                    };
+
+                    // Shard maintenance sweep.
+                    match maintain_live_route_shards(
+                        &config,
+                        rpc_client.as_ref(),
+                        wallet.as_ref(),
+                        &registry_guard,
+                        &[],
+                        state_file_lock.as_ref(),
+                    ) {
+                        Ok(confirmed) => {
+                            tracing::debug!(
+                                "periodic shard maintenance: confirmed_ops={}",
+                                confirmed
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "periodic shard maintenance failed: error={:#}",
+                                error
+                            );
+                        }
+                    }
+
+                    // DLMM staleness diagnostic (Issue #3): identify pools
+                    // registered but never touched by gRPC. Emitted every
+                    // ~30s to avoid log spam.
+                    if emit_diag {
+                        let now_ms_val = now_ms();
+                        let mut stale: Vec<(Pubkey, Pubkey, Pubkey, u64)> = Vec::new();
+                        for (_, mint_state) in registry_guard.iter() {
+                            for dlmm in &mint_state.dlmms {
+                                if dlmm.last_update_slot == 0 {
+                                    stale.push((
+                                        mint_state.mint,
+                                        dlmm.lb_pair,
+                                        dlmm.base_mint,
+                                        0,
+                                    ));
+                                }
+                            }
+                        }
+                        if !stale.is_empty() {
+                            for (mint, lb_pair, base_mint, _) in stale.iter().take(20) {
+                                tracing::info!(
+                                    "dlmm never received grpc update: mint={} lb_pair={} base_mint={} last_update_slot=0 now_ms={}",
+                                    mint,
+                                    lb_pair,
+                                    base_mint,
+                                    now_ms_val
+                                );
+                            }
+                            if stale.len() > 20 {
+                                tracing::info!(
+                                    "dlmm never received grpc update: additional_stale={} (log truncated at 20)",
+                                    stale.len() - 20
+                                );
+                            }
+                        }
+                    }
+                })
+                .await;
+            }
+        }
+    });
+    info!("periodic route-shard maintenance ticker spawned: interval_ms=5000");
 
     std::future::pending::<()>().await;
     Ok(())
