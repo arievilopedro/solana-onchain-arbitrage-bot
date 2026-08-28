@@ -916,9 +916,20 @@ impl AppConfig {
         }
 
         if self.runtime.wallet_followers.enabled {
-            if !self.runtime.hot_mints.enabled {
+            // wallet_followers has two possible consumers:
+            //   (a) the async polling loop, which feeds HotMintTracker and
+            //       therefore requires hot_mints.enabled;
+            //   (b) the boot-time seed extractor, which populates
+            //       `allowed_mints` directly (pin path) or the tracker via
+            //       seed_boost (non-pin path).
+            // Require at least one so `enabled=true` is never a no-op.
+            let polling_consumer = self.runtime.hot_mints.enabled;
+            let seed_consumer = self.runtime.wallet_followers.seed_top_n > 0;
+            if !polling_consumer && !seed_consumer {
                 anyhow::bail!(
-                    "runtime.wallet_followers.enabled requires runtime.hot_mints.enabled=true"
+                    "runtime.wallet_followers.enabled requires either \
+                     runtime.hot_mints.enabled=true (polling loop) or \
+                     runtime.wallet_followers.seed_top_n>0 (boot seed extraction)"
                 );
             }
             if self.runtime.wallet_followers.wallets.is_empty() {
