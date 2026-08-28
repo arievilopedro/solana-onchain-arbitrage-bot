@@ -1420,7 +1420,7 @@ async fn process_axion_trigger(
             &route_execution_cache,
         )?
     };
-    tracing::debug!(
+    tracing::info!(
         "trigger compiled: mint={} sig={} routes={} compiled={} missing_route_shard={} compile_failed={} compile_ms={}",
         signal.mint,
         signal.signature,
@@ -1431,7 +1431,12 @@ async fn process_axion_trigger(
         trigger_received_at.elapsed().as_millis()
     );
     if compilation.summary.compiled == 0 {
-        tracing::debug!(
+        // Promoted to INFO so operators see when a live trigger passed the
+        // filter but produced zero sendable transactions. Common causes:
+        // (a) all pools stale (see pack_with_optional_alt_filter INFO log),
+        // (b) missing route shard for the mint (fresh mint pre-alt),
+        // (c) compile error (see compile_failed).
+        tracing::info!(
             "trigger transaction send skipped: mint={} sig={} reason=no_compiled_route routes={} missing_route_shard={} compile_failed={}",
             signal.mint,
             signal.signature,
@@ -2790,7 +2795,10 @@ fn pack_with_optional_alt_filter(
         .collect();
 
     if filtered_dlmms.len() < total_eligible {
-        tracing::debug!(
+        // Promoted to INFO: when the route shard ALT is missing accounts for
+        // a DLMM pool, that pool is silently dropped from the pack. If this
+        // repeats for the same mint the shard needs to be extended.
+        tracing::info!(
             "route shard filter dropped {} dlmm(s) for mint {} (eligible={}, addressable={})",
             total_eligible - filtered_dlmms.len(),
             mint_state.mint,
@@ -2823,6 +2831,44 @@ fn pack_with_optional_alt_filter(
         + (!raydium_cps.is_empty() as usize)
         + (!damm_v2s.is_empty() as usize);
     if types_present < 2 {
+        // Diagnostic: show raw vs eligible counts per pool type so operators
+        // can distinguish "no pools known" from "pools known but all stale
+        // / below-liquidity / filtered out of ALT". Stale is the silent
+        // killer (updated_at_ms > max_state_age_ms) — this log surfaces it.
+        let raw_pump = mint_state.pump.len();
+        let raw_dlmm = mint_state.dlmms.len();
+        let raw_cpmm = mint_state.raydium_cps.len();
+        let raw_damm = mint_state.damm_v2s.len();
+        let eligible_pump = mint_state
+            .eligible_pumps(min_base_liquidity_lamports, max_state_age_ms, now_ms)
+            .len();
+        let eligible_dlmm_raw = mint_state
+            .eligible_dlmms(min_base_liquidity_lamports, max_state_age_ms, now_ms)
+            .len();
+        let eligible_cpmm = raydium_cps.len();
+        let eligible_damm = damm_v2s.len();
+        tracing::info!(
+            "route pack empty (discovery gate <2 types): mint={} types_present={} \
+             pump=(raw={},eligible={},final={}) \
+             dlmm=(raw={},eligible={},alt_filtered={}) \
+             cpmm=(raw={},eligible={}) \
+             damm_v2=(raw={},eligible={}) \
+             max_state_age_ms={} min_base_liquidity_lamports={}",
+            mint_state.mint,
+            types_present,
+            raw_pump,
+            eligible_pump,
+            pump.is_some() as usize,
+            raw_dlmm,
+            eligible_dlmm_raw,
+            filtered_dlmms.len(),
+            raw_cpmm,
+            eligible_cpmm,
+            raw_damm,
+            eligible_damm,
+            max_state_age_ms,
+            min_base_liquidity_lamports,
+        );
         return Vec::new();
     }
 
