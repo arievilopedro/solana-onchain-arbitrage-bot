@@ -2869,6 +2869,83 @@ fn pack_with_optional_alt_filter(
             max_state_age_ms,
             min_base_liquidity_lamports,
         );
+
+        // Per-pool breakdown: for each registered pool, dump the exact reject
+        // reason + age vs threshold. This surfaces which pool is stale and
+        // by how much (or if it's below-liquidity or missing-liquidity).
+        for (idx, pool) in mint_state.pump.iter().enumerate() {
+            let eligibility =
+                pool.eligibility(min_base_liquidity_lamports, max_state_age_ms, now_ms);
+            let (age_ms, base_lamports) = pool
+                .liquidity
+                .map(|liq| (now_ms.saturating_sub(liq.updated_at_ms), liq.base_lamports))
+                .unwrap_or((0, 0));
+            tracing::info!(
+                "  pool_reject pump[{}] pool={} eligibility={:?} enabled={} age_ms={} base_lamports={} last_update_slot={}",
+                idx,
+                pool.pool,
+                eligibility,
+                pool.enabled,
+                age_ms,
+                base_lamports,
+                pool.last_update_slot,
+            );
+        }
+        for (idx, pool) in mint_state.dlmms.iter().enumerate() {
+            let eligibility =
+                pool.eligibility(min_base_liquidity_lamports, max_state_age_ms, now_ms);
+            let (age_ms, base_lamports) = pool
+                .liquidity
+                .map(|liq| (now_ms.saturating_sub(liq.updated_at_ms), liq.base_lamports))
+                .unwrap_or((0, 0));
+            tracing::info!(
+                "  pool_reject dlmm[{}] lb_pair={} eligibility={:?} enabled={} age_ms={} base_lamports={} last_update_slot={}",
+                idx,
+                pool.lb_pair,
+                eligibility,
+                pool.enabled,
+                age_ms,
+                base_lamports,
+                pool.last_update_slot,
+            );
+        }
+        for (idx, pool) in mint_state.raydium_cps.iter().enumerate() {
+            let eligibility =
+                pool.eligibility(min_base_liquidity_lamports, max_state_age_ms, now_ms);
+            let (age_ms, base_lamports) = pool
+                .liquidity
+                .map(|liq| (now_ms.saturating_sub(liq.updated_at_ms), liq.base_lamports))
+                .unwrap_or((0, 0));
+            tracing::info!(
+                "  pool_reject cpmm[{}] pool={} eligibility={:?} enabled={} age_ms={} base_lamports={} last_update_slot={}",
+                idx,
+                pool.pool,
+                eligibility,
+                pool.enabled,
+                age_ms,
+                base_lamports,
+                pool.last_update_slot,
+            );
+        }
+        for (idx, pool) in mint_state.damm_v2s.iter().enumerate() {
+            let eligibility =
+                pool.eligibility(min_base_liquidity_lamports, max_state_age_ms, now_ms);
+            let (age_ms, base_lamports) = pool
+                .liquidity
+                .map(|liq| (now_ms.saturating_sub(liq.updated_at_ms), liq.base_lamports))
+                .unwrap_or((0, 0));
+            tracing::info!(
+                "  pool_reject damm_v2[{}] pool={} eligibility={:?} enabled={} age_ms={} base_lamports={} last_update_slot={}",
+                idx,
+                pool.pool,
+                eligibility,
+                pool.enabled,
+                age_ms,
+                base_lamports,
+                pool.last_update_slot,
+            );
+        }
+
         return Vec::new();
     }
 
