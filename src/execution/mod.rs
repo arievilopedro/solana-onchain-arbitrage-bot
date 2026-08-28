@@ -132,20 +132,22 @@ pub fn route_group_to_mint_pool_data(
     token_program: Pubkey,
 ) -> MintPoolData {
     let mut pool_data = MintPoolData::new(route.mint, wallet, token_program);
-    pool_data.add_pump_pool(
-        route.pump.pool,
-        route.pump.token_vault,
-        route.pump.base_vault,
-        route.pump.fee_wallet,
-        route.pump.fee_token_wallet,
-        route.pump.coin_creator_vault_ata,
-        route.pump.coin_creator_vault_authority,
-        route.pump.coin_creator,
-        route.mint,
-        route.pump.base_mint,
-        false,
-        route.pump.is_cashback_coin,
-    );
+    if let Some(pump) = &route.pump {
+        pool_data.add_pump_pool(
+            pump.pool,
+            pump.token_vault,
+            pump.base_vault,
+            pump.fee_wallet,
+            pump.fee_token_wallet,
+            pump.coin_creator_vault_ata,
+            pump.coin_creator_vault_authority,
+            pump.coin_creator,
+            route.mint,
+            pump.base_mint,
+            false,
+            pump.is_cashback_coin,
+        );
+    }
 
     for dlmm in &route.dlmms {
         pool_data.add_dlmm_pool(
@@ -161,6 +163,28 @@ pub fn route_group_to_mint_pool_data(
         );
     }
 
+    for cp in &route.raydium_cps {
+        pool_data.add_raydium_cp_pool(
+            cp.pool,
+            cp.token_vault,
+            cp.base_vault,
+            cp.amm_config,
+            cp.observation,
+            route.mint,
+            cp.base_mint,
+        );
+    }
+
+    for damm in &route.damm_v2s {
+        pool_data.add_meteora_damm_v2_pool(
+            damm.pool,
+            damm.token_vault,
+            damm.base_vault,
+            route.mint,
+            damm.base_mint,
+        );
+    }
+
     pool_data
 }
 
@@ -168,7 +192,7 @@ pub fn route_group_to_mint_pool_data(
 mod tests {
     use super::*;
     use crate::constants::sol_mint;
-    use crate::registry::{PoolLiquidity, PumpRouteState};
+    use crate::registry::{CpmmRouteState, DammV2RouteState, PoolLiquidity, PumpRouteState};
     use solana_program::instruction::AccountMeta;
     use solana_sdk::message::VersionedMessage;
 
@@ -224,13 +248,54 @@ mod tests {
         }
     }
 
+    fn cpmm(byte: u8) -> CpmmRouteState {
+        CpmmRouteState {
+            program_id: pk(byte),
+            base_mint: sol_mint(),
+            authority: pk(byte + 1),
+            pool: pk(byte + 2),
+            amm_config: pk(byte + 3),
+            token_vault: pk(byte + 4),
+            base_vault: pk(byte + 5),
+            observation: pk(byte + 6),
+            liquidity: Some(PoolLiquidity {
+                base_lamports: 2_000,
+                token_lamports: None,
+                updated_at_ms: 1_000,
+            }),
+            enabled: true,
+            last_update_slot: 10,
+        }
+    }
+
+    fn damm_v2(byte: u8) -> DammV2RouteState {
+        DammV2RouteState {
+            program_id: pk(byte),
+            base_mint: sol_mint(),
+            event_authority: pk(byte + 1),
+            pool_authority: pk(byte + 2),
+            pool: pk(byte + 3),
+            token_vault: pk(byte + 4),
+            base_vault: pk(byte + 5),
+            liquidity: Some(PoolLiquidity {
+                base_lamports: 2_000,
+                token_lamports: None,
+                updated_at_ms: 1_000,
+            }),
+            enabled: true,
+            last_update_slot: 10,
+        }
+    }
+
     #[test]
     fn route_group_conversion_preserves_pump_and_multiple_dlmms() {
         let mint = pk(1);
         let route = RouteGroup {
             mint,
-            pump: pump(),
+            pump: Some(pump()),
             dlmms: vec![dlmm(20), dlmm(40)],
+            raydium_cps: Vec::new(),
+            damm_v2s: Vec::new(),
         };
 
         let pool_data = route_group_to_mint_pool_data(&route, &pk(99), spl_token::ID);
@@ -243,6 +308,103 @@ mod tests {
         assert_eq!(pool_data.dlmm_pairs[0].pair, pk(23));
         assert_eq!(pool_data.dlmm_pairs[0].bin_arrays, vec![pk(28), pk(29)]);
         assert_eq!(pool_data.dlmm_pairs[1].pair, pk(43));
+        assert!(pool_data.raydium_cp_pools.is_empty());
+        assert!(pool_data.meteora_damm_v2_pools.is_empty());
+    }
+
+    #[test]
+    fn route_group_conversion_copies_raydium_cp_and_damm_v2_pools() {
+        let mint = pk(1);
+        let route = RouteGroup {
+            mint,
+            pump: Some(pump()),
+            dlmms: vec![dlmm(20)],
+            raydium_cps: vec![cpmm(50), cpmm(60)],
+            damm_v2s: vec![damm_v2(70)],
+        };
+
+        let pool_data = route_group_to_mint_pool_data(&route, &pk(99), spl_token::ID);
+
+        // Raydium CPMM: pool, token_vault, sol_vault, amm_config, observation.
+        assert_eq!(pool_data.raydium_cp_pools.len(), 2);
+        assert_eq!(pool_data.raydium_cp_pools[0].pool, pk(52));
+        assert_eq!(pool_data.raydium_cp_pools[0].token_vault, pk(54));
+        assert_eq!(pool_data.raydium_cp_pools[0].sol_vault, pk(55));
+        assert_eq!(pool_data.raydium_cp_pools[0].amm_config, pk(53));
+        assert_eq!(pool_data.raydium_cp_pools[0].observation, pk(56));
+        assert_eq!(pool_data.raydium_cp_pools[0].token_mint, mint);
+        assert_eq!(pool_data.raydium_cp_pools[0].base_mint, sol_mint());
+        assert_eq!(pool_data.raydium_cp_pools[1].pool, pk(62));
+
+        // Meteora DAMM v2: pool, token_x_vault, token_sol_vault.
+        assert_eq!(pool_data.meteora_damm_v2_pools.len(), 1);
+        assert_eq!(pool_data.meteora_damm_v2_pools[0].pool, pk(73));
+        assert_eq!(pool_data.meteora_damm_v2_pools[0].token_x_vault, pk(74));
+        assert_eq!(pool_data.meteora_damm_v2_pools[0].token_sol_vault, pk(75));
+        assert_eq!(pool_data.meteora_damm_v2_pools[0].token_mint, mint);
+        assert_eq!(pool_data.meteora_damm_v2_pools[0].base_mint, sol_mint());
+    }
+
+    #[test]
+    fn route_group_conversion_without_pump_produces_no_pump_pool() {
+        // Composition CPMM + DLMM (no pump) — verify the MintPoolData carries
+        // zero pump_pools while the CPMM and DLMM ones are populated. This
+        // guards against a regression where `route.pump.X` panics or the
+        // builder silently drops the composition.
+        let mint = pk(1);
+        let route = RouteGroup::<PumpRouteState, DlmmRouteState> {
+            mint,
+            pump: None,
+            dlmms: vec![dlmm(20)],
+            raydium_cps: vec![cpmm(50)],
+            damm_v2s: Vec::new(),
+        };
+
+        let pool_data = route_group_to_mint_pool_data(&route, &pk(99), spl_token::ID);
+
+        assert!(pool_data.pump_pools.is_empty());
+        assert_eq!(pool_data.dlmm_pairs.len(), 1);
+        assert_eq!(pool_data.raydium_cp_pools.len(), 1);
+    }
+
+    #[test]
+    fn controlled_transaction_builds_without_pump_leg() {
+        // End-to-end: build_controlled_transaction succeeds for a pump-absent
+        // composition. Confirms the whole pipeline (route → MintPoolData →
+        // create_swap_instruction → v0 message) tolerates `pump=None`.
+        let wallet = Keypair::new();
+        let mint = pk(1);
+        let route = RouteGroup::<PumpRouteState, DlmmRouteState> {
+            mint,
+            pump: None,
+            dlmms: vec![dlmm(20)],
+            raydium_cps: vec![cpmm(50)],
+            damm_v2s: Vec::new(),
+        };
+        let params = ControlledExecutionParams {
+            compute_unit_limit: 450_000,
+            compute_unit_price: 0,
+            minimum_profit_lamports: 0,
+            use_flashloan: false,
+            no_failure_mode: true,
+            sender_tip: None,
+        };
+
+        let tx = build_controlled_transaction(
+            &wallet,
+            &route,
+            spl_token::ID,
+            Hash::new_unique(),
+            &[],
+            params,
+        )
+        .unwrap();
+
+        // v0 message with at least one instruction (compute budget + swap).
+        let VersionedMessage::V0(message) = &tx.message else {
+            panic!("expected v0 message");
+        };
+        assert!(!message.instructions.is_empty());
     }
 
     #[test]
@@ -252,8 +414,10 @@ mod tests {
         let mint = pk(1);
         let route = RouteGroup {
             mint,
-            pump: pump(),
+            pump: Some(pump()),
             dlmms: vec![dlmm(20)],
+            raydium_cps: Vec::new(),
+            damm_v2s: Vec::new(),
         };
         let params = ControlledExecutionParams {
             compute_unit_limit: 450_000,

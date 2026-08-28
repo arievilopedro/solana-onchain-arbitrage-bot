@@ -343,10 +343,17 @@ impl PromoterOrchestrator {
                             now_ms,
                         );
                         if route_opt.is_none() {
+                            // Log counts across ALL 4 pool types so operators
+                            // can tell whether the mint has a viable arb
+                            // composition even if the current gate rejects it.
+                            // Fase 0.d will relax the gate to accept any 2+
+                            // pool types; this log is future-proof already.
                             let msg = format!(
-                                "no eligible pump+dlmm pair: pump_pools={} dlmm_pools={}",
+                                "no eligible pump+dlmm pair: pump_pools={} dlmm_pools={} cpmm_pools={} damm_v2_pools={}",
                                 disc.state.pump.len(),
-                                disc.state.dlmms.len()
+                                disc.state.dlmms.len(),
+                                disc.state.raydium_cps.len(),
+                                disc.state.damm_v2s.len(),
                             );
                             warn!(
                                 mint = %mint,

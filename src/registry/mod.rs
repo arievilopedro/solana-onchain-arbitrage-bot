@@ -11,6 +11,8 @@ use std::sync::Arc;
 pub enum PoolKind {
     Pump,
     MeteoraDlmm,
+    RaydiumCpmm,
+    MeteoraDammV2,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -76,12 +78,56 @@ pub struct DlmmRouteState {
     pub last_update_slot: u64,
 }
 
+/// Raydium CPMM (`CPMMoo8L…`) pool route.
+///
+/// Account layout at swap time (matches on-chain evidence in `tx4.json` and
+/// the MEV-i on-chain program reference): the swap-side accounts pushed for
+/// this pool are `authority (PDA) + pool + amm_config + token_vault +
+/// base_vault + observation`. `program_id` and `base_mint` are stored so
+/// downstream builders can validate at compile time.
+#[derive(Debug, Clone)]
+pub struct CpmmRouteState {
+    pub program_id: Pubkey,
+    pub base_mint: Pubkey,
+    pub authority: Pubkey,
+    pub pool: Pubkey,
+    pub amm_config: Pubkey,
+    pub token_vault: Pubkey,
+    pub base_vault: Pubkey,
+    pub observation: Pubkey,
+    pub liquidity: Option<PoolLiquidity>,
+    pub enabled: bool,
+    pub last_update_slot: u64,
+}
+
+/// Meteora DAMM v2 (CP-AMM, `cpamdp…`) pool route.
+///
+/// Account layout at swap time (matches on-chain evidence in `tx2.json` and
+/// the MEV-i on-chain program reference): the swap-side accounts pushed for
+/// this pool are `event_authority + pool_authority + pool + token_vault +
+/// base_vault + Sysvar1nstructions`. The sysvar is fixed and not stored.
+#[derive(Debug, Clone)]
+pub struct DammV2RouteState {
+    pub program_id: Pubkey,
+    pub base_mint: Pubkey,
+    pub event_authority: Pubkey,
+    pub pool_authority: Pubkey,
+    pub pool: Pubkey,
+    pub token_vault: Pubkey,
+    pub base_vault: Pubkey,
+    pub liquidity: Option<PoolLiquidity>,
+    pub enabled: bool,
+    pub last_update_slot: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct MintRuntimeState {
     pub mint: Pubkey,
     pub token_program: Pubkey,
     pub pump: Vec<PumpRouteState>,
     pub dlmms: Vec<DlmmRouteState>,
+    pub raydium_cps: Vec<CpmmRouteState>,
+    pub damm_v2s: Vec<DammV2RouteState>,
     pub updated_slot: u64,
 }
 
@@ -92,6 +138,8 @@ impl MintRuntimeState {
             token_program,
             pump: Vec::new(),
             dlmms: Vec::new(),
+            raydium_cps: Vec::new(),
+            damm_v2s: Vec::new(),
             updated_slot: 0,
         }
     }
@@ -125,6 +173,36 @@ impl MintRuntimeState {
             })
             .collect()
     }
+
+    pub fn eligible_raydium_cps(
+        &self,
+        min_base_liquidity_lamports: u64,
+        max_state_age_ms: u64,
+        now_ms: u128,
+    ) -> Vec<&CpmmRouteState> {
+        self.raydium_cps
+            .iter()
+            .filter(|pool| {
+                pool.eligibility(min_base_liquidity_lamports, max_state_age_ms, now_ms)
+                    .is_eligible()
+            })
+            .collect()
+    }
+
+    pub fn eligible_damm_v2s(
+        &self,
+        min_base_liquidity_lamports: u64,
+        max_state_age_ms: u64,
+        now_ms: u128,
+    ) -> Vec<&DammV2RouteState> {
+        self.damm_v2s
+            .iter()
+            .filter(|pool| {
+                pool.eligibility(min_base_liquidity_lamports, max_state_age_ms, now_ms)
+                    .is_eligible()
+            })
+            .collect()
+    }
 }
 
 impl PumpRouteState {
@@ -146,6 +224,42 @@ impl PumpRouteState {
 }
 
 impl DlmmRouteState {
+    pub fn eligibility(
+        &self,
+        min_base_liquidity_lamports: u64,
+        max_state_age_ms: u64,
+        now_ms: u128,
+    ) -> PoolEligibility {
+        pool_eligibility(
+            self.enabled,
+            self.base_mint,
+            self.liquidity,
+            min_base_liquidity_lamports,
+            max_state_age_ms,
+            now_ms,
+        )
+    }
+}
+
+impl CpmmRouteState {
+    pub fn eligibility(
+        &self,
+        min_base_liquidity_lamports: u64,
+        max_state_age_ms: u64,
+        now_ms: u128,
+    ) -> PoolEligibility {
+        pool_eligibility(
+            self.enabled,
+            self.base_mint,
+            self.liquidity,
+            min_base_liquidity_lamports,
+            max_state_age_ms,
+            now_ms,
+        )
+    }
+}
+
+impl DammV2RouteState {
     pub fn eligibility(
         &self,
         min_base_liquidity_lamports: u64,
@@ -195,13 +309,11 @@ impl RuntimeRegistry {
 
     /// Constructs a registry with a permanent seed set. The active allowlist is
     /// initialised to the seed; `replace_active_set` may extend it later while
-    /// preserving the seed as an invariant.
+    /// preserving the seed as an invariant. An empty seed is allowed to support
+    /// deployments where the active set is populated post-boot (e.g. wallet
+    /// copy-trade seeding or promoter-only discovery).
     pub fn new_with_seed(seed: impl IntoIterator<Item = Pubkey>) -> anyhow::Result<Self> {
         let seed = seed.into_iter().collect::<HashSet<_>>();
-        if seed.is_empty() {
-            anyhow::bail!("allowed_mints must not be empty");
-        }
-
         let allowed = Arc::new(ArcSwap::from_pointee(seed.clone()));
         Ok(Self {
             allowed,
@@ -422,6 +534,43 @@ mod tests {
         assert!(registry.is_allowed(&b));
         assert_eq!(registry.seed().len(), 2);
         assert_eq!(registry.allowed_snapshot().len(), 2);
+    }
+
+    #[test]
+    fn new_with_seed_accepts_empty_seed() {
+        let registry = RuntimeRegistry::new_with_seed(std::iter::empty()).unwrap();
+        assert!(registry.seed().is_empty());
+        assert!(registry.allowed_snapshot().is_empty());
+        assert!(registry.allowed_mints().is_empty());
+    }
+
+    #[test]
+    fn admit_after_empty_seed_populates_mints_but_not_seed() {
+        let mut registry = RuntimeRegistry::new_with_seed(std::iter::empty()).unwrap();
+        let hot = pk(200);
+        registry
+            .admit_mint_with_initial_state(MintRuntimeState::new(hot, spl_token::ID))
+            .unwrap();
+        assert!(registry.is_allowed(&hot));
+        assert!(registry.get(&hot).is_some());
+        assert!(registry.seed().is_empty(), "seed must remain empty");
+    }
+
+    #[test]
+    fn replace_active_set_no_op_with_empty_seed() {
+        let mut registry = RuntimeRegistry::new_with_seed(std::iter::empty()).unwrap();
+        let delta = registry.replace_active_set(HashSet::new()).unwrap();
+        assert!(delta.added.is_empty());
+        assert!(delta.removed.is_empty());
+        assert!(registry.allowed_snapshot().is_empty());
+    }
+
+    #[test]
+    fn evict_mint_still_refuses_pinned_seed_when_non_empty() {
+        let seed = pk(210);
+        let mut registry = RuntimeRegistry::new_with_seed([seed]).unwrap();
+        assert!(registry.evict_mint(seed).is_err());
+        assert!(registry.is_allowed(&seed));
     }
 
     #[test]

@@ -34,3 +34,8 @@ pub fn damm_v2_pool_authority() -> Pubkey {
 }
 
 pub const BIN_ARRAY: &[u8] = b"bin_array";
+
+/// Anchor discriminator for Meteora DAMM v2 (CP-AMM) `swap` instruction.
+/// Observed on-chain in production MEV-i arb txs (see tx2 in tests fixtures).
+pub const DAMM_V2_SWAP_DISCRIMINATOR: [u8; 8] =
+    [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];

@@ -68,6 +68,8 @@ pub mod yellowstone {
     };
     use crate::axion::yellowstone::{account_keys, sol_volume, token_balance_mints};
     use crate::axion::{collect_allowlisted_mints_from_strings, pump_amm_pubkey};
+    use crate::dex::meteora::constants::damm_v2_program_id;
+    use crate::dex::raydium::constants::raydium_cp_program_id;
     use solana_program::pubkey::Pubkey;
     use std::collections::HashSet;
     use yellowstone_grpc_proto::solana::storage::confirmed_block::{
@@ -100,7 +102,8 @@ pub mod yellowstone {
 
     /// Verifies the FOMO trigger shape:
     ///   1. `account_keys[0]` (fee-payer / signer) equals `fomo_signer`.
-    ///   2. The tx touches pump-amm OR Meteora DLMM.
+    ///   2. The tx touches pump-amm OR Meteora DLMM OR Raydium CPMM OR
+    ///      Meteora DAMM v2.
     ///
     /// We deliberately do NOT validate the router program or its discriminator:
     /// FOMO has been observed swapping between DFLOW and Jupiter V6, and may
@@ -123,9 +126,13 @@ pub mod yellowstone {
         if !signer_matches {
             return false;
         }
-        let pump = pump_amm_pubkey();
-        let dlmm = meteora_dlmm_pubkey();
-        keys.iter().any(|k| *k == pump || *k == dlmm)
+        let acceptable_venues = [
+            pump_amm_pubkey(),
+            meteora_dlmm_pubkey(),
+            raydium_cp_program_id(),
+            damm_v2_program_id(),
+        ];
+        keys.iter().any(|k| acceptable_venues.contains(k))
     }
 
     pub fn fomo_trigger_signals(
@@ -245,6 +252,44 @@ pub mod yellowstone {
                 super::super::fomo_signer_pubkey()
             ));
             assert_eq!(detect_router_kind(&tx, &parsed_keys), "jupiter");
+        }
+
+        #[test]
+        fn accepts_signer_plus_raydium_cpmm() {
+            let keys = vec![
+                signer_bytes(),
+                raydium_cp_program_id().to_bytes().to_vec(),
+                pubkey_bytes("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH"),
+            ];
+            let tx = make_tx(keys.clone(), vec![]);
+            let parsed_keys: Vec<Pubkey> = keys
+                .iter()
+                .map(|k| Pubkey::try_from(k.as_slice()).unwrap())
+                .collect();
+            assert!(validate_fomo_structure(
+                &tx,
+                &parsed_keys,
+                super::super::fomo_signer_pubkey()
+            ));
+        }
+
+        #[test]
+        fn accepts_signer_plus_damm_v2() {
+            let keys = vec![
+                signer_bytes(),
+                damm_v2_program_id().to_bytes().to_vec(),
+                pubkey_bytes(super::super::JUPITER_V6_PROGRAM),
+            ];
+            let tx = make_tx(keys.clone(), vec![]);
+            let parsed_keys: Vec<Pubkey> = keys
+                .iter()
+                .map(|k| Pubkey::try_from(k.as_slice()).unwrap())
+                .collect();
+            assert!(validate_fomo_structure(
+                &tx,
+                &parsed_keys,
+                super::super::fomo_signer_pubkey()
+            ));
         }
 
         #[test]

@@ -5,10 +5,12 @@ use solana_onchain_arbitrage_bot::alt::{
     load_lookup_table_account, maintain_route_shards_incremental, RouteShardLookupResolver,
     StableMintRouteAccounts,
 };
-use solana_onchain_arbitrage_bot::ata::ensure_base_atas_exist;
+use solana_onchain_arbitrage_bot::ata::{ensure_ata_exists, ensure_base_atas_exist};
 use solana_onchain_arbitrage_bot::config::AppConfig;
 use solana_onchain_arbitrage_bot::constants::sol_mint;
+use solana_onchain_arbitrage_bot::dex::meteora::constants::damm_v2_program_id;
 use solana_onchain_arbitrage_bot::dex::pump::pump_program_id;
+use solana_onchain_arbitrage_bot::dex::raydium::constants::raydium_cp_program_id;
 use solana_onchain_arbitrage_bot::discovery::{ControlledRpcBootstrap, RpcBootstrapConfig};
 use solana_onchain_arbitrage_bot::hot_mints::HotMintTracker;
 use solana_onchain_arbitrage_bot::execution::{
@@ -36,14 +38,16 @@ use solana_onchain_arbitrage_bot::streams::shard_slot::ShardSlotAllocator;
 use solana_onchain_arbitrage_bot::nonce::{parse_nonce_pubkeys, NonceManager};
 use solana_onchain_arbitrage_bot::registry::{DlmmRouteState, PumpRouteState};
 use solana_onchain_arbitrage_bot::routes::{FixedDlmmRoutePacker, RouteGroup};
-use solana_onchain_arbitrage_bot::sender::{HeliusSenderClient, HeliusSenderPlan, SenderTipConfig};
+use solana_onchain_arbitrage_bot::sender::{
+    AstralanSenderPlan, HeliusSenderPlan, NozomiSenderPlan, SenderPool, SenderTipConfig,
+};
 use solana_onchain_arbitrage_bot::streams::grpc::GeyserAccountStreamPlan;
 use solana_onchain_arbitrage_bot::streams::rabbitstream::RabbitStreamPlan;
 use solana_onchain_arbitrage_bot::transaction::derive_vault_token_account;
 use solana_onchain_arbitrage_bot::wallet::load_keypair;
 use solana_onchain_arbitrage_bot::wallet_followers::{
     bootstrap_wallet_followers, parse_config as parse_wallet_followers_config,
-    run_wallet_follower_loop,
+    run_wallet_follower_loop, seed_mints_from_wallets, SeedExtractionConfig,
 };
 use solana_program::program_pack::Pack;
 use solana_program::pubkey::Pubkey;
@@ -96,10 +100,100 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::load(config_path)?;
     let wallet = load_keypair(&config.wallet.private_key).context("failed to load wallet")?;
-    let allowed_mints = parse_allowed_mints(&config)?;
+    let mut allowed_mints = parse_allowed_mints(&config)?;
+
+    // Wallet-seeded boot (D.3): when `wallet_followers.seed_top_n > 0`, run a
+    // one-shot RPC scan across every configured copy wallet and pick the
+    // top-N most-frequently-traded mints. Splits into two paths:
+    //   * `pin_seeded_mints=true`  → seeded mints join `allowed_mints`
+    //     BEFORE the boot pipeline (bootstrap discovery + per-mint ATA +
+    //     route-shard maintenance + geyser subscriptions).
+    //   * `pin_seeded_mints=false` → seeded mints are held aside in
+    //     `seeded_non_pinned` and planted into `HotMintTracker` via
+    //     `seed_boost` once the tracker exists (see below). The promoter
+    //     FSM then discovers them lazily on its next tick.
+    // Validation (config::validate_controlled_v1) already guarantees the
+    // preconditions here: `wallets` non-empty, promoter+hot_mints enabled
+    // for the non-pin path, budget/max_signatures/concurrency > 0.
+    let mut seeded_non_pinned: Vec<Pubkey> = Vec::new();
+    if config.runtime.wallet_followers.enabled
+        && config.runtime.wallet_followers.seed_top_n > 0
+    {
+        let wf = &config.runtime.wallet_followers;
+        let runtime_cfg = parse_wallet_followers_config(wf)
+            .context("failed to parse wallet_followers config for seed extraction")?;
+        let wallets: Vec<Pubkey> = runtime_cfg
+            .wallets
+            .iter()
+            .map(|w| w.address)
+            .collect();
+        let seed_cfg = SeedExtractionConfig {
+            top_n: wf.seed_top_n,
+            max_signatures_per_wallet: wf.seed_max_signatures_per_wallet,
+            budget: Duration::from_millis(wf.seed_budget_ms),
+            concurrency: wf.seed_concurrency,
+        };
+        let scan_rpc = Arc::new(RpcClient::new(config.rpc.http.clone()));
+        let seed_wallets = wallets.clone();
+        let seed_cfg_task = seed_cfg.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            seed_mints_from_wallets(scan_rpc.as_ref(), &seed_wallets, &seed_cfg_task)
+        })
+        .await
+        .context("wallet seed extraction task join failed")?
+        .context("wallet seed extraction failed")?;
+
+        let selected_mints: Vec<Pubkey> =
+            report.selected.iter().map(|r| r.mint).collect();
+        info!(
+            "wallet_seed_extraction: selected={} all_ranked={} wallets_scanned={} signatures_examined={} budget_exhausted={} elapsed_ms={} pin_seeded_mints={}",
+            selected_mints.len(),
+            report.all_ranked.len(),
+            report.wallets_scanned,
+            report.signatures_examined,
+            report.budget_exhausted,
+            report.elapsed.as_millis(),
+            wf.pin_seeded_mints,
+        );
+
+        if selected_mints.is_empty() {
+            if allowed_mints.is_empty() {
+                anyhow::bail!(
+                    "wallet seed extraction returned zero mints and runtime.allowed_mints is empty; refusing to boot with no monitored mints"
+                );
+            } else {
+                tracing::warn!(
+                    "wallet seed extraction returned zero mints; continuing with runtime.allowed_mints only"
+                );
+            }
+        }
+
+        if wf.pin_seeded_mints {
+            // Dedup: `allowed_mints` may already contain some of the seeded
+            // mints via the static config list.
+            let existing: HashSet<Pubkey> = allowed_mints.iter().copied().collect();
+            for m in &selected_mints {
+                if !existing.contains(m) {
+                    allowed_mints.push(*m);
+                }
+            }
+            info!(
+                "wallet_seed_extraction: pinned effective_allowed_mints={} (base={} + seed_added={})",
+                allowed_mints.len(),
+                config.runtime.allowed_mints.len(),
+                allowed_mints.len().saturating_sub(config.runtime.allowed_mints.len())
+            );
+        } else {
+            seeded_non_pinned = selected_mints;
+        }
+    }
+
+    let allowed_mints = allowed_mints; // freeze
     let grpc_plans = GeyserAccountStreamPlan::controlled_v1(&config.grpc, &allowed_mints)?;
     let rabbitstream_plan = RabbitStreamPlan::controlled_v1(&config.rabbitstream)?;
     let helius_sender_plan = HeliusSenderPlan::from_config(&config.sender.helius)?;
+    let nozomi_sender_plan = NozomiSenderPlan::from_config(&config.sender.nozomi)?;
+    let astralan_sender_plan = AstralanSenderPlan::from_config(&config.sender.astralan)?;
     info!(
         "config OK: wallet={} mints={} sol_only={} minimum_profit_lamports={} route_shards={} auto_create={} auto_extend={} send_live_transactions={} live_route_refresh_cooldown_ms={} trigger_send_max_transactions={} grpc={} rabbitstream={}",
         wallet.pubkey(),
@@ -116,7 +210,12 @@ async fn main() -> anyhow::Result<()> {
         config.rabbitstream.enabled
     );
     log_stream_plans(&grpc_plans, rabbitstream_plan.as_ref());
-    log_sender_plan(&config, helius_sender_plan.as_ref());
+    log_sender_plan(
+        &config,
+        helius_sender_plan.as_ref(),
+        nozomi_sender_plan.as_ref(),
+        astralan_sender_plan.as_ref(),
+    );
 
     let rpc_client = Arc::new(RpcClient::new(config.rpc.http.clone()));
     ensure_base_atas_exist(&rpc_client, &wallet).context("failed to verify base token ATAs")?;
@@ -131,20 +230,42 @@ async fn main() -> anyhow::Result<()> {
         .context("controlled RPC bootstrap failed")?;
 
     info!(
-        "bootstrap OK: registry_mints={} pump={} dlmm={} skipped_low_liquidity={}",
+        "bootstrap OK: registry_mints={} pump={} dlmm={} raydium_cp={} damm_v2={} skipped_low_liquidity={}",
         report.registry.len(),
         report.discovered_pump,
         report.discovered_dlmm,
+        report.discovered_raydium_cp,
+        report.discovered_damm_v2,
         report.skipped_low_liquidity
     );
     let registry = report.registry;
+
+    // Delta B1 (per-mint ATA at boot): the hot path assumes the target-mint
+    // ATA already exists so trigger transactions never need to embed a
+    // `create_associated_token_account_idempotent` instruction. Pre-warm one
+    // ATA per `allowed_mints` entry now, before subscribing streams, so the
+    // first trigger for each seed mint runs the minimum-instruction path.
+    // Base ATAs (WSOL/USDC/USD1) were already ensured above via
+    // `ensure_base_atas_exist`. This loop is a no-op when the caller boots
+    // with `allowed_mints=[]` (wallet-seeded non-pin path); the promoter
+    // takes over ATA creation per-mint as it promotes seed mints.
+    for mint in &allowed_mints {
+        ensure_ata_exists(&rpc_client, &wallet, mint, "boot-seed")
+            .with_context(|| format!("ensure_ata_exists at boot for mint {mint}"))?;
+    }
 
     // Global lock serialising every writer that mutates the route-shard
     // state file. See `promote_mint_into_shard_async` in `src/alt/mod.rs` for
     // the race this defends against.
     let state_file_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 
-    if config.lookup_tables.route_shards.enabled {
+    if config.lookup_tables.route_shards.enabled && !allowed_mints.is_empty() {
+        // Wallet-seeded boot may leave `allowed_mints` empty until the
+        // promoter admits the first seed mint (see
+        // `docs/WALLET_SEEDING.md`). Running the maintenance pass with an
+        // empty allowlist is a no-op inside `RouteShardPlanner`, but we skip
+        // it entirely here to avoid the misleading `mint_blocks=0` log and
+        // the state-file mutex round-trip.
         let (routes, skipped_unready) = collect_stable_mint_routes(&config, &registry);
         let maintenance = {
             let _guard = state_file_lock
@@ -282,6 +403,28 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Plant wallet-seeded (non-pinned) mints into the hot-mint tracker so the
+    // promoter's first tick sees them at the top of `top_n`. No-op when the
+    // pin path was taken (mints already live in `allowed_mints`) or when
+    // the tracker itself is disabled (validation forbids this combo but we
+    // handle it defensively).
+    if !seeded_non_pinned.is_empty() {
+        if let Some(tracker) = hot_tracker.as_ref() {
+            let boost = config.runtime.wallet_followers.seed_boost_weight;
+            tracker.seed_boost(seeded_non_pinned.iter().copied(), boost);
+            info!(
+                "wallet_seed_planted_in_tracker: count={} boost_weight={}",
+                seeded_non_pinned.len(),
+                boost
+            );
+        } else {
+            tracing::warn!(
+                "wallet_seed_planted_in_tracker skipped: hot_mints disabled (count={})",
+                seeded_non_pinned.len()
+            );
+        }
+    }
+
     // Cold-start scan: pre-populate the tracker so promoter decisions don't
     // wait for `window_ms` of live trigger traffic. No-op if disabled or if
     // the tracker itself is disabled.
@@ -298,7 +441,17 @@ async fn main() -> anyhow::Result<()> {
             let scan_cfg = ColdStartScanConfig {
                 max_signatures: cfg.max_signatures,
                 budget: Duration::from_millis(cfg.budget_ms),
-                programs: vec![pump_program_id()],
+                // Seed from pump-amm, Raydium CPMM, and Meteora DAMM v2 so
+                // non-pump mints (which don't follow the `*pump` naming
+                // convention) also reach the tracker at cold-start. The
+                // scanner iterates programs sequentially and shares the
+                // wall-clock `budget`; tune `budget_ms` / `max_signatures`
+                // in config if you need more coverage of later programs.
+                programs: vec![
+                    pump_program_id(),
+                    raydium_cp_program_id(),
+                    damm_v2_program_id(),
+                ],
             };
             seed_hot_mint_tracker(&scanner, tracker.as_ref(), &scan_cfg)
         })
@@ -398,26 +551,57 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn log_sender_plan(config: &AppConfig, helius_sender_plan: Option<&HeliusSenderPlan>) {
-    if config.sender.primary == "helius" {
-        if let Some(plan) = helius_sender_plan {
-            info!(
-                "Helius sender planned: endpoint={} tip_lamports_min={} tip_lamports_max={} tip_accounts={} max_tps={} burst={} timeout_ms={} connection_warming={} warming_interval_ms={}",
-                redacted_endpoint(&plan.endpoint),
-                plan.tip.min_lamports,
-                plan.tip.max_lamports,
-                plan.tip.accounts.len(),
-                plan.max_tps,
-                plan.burst,
-                plan.timeout_ms,
-                plan.connection_warming_enabled,
-                plan.connection_warming_interval_ms
-            );
-        }
-    } else {
+fn log_sender_plan(
+    config: &AppConfig,
+    helius_sender_plan: Option<&HeliusSenderPlan>,
+    nozomi_sender_plan: Option<&NozomiSenderPlan>,
+    astralan_sender_plan: Option<&AstralanSenderPlan>,
+) {
+    info!(
+        "sender pool: primary={} broadcast={} send_rpc={} helius_enabled={} nozomi_enabled={} astralan_enabled={}",
+        config.sender.primary,
+        config.sender.broadcast,
+        config.sender.send_rpc,
+        config.sender.helius.enabled,
+        config.sender.nozomi.enabled,
+        config.sender.astralan.enabled,
+    );
+    if let Some(plan) = helius_sender_plan {
         info!(
-            "primary sender is RPC: send_rpc={} helius_enabled={}",
-            config.sender.send_rpc, config.sender.helius.enabled
+            "Helius sender planned: endpoint={} tip_lamports_min={} tip_lamports_max={} tip_accounts={} max_tps={} burst={} timeout_ms={} connection_warming={} warming_interval_ms={}",
+            redacted_endpoint(&plan.endpoint),
+            plan.tip.min_lamports,
+            plan.tip.max_lamports,
+            plan.tip.accounts.len(),
+            plan.max_tps,
+            plan.burst,
+            plan.timeout_ms,
+            plan.connection_warming_enabled,
+            plan.connection_warming_interval_ms
+        );
+    }
+    if let Some(plan) = nozomi_sender_plan {
+        info!(
+            "Nozomi sender planned: endpoint={} tip_lamports_min={} tip_lamports_max={} tip_accounts={} timeout_ms={} connection_warming={} warming_interval_ms={}",
+            redacted_endpoint(&plan.endpoint),
+            plan.tip.min_lamports,
+            plan.tip.max_lamports,
+            plan.tip.accounts.len(),
+            plan.timeout_ms,
+            plan.connection_warming_enabled,
+            plan.connection_warming_interval_ms
+        );
+    }
+    if let Some(plan) = astralan_sender_plan {
+        info!(
+            "Astralan sender planned: endpoint={} tip_lamports_min={} tip_lamports_max={} tip_accounts={} timeout_ms={} connection_warming={} warming_interval_ms={}",
+            redacted_endpoint(&plan.endpoint),
+            plan.tip.min_lamports,
+            plan.tip.max_lamports,
+            plan.tip.accounts.len(),
+            plan.timeout_ms,
+            plan.connection_warming_enabled,
+            plan.connection_warming_interval_ms
         );
     }
 }
@@ -425,6 +609,10 @@ fn log_sender_plan(config: &AppConfig, helius_sender_plan: Option<&HeliusSenderP
 fn redacted_endpoint(endpoint: &str) -> String {
     if let Some((prefix, _)) = endpoint.split_once("api-key=") {
         format!("{}api-key=<redacted>", prefix)
+    } else if let Some((prefix, _)) = endpoint.split_once("?c=") {
+        format!("{}?c=<redacted>", prefix)
+    } else if let Some((prefix, _)) = endpoint.split_once("&c=") {
+        format!("{}&c=<redacted>", prefix)
     } else {
         endpoint.to_string()
     }
@@ -700,19 +888,15 @@ fn run_rabbitstream_trigger_worker(
     // after this worker started (i.e. beyond the config seed) are trigger-
     // eligible without a reconnect.
     let allowed_mints_handle = registry.lock().unwrap().allowed_handle();
-    let helius_sender = if config.sender.primary == "helius" {
-        HeliusSenderPlan::from_config(&config.sender.helius)?
-            .map(HeliusSenderClient::new)
-            .transpose()?
-    } else {
-        None
-    };
-    if let Some(sender) = &helius_sender {
-        sender.start_connection_warmer();
-    }
+    let sender_pool = SenderPool::from_config(&config.sender)?;
+    sender_pool.start_all_warmers();
     info!(
-        "starting RabbitStream Axion trigger worker: url={} seed_mints={} min_sol={:.6}",
-        plan.url, seed_len, config.axion.min_sol
+        "starting RabbitStream Axion trigger worker: url={} seed_mints={} min_sol={:.6} sender_providers={:?} sender_broadcast={}",
+        plan.url,
+        seed_len,
+        config.axion.min_sol,
+        sender_pool.provider_names(),
+        config.sender.broadcast,
     );
 
     tokio::spawn(async move {
@@ -740,7 +924,7 @@ fn run_rabbitstream_trigger_worker(
             let route_execution_cache_iter = route_execution_cache.clone();
             let wallet_iter = wallet.clone();
             let registry_iter = registry.clone();
-            let helius_sender_iter = helius_sender.clone();
+            let sender_pool_iter = sender_pool.clone();
             let seen_signatures_iter = seen_signatures.clone();
             let seen_signature_order_iter = seen_signature_order.clone();
             let last_trigger_by_mint_iter = last_trigger_by_mint.clone();
@@ -823,7 +1007,7 @@ fn run_rabbitstream_trigger_worker(
                     let route_execution_cache = route_execution_cache_iter.clone();
                     let wallet = wallet_iter.clone();
                     let registry = registry_iter.clone();
-                    let helius_sender = helius_sender_iter.clone();
+                    let sender_pool = sender_pool_iter.clone();
                     tokio::spawn(async move {
                         if let Err(error) = process_axion_trigger(
                             config,
@@ -832,7 +1016,7 @@ fn run_rabbitstream_trigger_worker(
                             route_execution_cache,
                             wallet,
                             registry,
-                            helius_sender,
+                            sender_pool,
                             signal,
                             sol_amount,
                             volume_source,
@@ -910,19 +1094,16 @@ fn run_fomo_trigger_worker(
     drop(allowed_mints);
     // Hot-reload allowlist per transaction (see run_rabbitstream_trigger_worker).
     let allowed_mints_handle = registry.lock().unwrap().allowed_handle();
-    let helius_sender = if config.sender.primary == "helius" {
-        HeliusSenderPlan::from_config(&config.sender.helius)?
-            .map(HeliusSenderClient::new)
-            .transpose()?
-    } else {
-        None
-    };
-    if let Some(sender) = &helius_sender {
-        sender.start_connection_warmer();
-    }
+    let sender_pool = SenderPool::from_config(&config.sender)?;
+    sender_pool.start_all_warmers();
     info!(
-        "starting RabbitStream FOMO trigger worker: url={} signer={} seed_mints={} min_sol={:.6}",
-        plan.url, fomo_signer, seed_len, config.fomo.min_sol
+        "starting RabbitStream FOMO trigger worker: url={} signer={} seed_mints={} min_sol={:.6} sender_providers={:?} sender_broadcast={}",
+        plan.url,
+        fomo_signer,
+        seed_len,
+        config.fomo.min_sol,
+        sender_pool.provider_names(),
+        config.sender.broadcast,
     );
 
     tokio::spawn(async move {
@@ -946,7 +1127,7 @@ fn run_fomo_trigger_worker(
             let route_execution_cache_iter = route_execution_cache.clone();
             let wallet_iter = wallet.clone();
             let registry_iter = registry.clone();
-            let helius_sender_iter = helius_sender.clone();
+            let sender_pool_iter = sender_pool.clone();
             let seen_signatures_iter = seen_signatures.clone();
             let seen_signature_order_iter = seen_signature_order.clone();
             let last_trigger_by_mint_iter = last_trigger_by_mint.clone();
@@ -1056,7 +1237,7 @@ fn run_fomo_trigger_worker(
                     let route_execution_cache = route_execution_cache_iter.clone();
                     let wallet = wallet_iter.clone();
                     let registry = registry_iter.clone();
-                    let helius_sender = helius_sender_iter.clone();
+                    let sender_pool = sender_pool_iter.clone();
                     tokio::spawn(async move {
                         if let Err(error) = process_axion_trigger(
                             config,
@@ -1065,7 +1246,7 @@ fn run_fomo_trigger_worker(
                             route_execution_cache,
                             wallet,
                             registry,
-                            helius_sender,
+                            sender_pool,
                             axion_signal,
                             sol_amount,
                             volume_source,
@@ -1146,7 +1327,7 @@ async fn process_axion_trigger(
     route_execution_cache: Option<Arc<RwLock<RouteExecutionCache>>>,
     wallet: Arc<solana_sdk::signature::Keypair>,
     registry: Arc<Mutex<solana_onchain_arbitrage_bot::registry::RuntimeRegistry>>,
-    helius_sender: Option<HeliusSenderClient>,
+    sender_pool: SenderPool,
     signal: solana_onchain_arbitrage_bot::axion::AxionTriggerSignal,
     sol_amount: f64,
     volume_source: &'static str,
@@ -1255,13 +1436,16 @@ async fn process_axion_trigger(
         );
         return Ok(());
     };
-    let Some(sender) = helius_sender else {
+    if sender_pool.is_empty() {
         tracing::debug!(
-            "trigger transaction send skipped: mint={} sig={} reason=helius_sender_disabled",
-            signal.mint, signal.signature
+            "trigger transaction send skipped: mint={} sig={} reason=sender_pool_empty primary={} broadcast={}",
+            signal.mint,
+            signal.signature,
+            config.sender.primary,
+            config.sender.broadcast,
         );
         return Ok(());
-    };
+    }
     let trigger_signature = signal.signature.clone();
     let trigger_mint = signal.mint;
     let trigger_slot = signal.slot;
@@ -1274,34 +1458,44 @@ async fn process_axion_trigger(
         if stagger_us > 0 && tx_index > 0 {
             tokio::time::sleep(std::time::Duration::from_micros(stagger_us)).await;
         }
-        let sender = sender.clone();
+        let sender_pool = sender_pool.clone();
         let trigger_signature = trigger_signature.clone();
         let trigger_to_spawn_ms = trigger_received_at.elapsed().as_millis();
+        let tx = Arc::new(tx);
         tokio::spawn(async move {
             let send_started_at = Instant::now();
-            match sender.send_transaction(&tx).await {
-                Ok(signature) => info!(
-                    "trigger transaction sent: mint={} trigger_slot={} trigger_sig={} tx_index={} tx_sig={} trigger_to_spawn_ms={} sender_ack_ms={} trigger_to_ack_ms={}",
-                    trigger_mint,
-                    trigger_slot,
-                    trigger_signature,
-                    tx_index,
-                    signature,
-                    trigger_to_spawn_ms,
-                    send_started_at.elapsed().as_millis(),
-                    trigger_received_at.elapsed().as_millis()
-                ),
-                Err(error) => tracing::error!(
-                    "trigger transaction send failed: mint={} trigger_slot={} trigger_sig={} tx_index={} trigger_to_spawn_ms={} sender_ack_ms={} trigger_to_ack_ms={} error={}",
-                    trigger_mint,
-                    trigger_slot,
-                    trigger_signature,
-                    tx_index,
-                    trigger_to_spawn_ms,
-                    send_started_at.elapsed().as_millis(),
-                    trigger_received_at.elapsed().as_millis(),
-                    error
-                ),
+            let outcomes = sender_pool.broadcast(tx).await;
+            let broadcast_ms = send_started_at.elapsed().as_millis();
+            let trigger_to_ack_ms = trigger_received_at.elapsed().as_millis();
+            for outcome in outcomes {
+                match outcome.result {
+                    Ok(signature) => info!(
+                        "trigger transaction sent: mint={} trigger_slot={} trigger_sig={} tx_index={} provider={} tx_sig={} trigger_to_spawn_ms={} sender_ack_ms={} broadcast_ms={} trigger_to_ack_ms={}",
+                        trigger_mint,
+                        trigger_slot,
+                        trigger_signature,
+                        tx_index,
+                        outcome.provider,
+                        signature,
+                        trigger_to_spawn_ms,
+                        outcome.latency.as_millis(),
+                        broadcast_ms,
+                        trigger_to_ack_ms,
+                    ),
+                    Err(error) => tracing::error!(
+                        "trigger transaction send failed: mint={} trigger_slot={} trigger_sig={} tx_index={} provider={} trigger_to_spawn_ms={} sender_ack_ms={} broadcast_ms={} trigger_to_ack_ms={} error={}",
+                        trigger_mint,
+                        trigger_slot,
+                        trigger_signature,
+                        tx_index,
+                        outcome.provider,
+                        trigger_to_spawn_ms,
+                        outcome.latency.as_millis(),
+                        broadcast_ms,
+                        trigger_to_ack_ms,
+                        error,
+                    ),
+                }
             }
         });
     }
@@ -2216,10 +2410,17 @@ fn prepare_route_runtime_accounts_for_registry(
         );
 
         for route in route_groups {
-            for ata in pump_route_atas_to_prepare(wallet.pubkey(), &route.pump) {
-                if seen_atas.insert(ata.address) {
-                    if ensure_cached_pda_ata(rpc_client, wallet, runtime_account_cache, &ata)? {
-                        prepared += 1;
+            if let Some(pump) = &route.pump {
+                for ata in pump_route_atas_to_prepare(wallet.pubkey(), pump) {
+                    if seen_atas.insert(ata.address) {
+                        if ensure_cached_pda_ata(
+                            rpc_client,
+                            wallet,
+                            runtime_account_cache,
+                            &ata,
+                        )? {
+                            prepared += 1;
+                        }
                     }
                 }
             }
@@ -2261,10 +2462,12 @@ fn prepare_route_runtime_accounts_for_mint(
     let mut seen_atas = HashSet::<Pubkey>::new();
 
     for route in route_groups {
-        for ata in pump_route_atas_to_prepare(wallet.pubkey(), &route.pump) {
-            if seen_atas.insert(ata.address) {
-                if ensure_cached_pda_ata(rpc_client, wallet, runtime_account_cache, &ata)? {
-                    prepared += 1;
+        if let Some(pump) = &route.pump {
+            for ata in pump_route_atas_to_prepare(wallet.pubkey(), pump) {
+                if seen_atas.insert(ata.address) {
+                    if ensure_cached_pda_ata(rpc_client, wallet, runtime_account_cache, &ata)? {
+                        prepared += 1;
+                    }
                 }
             }
         }
@@ -2523,23 +2726,24 @@ fn pack_with_optional_alt_filter(
         );
     };
 
-    // Filtered path: drop DLMMs whose critical accounts are not in the route
-    // shard ALT. Without this filter those DLMMs land in the tx as static
+    // Filtered path: drop pools whose critical accounts are not in the route
+    // shard ALT. Without this filter those accounts land in the tx as static
     // 32-byte keys and push the tx past the 1232-byte wire limit, causing
     // Helius to reject with `base64 encoded too large`.
-    let Some(pump) = mint_state
+    //
+    // Pump is optional (compositions like CPMM+DLMM or DAMM v2+DLMM don't
+    // need a Pump leg). The `≥2 pool types present` rule at the bottom is the
+    // authoritative Discovery gate; missing pump alone is not a bail reason.
+    let pump = mint_state
         .eligible_pumps(min_base_liquidity_lamports, max_state_age_ms, now_ms)
         .into_iter()
         .next()
-        .cloned()
-    else {
-        return Vec::new();
-    };
+        .cloned();
 
     let eligible_dlmms =
         mint_state.eligible_dlmms(min_base_liquidity_lamports, max_state_age_ms, now_ms);
     let total_eligible = eligible_dlmms.len();
-    let filtered: Vec<DlmmRouteState> = eligible_dlmms
+    let filtered_dlmms: Vec<DlmmRouteState> = eligible_dlmms
         .into_iter()
         .filter(|dlmm| {
             alt.contains(&dlmm.lb_pair)
@@ -2549,28 +2753,64 @@ fn pack_with_optional_alt_filter(
         .cloned()
         .collect();
 
-    if filtered.len() < total_eligible {
+    if filtered_dlmms.len() < total_eligible {
         tracing::debug!(
             "route shard filter dropped {} dlmm(s) for mint {} (eligible={}, addressable={})",
-            total_eligible - filtered.len(),
+            total_eligible - filtered_dlmms.len(),
             mint_state.mint,
             total_eligible,
-            filtered.len(),
+            filtered_dlmms.len(),
         );
     }
 
-    if filtered.is_empty() {
+    // CPMM/DAMM v2 do NOT currently live in the route shard ALT (Fase 0.d.3
+    // deferred). Passing them inline is intentional for the MVP path: the tx
+    // wire budget accommodates a small number of CPMM/DAMM v2 pools inline
+    // even without ALT compaction. If wire size regresses in production we
+    // will need to (a) reintroduce the ALT-membership filter here and (b)
+    // land the CPMM/DAMM v2 ALT extensions in Fase 0.d.3.
+    let raydium_cps: Vec<solana_onchain_arbitrage_bot::registry::CpmmRouteState> = mint_state
+        .eligible_raydium_cps(min_base_liquidity_lamports, max_state_age_ms, now_ms)
+        .into_iter()
+        .cloned()
+        .collect();
+
+    let damm_v2s: Vec<solana_onchain_arbitrage_bot::registry::DammV2RouteState> = mint_state
+        .eligible_damm_v2s(min_base_liquidity_lamports, max_state_age_ms, now_ms)
+        .into_iter()
+        .cloned()
+        .collect();
+
+    // Discovery gate: ≥2 distinct pool types required for a valid arb.
+    let types_present = (pump.is_some() as usize)
+        + (!filtered_dlmms.is_empty() as usize)
+        + (!raydium_cps.is_empty() as usize)
+        + (!damm_v2s.is_empty() as usize);
+    if types_present < 2 {
         return Vec::new();
     }
 
+    if filtered_dlmms.is_empty() {
+        // DLMM-less composition — single group with everything else.
+        return vec![RouteGroup {
+            mint: mint_state.mint,
+            pump,
+            dlmms: Vec::new(),
+            raydium_cps,
+            damm_v2s,
+        }];
+    }
+
     packer
-        .pack(&filtered)
+        .pack(&filtered_dlmms)
         .into_iter()
         .filter(|group| !group.is_empty())
         .map(|dlmms| RouteGroup {
             mint: mint_state.mint,
             pump: pump.clone(),
             dlmms,
+            raydium_cps: raydium_cps.clone(),
+            damm_v2s: damm_v2s.clone(),
         })
         .collect()
 }

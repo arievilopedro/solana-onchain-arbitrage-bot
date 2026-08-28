@@ -23,6 +23,17 @@ pub struct RaydiumCpAmmInfo {
 }
 
 impl RaydiumCpAmmInfo {
+    /// GPA memcmp offset for `token_0_mint`. Used to find every pool whose
+    /// token_0 slot equals a given mint.
+    pub const fn token_0_mint_gpa_offset() -> usize {
+        TOKEN_0_MINT_OFFSET
+    }
+
+    /// GPA memcmp offset for `token_1_mint`.
+    pub const fn token_1_mint_gpa_offset() -> usize {
+        TOKEN_1_MINT_OFFSET
+    }
+
     pub fn load_checked(data: &[u8]) -> Result<Self> {
         if data.len() < OBSERVATION_KEY_OFFSET + 32 {
             return Err(anyhow::anyhow!("Invalid data length for RaydiumCpAmmInfo"));

@@ -8,3 +8,7 @@ config.toml
 /fomo*.json
 /tx*.json
 /nul
+
+# Runtime state (route shards + plan file). Regenerated at boot.
+/route_shards.json
+/route_shards.plan.json

@@ -3,14 +3,21 @@
 //! Bootstrap may use RPC. Runtime updates should come from Geyser/account streams.
 
 use crate::constants::sol_mint;
-use crate::dex::meteora::constants::{dlmm_event_authority, dlmm_program_id, memo_program_v2};
+use crate::dex::meteora::constants::{
+    damm_v2_event_authority, damm_v2_pool_authority, damm_v2_program_id, dlmm_event_authority,
+    dlmm_program_id, memo_program_v2,
+};
+use crate::dex::meteora::dammv2_info::MeteoraDAmmV2Info;
 use crate::dex::meteora::dlmm_info::DlmmInfo;
 use crate::dex::pump::amm_info::{
     PumpAmmInfo, PUMP_BASE_MINT_GPA_OFFSET, PUMP_QUOTE_MINT_GPA_OFFSET,
 };
 use crate::dex::pump::{pump_fee_wallet, pump_mayhem_fee_wallet, pump_program_id};
+use crate::dex::raydium::constants::{raydium_cp_authority, raydium_cp_program_id};
+use crate::dex::raydium::cp_amm_info::RaydiumCpAmmInfo;
 use crate::registry::{
-    DlmmRouteState, MintRuntimeState, PoolLiquidity, PumpRouteState, RuntimeRegistry,
+    CpmmRouteState, DammV2RouteState, DlmmRouteState, MintRuntimeState, PoolLiquidity,
+    PumpRouteState, RuntimeRegistry,
 };
 use anyhow::Context;
 use solana_account_decoder::UiAccountEncoding;
@@ -33,6 +40,8 @@ pub struct RpcBootstrapReport {
     pub registry: RuntimeRegistry,
     pub discovered_pump: usize,
     pub discovered_dlmm: usize,
+    pub discovered_raydium_cp: usize,
+    pub discovered_damm_v2: usize,
     pub skipped_low_liquidity: usize,
 }
 
@@ -47,6 +56,8 @@ pub struct MintDiscoveryResult {
     pub state: MintRuntimeState,
     pub discovered_pump: usize,
     pub discovered_dlmm: usize,
+    pub discovered_raydium_cp: usize,
+    pub discovered_damm_v2: usize,
     pub skipped_low_liquidity: usize,
 }
 
@@ -64,12 +75,16 @@ impl ControlledRpcBootstrap {
         let mut registry = RuntimeRegistry::new(allowed_mints.iter().copied())?;
         let mut discovered_pump = 0usize;
         let mut discovered_dlmm = 0usize;
+        let mut discovered_raydium_cp = 0usize;
+        let mut discovered_damm_v2 = 0usize;
         let mut skipped_low_liquidity = 0usize;
 
         for mint in allowed_mints {
             let result = self.discover_mint(*mint)?;
             discovered_pump += result.discovered_pump;
             discovered_dlmm += result.discovered_dlmm;
+            discovered_raydium_cp += result.discovered_raydium_cp;
+            discovered_damm_v2 += result.discovered_damm_v2;
             skipped_low_liquidity += result.skipped_low_liquidity;
             registry.upsert_mint(result.state)?;
         }
@@ -78,6 +93,8 @@ impl ControlledRpcBootstrap {
             registry,
             discovered_pump,
             discovered_dlmm,
+            discovered_raydium_cp,
+            discovered_damm_v2,
             skipped_low_liquidity,
         })
     }
@@ -91,6 +108,8 @@ impl ControlledRpcBootstrap {
         let mut state = MintRuntimeState::new(mint, token_program);
         let mut discovered_pump = 0usize;
         let mut discovered_dlmm = 0usize;
+        let mut discovered_raydium_cp = 0usize;
+        let mut discovered_damm_v2 = 0usize;
         let mut skipped_low_liquidity = 0usize;
 
         let pump_accounts = self.discover_pump_pool_accounts(mint)?;
@@ -148,10 +167,60 @@ impl ControlledRpcBootstrap {
             }
         }
 
+        let raydium_cp_accounts = self.discover_raydium_cp_accounts(mint)?;
+        for (pool, account) in raydium_cp_accounts {
+            let Some(route_state) = cpmm_route_state_from_account(
+                mint,
+                pool,
+                &account,
+                |base_vault| self.base_vault_liquidity(base_vault),
+            )?
+            else {
+                continue;
+            };
+
+            if route_state
+                .liquidity
+                .map(|l| l.base_lamports >= self.config.min_pool_base_liquidity_lamports)
+                .unwrap_or(false)
+            {
+                discovered_raydium_cp += 1;
+                state.raydium_cps.push(route_state);
+            } else {
+                skipped_low_liquidity += 1;
+            }
+        }
+
+        let damm_v2_accounts = self.discover_damm_v2_accounts(mint)?;
+        for (pool, account) in damm_v2_accounts {
+            let Some(route_state) = damm_v2_route_state_from_account(
+                mint,
+                pool,
+                &account,
+                |base_vault| self.base_vault_liquidity(base_vault),
+            )?
+            else {
+                continue;
+            };
+
+            if route_state
+                .liquidity
+                .map(|l| l.base_lamports >= self.config.min_pool_base_liquidity_lamports)
+                .unwrap_or(false)
+            {
+                discovered_damm_v2 += 1;
+                state.damm_v2s.push(route_state);
+            } else {
+                skipped_low_liquidity += 1;
+            }
+        }
+
         Ok(MintDiscoveryResult {
             state,
             discovered_pump,
             discovered_dlmm,
+            discovered_raydium_cp,
+            discovered_damm_v2,
             skipped_low_liquidity,
         })
     }
@@ -177,6 +246,44 @@ impl ControlledRpcBootstrap {
         ] {
             for (pubkey, account) in
                 self.get_program_accounts_by_mint(dlmm_program_id(), offset, mint)?
+            {
+                out.insert(pubkey, account);
+            }
+        }
+
+        Ok(out.into_iter().collect())
+    }
+
+    fn discover_raydium_cp_accounts(
+        &self,
+        mint: Pubkey,
+    ) -> anyhow::Result<Vec<(Pubkey, Account)>> {
+        let mut out = HashMap::new();
+        for offset in [
+            RaydiumCpAmmInfo::token_0_mint_gpa_offset(),
+            RaydiumCpAmmInfo::token_1_mint_gpa_offset(),
+        ] {
+            for (pubkey, account) in
+                self.get_program_accounts_by_mint(raydium_cp_program_id(), offset, mint)?
+            {
+                out.insert(pubkey, account);
+            }
+        }
+
+        Ok(out.into_iter().collect())
+    }
+
+    fn discover_damm_v2_accounts(
+        &self,
+        mint: Pubkey,
+    ) -> anyhow::Result<Vec<(Pubkey, Account)>> {
+        let mut out = HashMap::new();
+        for offset in [
+            MeteoraDAmmV2Info::base_mint_gpa_offset(),
+            MeteoraDAmmV2Info::quote_mint_gpa_offset(),
+        ] {
+            for (pubkey, account) in
+                self.get_program_accounts_by_mint(damm_v2_program_id(), offset, mint)?
             {
                 out.insert(pubkey, account);
             }
@@ -365,6 +472,77 @@ pub fn dlmm_route_state_from_account(
     }))
 }
 
+pub fn cpmm_route_state_from_account(
+    mint: Pubkey,
+    pool: Pubkey,
+    account: &Account,
+    liquidity: impl FnOnce(Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
+) -> anyhow::Result<Option<CpmmRouteState>> {
+    let info = RaydiumCpAmmInfo::load_checked(&account.data)?;
+    if !pool_contains_mint_and_sol(info.token_0_mint, info.token_1_mint, mint) {
+        return Ok(None);
+    }
+
+    let (token_vault, base_vault, base_mint) = if info.token_0_mint == mint {
+        (info.token_0_vault, info.token_1_vault, info.token_1_mint)
+    } else {
+        (info.token_1_vault, info.token_0_vault, info.token_0_mint)
+    };
+
+    if base_mint != sol_mint() {
+        return Ok(None);
+    }
+
+    Ok(Some(CpmmRouteState {
+        program_id: raydium_cp_program_id(),
+        base_mint,
+        authority: raydium_cp_authority(),
+        pool,
+        amm_config: info.amm_config,
+        token_vault,
+        base_vault,
+        observation: info.observation_key,
+        liquidity: liquidity(base_vault)?,
+        enabled: true,
+        last_update_slot: 0,
+    }))
+}
+
+pub fn damm_v2_route_state_from_account(
+    mint: Pubkey,
+    pool: Pubkey,
+    account: &Account,
+    liquidity: impl FnOnce(Pubkey) -> anyhow::Result<Option<PoolLiquidity>>,
+) -> anyhow::Result<Option<DammV2RouteState>> {
+    let info = MeteoraDAmmV2Info::load_checked(&account.data)?;
+    if !pool_contains_mint_and_sol(info.base_mint, info.quote_mint, mint) {
+        return Ok(None);
+    }
+
+    let (token_vault, base_vault, base_mint) = if info.base_mint == mint {
+        (info.base_vault, info.quote_vault, info.quote_mint)
+    } else {
+        (info.quote_vault, info.base_vault, info.base_mint)
+    };
+
+    if base_mint != sol_mint() {
+        return Ok(None);
+    }
+
+    Ok(Some(DammV2RouteState {
+        program_id: damm_v2_program_id(),
+        base_mint,
+        event_authority: damm_v2_event_authority(),
+        pool_authority: damm_v2_pool_authority(),
+        pool,
+        token_vault,
+        base_vault,
+        liquidity: liquidity(base_vault)?,
+        enabled: true,
+        last_update_slot: 0,
+    }))
+}
+
 fn pool_contains_mint_and_sol(a: Pubkey, b: Pubkey, mint: Pubkey) -> bool {
     let sol = sol_mint();
     (a == mint && b == sol) || (b == mint && a == sol)
@@ -446,5 +624,175 @@ mod tests {
         assert_eq!(memo, Some(memo_program_v2()));
         assert_ne!(memo, Some(token_2022_program_id()));
         assert_eq!(no_memo, None);
+    }
+
+    #[test]
+    fn cpmm_gpa_offsets_are_ordered() {
+        assert_eq!(
+            RaydiumCpAmmInfo::token_1_mint_gpa_offset(),
+            RaydiumCpAmmInfo::token_0_mint_gpa_offset() + 32
+        );
+    }
+
+    #[test]
+    fn damm_v2_gpa_offsets_are_ordered() {
+        assert_eq!(
+            MeteoraDAmmV2Info::quote_mint_gpa_offset(),
+            MeteoraDAmmV2Info::base_mint_gpa_offset() + 32
+        );
+    }
+
+    /// Build a raw CPMM pool account buffer with the given mints/vaults at
+    /// the correct offsets. Everything else is zero-padded; only the fields
+    /// the decoder reads matter.
+    fn cpmm_account_data(
+        amm_config: Pubkey,
+        token_0_vault: Pubkey,
+        token_1_vault: Pubkey,
+        token_0_mint: Pubkey,
+        token_1_mint: Pubkey,
+        observation: Pubkey,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; 328];
+        data[8..40].copy_from_slice(amm_config.as_ref());
+        data[72..104].copy_from_slice(token_0_vault.as_ref());
+        data[104..136].copy_from_slice(token_1_vault.as_ref());
+        data[168..200].copy_from_slice(token_0_mint.as_ref());
+        data[200..232].copy_from_slice(token_1_mint.as_ref());
+        data[296..328].copy_from_slice(observation.as_ref());
+        data
+    }
+
+    fn damm_v2_account_data(
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        base_vault: Pubkey,
+        quote_vault: Pubkey,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; 296];
+        data[168..200].copy_from_slice(base_mint.as_ref());
+        data[200..232].copy_from_slice(quote_mint.as_ref());
+        data[232..264].copy_from_slice(base_vault.as_ref());
+        data[264..296].copy_from_slice(quote_vault.as_ref());
+        data
+    }
+
+    fn fake_account(data: Vec<u8>) -> Account {
+        Account {
+            lamports: 0,
+            data,
+            owner: Pubkey::default(),
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn cpmm_route_state_normalizes_mint_on_token_0_side() {
+        let mint = pk(1);
+        let pool = pk(2);
+        let data = cpmm_account_data(
+            pk(10), // amm_config
+            pk(11), // token_0_vault (mint)
+            pk(12), // token_1_vault (SOL)
+            mint,
+            sol_mint(),
+            pk(13), // observation
+        );
+
+        let route = cpmm_route_state_from_account(mint, pool, &fake_account(data), |_| Ok(None))
+            .unwrap()
+            .expect("route state");
+
+        assert_eq!(route.program_id, raydium_cp_program_id());
+        assert_eq!(route.authority, raydium_cp_authority());
+        assert_eq!(route.pool, pool);
+        assert_eq!(route.base_mint, sol_mint());
+        assert_eq!(route.amm_config, pk(10));
+        assert_eq!(route.token_vault, pk(11));
+        assert_eq!(route.base_vault, pk(12));
+        assert_eq!(route.observation, pk(13));
+    }
+
+    #[test]
+    fn cpmm_route_state_normalizes_mint_on_token_1_side() {
+        let mint = pk(1);
+        let pool = pk(2);
+        let data = cpmm_account_data(
+            pk(10),
+            pk(11), // token_0_vault (SOL)
+            pk(12), // token_1_vault (mint)
+            sol_mint(),
+            mint,
+            pk(13),
+        );
+
+        let route = cpmm_route_state_from_account(mint, pool, &fake_account(data), |_| Ok(None))
+            .unwrap()
+            .expect("route state");
+
+        assert_eq!(route.token_vault, pk(12));
+        assert_eq!(route.base_vault, pk(11));
+        assert_eq!(route.base_mint, sol_mint());
+    }
+
+    #[test]
+    fn cpmm_route_state_rejects_non_sol_pairs() {
+        let mint = pk(1);
+        let pool = pk(2);
+        // Mint paired with USDC, not SOL — must be rejected.
+        let data = cpmm_account_data(pk(10), pk(11), pk(12), mint, usdc_mint(), pk(13));
+
+        let route =
+            cpmm_route_state_from_account(mint, pool, &fake_account(data), |_| Ok(None)).unwrap();
+        assert!(route.is_none());
+    }
+
+    #[test]
+    fn damm_v2_route_state_normalizes_mint_on_base_side() {
+        let mint = pk(1);
+        let pool = pk(2);
+        let data = damm_v2_account_data(mint, sol_mint(), pk(11), pk(12));
+
+        let route =
+            damm_v2_route_state_from_account(mint, pool, &fake_account(data), |_| Ok(None))
+                .unwrap()
+                .expect("route state");
+
+        assert_eq!(route.program_id, damm_v2_program_id());
+        assert_eq!(route.event_authority, damm_v2_event_authority());
+        assert_eq!(route.pool_authority, damm_v2_pool_authority());
+        assert_eq!(route.pool, pool);
+        assert_eq!(route.base_mint, sol_mint());
+        assert_eq!(route.token_vault, pk(11));
+        assert_eq!(route.base_vault, pk(12));
+    }
+
+    #[test]
+    fn damm_v2_route_state_normalizes_mint_on_quote_side() {
+        let mint = pk(1);
+        let pool = pk(2);
+        let data = damm_v2_account_data(sol_mint(), mint, pk(11), pk(12));
+
+        let route =
+            damm_v2_route_state_from_account(mint, pool, &fake_account(data), |_| Ok(None))
+                .unwrap()
+                .expect("route state");
+
+        assert_eq!(route.token_vault, pk(12));
+        assert_eq!(route.base_vault, pk(11));
+        assert_eq!(route.base_mint, sol_mint());
+    }
+
+    #[test]
+    fn damm_v2_route_state_rejects_non_sol_pairs() {
+        let mint = pk(1);
+        let pool = pk(2);
+        let data = damm_v2_account_data(mint, usdc_mint(), pk(11), pk(12));
+
+        let route =
+            damm_v2_route_state_from_account(mint, pool, &fake_account(data), |_| Ok(None))
+                .unwrap();
+        assert!(route.is_none());
     }
 }

@@ -109,6 +109,10 @@ pub mod yellowstone {
         AXIOM_CU_LIMIT, AXION_PREPARE_IX_LEN, AXION_PREPARE_OPCODE, AXION_SWAP_IX_LEN,
         AXION_SWAP_OPCODE,
     };
+    use crate::dex::meteora::constants::{damm_v2_program_id, DAMM_V2_SWAP_DISCRIMINATOR};
+    use crate::dex::raydium::constants::{
+        raydium_cp_program_id, RAYDIUM_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR,
+    };
     use solana_program::pubkey::Pubkey;
     use std::collections::HashSet;
     use yellowstone_grpc_proto::solana::storage::confirmed_block::{
@@ -179,8 +183,13 @@ pub mod yellowstone {
         axion_program: Pubkey,
     ) -> AxionVolume {
         let pump_instruction = pump_amm_instruction_volume(tx, keys);
+        let cpmm_instruction = cpmm_instruction_volume(tx, keys);
+        let damm_v2_instruction = damm_v2_instruction_volume(tx, keys);
         let axion_instruction = axion_instruction_volume(tx, keys, axion_program, meta);
-        let instruction = pump_instruction.or(axion_instruction);
+        let instruction = pump_instruction
+            .or(cpmm_instruction)
+            .or(damm_v2_instruction)
+            .or(axion_instruction);
         if let Some(meta) = meta {
             let wsol = wsol_volume(meta);
             if wsol > 0.0 {
@@ -357,6 +366,64 @@ pub mod yellowstone {
         })
     }
 
+    fn cpmm_instruction_volume(tx: &Transaction, keys: &[Pubkey]) -> Option<AxionVolume> {
+        let msg = tx.message.as_ref()?;
+        let cpmm_program = raydium_cp_program_id();
+        msg.instructions
+            .iter()
+            .filter(|ix| keys.get(ix.program_id_index as usize) == Some(&cpmm_program))
+            .filter_map(|ix| cpmm_volume_from_instruction(&ix.data))
+            .max_by_key(|volume| volume.raw_amount.unwrap_or(0))
+    }
+
+    /// Decodes a Raydium CPMM `swap_base_input` ix. Side (buy/sell) can't be
+    /// inferred from the ix bytes alone; sol_amount is left at 0.0 so
+    /// `sol_volume` falls back to the WSOL/native-SOL meta delta.
+    fn cpmm_volume_from_instruction(data: &[u8]) -> Option<AxionVolume> {
+        if data.len() < 16 || !data.starts_with(&RAYDIUM_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR) {
+            return None;
+        }
+        let amount = read_le_u64(&data[8..16]).unwrap_or(0);
+        if amount == 0 {
+            return None;
+        }
+        Some(AxionVolume {
+            sol_amount: 0.0,
+            source: "cpmm_swap_base_input_bytes",
+            side: None,
+            raw_amount: Some(amount),
+        })
+    }
+
+    fn damm_v2_instruction_volume(tx: &Transaction, keys: &[Pubkey]) -> Option<AxionVolume> {
+        let msg = tx.message.as_ref()?;
+        let damm_program = damm_v2_program_id();
+        msg.instructions
+            .iter()
+            .filter(|ix| keys.get(ix.program_id_index as usize) == Some(&damm_program))
+            .filter_map(|ix| damm_v2_volume_from_instruction(&ix.data))
+            .max_by_key(|volume| volume.raw_amount.unwrap_or(0))
+    }
+
+    /// Decodes a Meteora DAMM v2 `swap` ix. Side (buy/sell) can't be inferred
+    /// from the ix bytes alone; sol_amount is left at 0.0 so `sol_volume`
+    /// falls back to the WSOL/native-SOL meta delta.
+    fn damm_v2_volume_from_instruction(data: &[u8]) -> Option<AxionVolume> {
+        if data.len() < 16 || !data.starts_with(&DAMM_V2_SWAP_DISCRIMINATOR) {
+            return None;
+        }
+        let amount = read_le_u64(&data[8..16]).unwrap_or(0);
+        if amount == 0 {
+            return None;
+        }
+        Some(AxionVolume {
+            sol_amount: 0.0,
+            source: "damm_v2_swap_bytes",
+            side: None,
+            raw_amount: Some(amount),
+        })
+    }
+
     fn owner_wsol_delta_sol(meta: &TransactionStatusMeta, owner: &Pubkey) -> Option<f64> {
         let owner = owner.to_string();
         let mut pre = std::collections::HashMap::new();
@@ -400,8 +467,9 @@ pub mod yellowstone {
     }
 
     /// Verifies the Axion trigger shape (2 ixs: prepare + swap) and the swap
-    /// touches pump-amm. Rejects everything else (single-ix probes, wrong
-    /// opcodes, wrong lengths, no pump-amm).
+    /// touches one of the supported AMMs (pump-amm, Raydium CPMM, or
+    /// Meteora DAMM v2). Rejects everything else (single-ix probes, wrong
+    /// opcodes, wrong lengths, unsupported venue).
     pub fn validate_axion_structure(
         tx: &Transaction,
         keys: &[Pubkey],
@@ -430,10 +498,16 @@ pub mod yellowstone {
         {
             return false;
         }
-        let pump = pump_amm_pubkey();
-        swap.accounts
-            .iter()
-            .any(|idx| keys.get(*idx as usize) == Some(&pump))
+        let acceptable_targets = [
+            pump_amm_pubkey(),
+            raydium_cp_program_id(),
+            damm_v2_program_id(),
+        ];
+        swap.accounts.iter().any(|idx| {
+            keys.get(*idx as usize)
+                .map(|k| acceptable_targets.contains(k))
+                .unwrap_or(false)
+        })
     }
 
     /// True iff the tx contains a `SetComputeUnitLimit(target)` ComputeBudget ix.
@@ -561,6 +635,60 @@ pub mod yellowstone {
             assert_eq!(volume.raw_amount, Some(42_000_000));
             assert_eq!(volume.source, "pump_swap_sell_bytes");
             assert_eq!(volume.sol_amount, 0.0);
+        }
+
+        #[test]
+        fn cpmm_discriminator_detects_swap_base_input() {
+            let mut data = Vec::from(RAYDIUM_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR);
+            data.extend_from_slice(&3_141_592_653u64.to_le_bytes());
+
+            let volume = cpmm_volume_from_instruction(&data).expect("volume");
+
+            assert_eq!(volume.side, None);
+            assert_eq!(volume.raw_amount, Some(3_141_592_653));
+            assert_eq!(volume.source, "cpmm_swap_base_input_bytes");
+            assert_eq!(volume.sol_amount, 0.0);
+        }
+
+        #[test]
+        fn cpmm_wrong_discriminator_is_ignored() {
+            let mut data = vec![0xaa; 8];
+            data.extend_from_slice(&1_000_000u64.to_le_bytes());
+            assert!(cpmm_volume_from_instruction(&data).is_none());
+        }
+
+        #[test]
+        fn cpmm_zero_amount_is_ignored() {
+            let mut data = Vec::from(RAYDIUM_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR);
+            data.extend_from_slice(&0u64.to_le_bytes());
+            assert!(cpmm_volume_from_instruction(&data).is_none());
+        }
+
+        #[test]
+        fn damm_v2_discriminator_detects_swap() {
+            let mut data = Vec::from(DAMM_V2_SWAP_DISCRIMINATOR);
+            data.extend_from_slice(&27_182_818u64.to_le_bytes());
+
+            let volume = damm_v2_volume_from_instruction(&data).expect("volume");
+
+            assert_eq!(volume.side, None);
+            assert_eq!(volume.raw_amount, Some(27_182_818));
+            assert_eq!(volume.source, "damm_v2_swap_bytes");
+            assert_eq!(volume.sol_amount, 0.0);
+        }
+
+        #[test]
+        fn damm_v2_wrong_discriminator_is_ignored() {
+            let mut data = vec![0xbb; 8];
+            data.extend_from_slice(&1_000_000u64.to_le_bytes());
+            assert!(damm_v2_volume_from_instruction(&data).is_none());
+        }
+
+        #[test]
+        fn damm_v2_zero_amount_is_ignored() {
+            let mut data = Vec::from(DAMM_V2_SWAP_DISCRIMINATOR);
+            data.extend_from_slice(&0u64.to_le_bytes());
+            assert!(damm_v2_volume_from_instruction(&data).is_none());
         }
 
         #[test]

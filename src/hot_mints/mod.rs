@@ -53,6 +53,25 @@ impl HotMintTracker {
         }
     }
 
+    /// Seed the tracker with a synthetic boost of `boost` hits per mint,
+    /// applied in one shot to the current bucket. Used at boot by the
+    /// wallet-seeded flow (`wallet_followers::seed_mints_from_wallets`) so
+    /// the very first promoter tick observes the seed mints near the top
+    /// of `top_n` even before any live trigger stream has fired. `boost=0`
+    /// is a no-op. The boost decays naturally via ring rotation like any
+    /// other recorded hit.
+    pub fn seed_boost(&self, mints: impl IntoIterator<Item = Pubkey>, boost: u32) {
+        if boost == 0 {
+            return;
+        }
+        let idx = self.current_index();
+        let bump = boost as u64;
+        for mint in mints {
+            let mut entry = self.buckets[idx].entry(mint).or_insert(0);
+            *entry = entry.saturating_add(bump);
+        }
+    }
+
     /// Advance the ring by one slot and clear the incoming bucket. Must be
     /// called externally on a `bucket_ms` cadence.
     pub fn rotate(&self) {
@@ -184,5 +203,58 @@ mod tests {
         let tracker = HotMintTracker::new(3);
         assert!(tracker.top_n(10).is_empty());
         assert_eq!(tracker.unique_mint_count(), 0);
+    }
+
+    #[test]
+    fn seed_boost_places_mints_at_top_of_ranking() {
+        let tracker = HotMintTracker::new(3);
+        // Prior live activity: pk(9) has 2 organic hits.
+        tracker.record(pk(9));
+        tracker.record(pk(9));
+
+        // Seed boost pk(1)/pk(2) with 5 synthetic hits each.
+        tracker.seed_boost([pk(1), pk(2)], 5);
+
+        let top = tracker.top_n(3);
+        // Seeded mints outrank pk(9) (count 5 > 2).
+        assert_eq!(top[0].1, 5);
+        assert_eq!(top[1].1, 5);
+        assert!(top[0].0 == pk(1) || top[0].0 == pk(2));
+        assert!(top[1].0 == pk(1) || top[1].0 == pk(2));
+        assert_ne!(top[0].0, top[1].0);
+        assert_eq!(top[2].0, pk(9));
+        assert_eq!(top[2].1, 2);
+    }
+
+    #[test]
+    fn seed_boost_zero_is_noop() {
+        let tracker = HotMintTracker::new(2);
+        tracker.seed_boost([pk(1), pk(2)], 0);
+        assert!(tracker.top_n(5).is_empty());
+        assert_eq!(tracker.unique_mint_count(), 0);
+    }
+
+    #[test]
+    fn seed_boost_decays_via_rotation() {
+        let tracker = HotMintTracker::new(2);
+        tracker.seed_boost([pk(1)], 10);
+        assert_eq!(tracker.top_n(1)[0].1, 10);
+        // Bucket 0 → 1 rotate: seed still live (2-bucket window).
+        tracker.rotate();
+        assert_eq!(tracker.top_n(1)[0].1, 10);
+        // Second rotate evicts bucket 0 (the one that held the boost).
+        tracker.rotate();
+        assert!(tracker.top_n(1).is_empty());
+    }
+
+    #[test]
+    fn seed_boost_stacks_with_organic_hits() {
+        let tracker = HotMintTracker::new(2);
+        tracker.seed_boost([pk(1)], 3);
+        tracker.record(pk(1));
+        tracker.record(pk(1));
+        let top = tracker.top_n(1);
+        assert_eq!(top[0].0, pk(1));
+        assert_eq!(top[0].1, 5);
     }
 }

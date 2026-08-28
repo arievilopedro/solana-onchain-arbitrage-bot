@@ -125,6 +125,42 @@ pub struct WalletFollowersConfig {
     pub programs: Vec<String>,
     #[serde(default)]
     pub wallets: Vec<WalletFollowerEntry>,
+    /// Wallet-seeded boot: at start-up, scan `wallets` and pick the top-N
+    /// mints (by trade frequency, tie-break by `last_seen_slot` desc) to
+    /// seed the initial monitored allowlist. `0` disables seeding — boot
+    /// falls back to the plain `runtime.allowed_mints` list. When `> 0` and
+    /// `runtime.allowed_mints` is empty, this is the only source of the
+    /// initial allowlist.
+    #[serde(default)]
+    pub seed_top_n: usize,
+    /// When `true`, seeded mints are permanently pinned into the effective
+    /// allowlist alongside `runtime.allowed_mints` (same boot pipeline: full
+    /// discovery + ATA + ALT + registry populated synchronously). When
+    /// `false`, the seeded mints are instead planted into `HotMintTracker`
+    /// via `seed_boost` and the promoter FSM discovers them lazily on the
+    /// next tick — requires `promoter.enabled` and `hot_mints.enabled`.
+    #[serde(default)]
+    pub pin_seeded_mints: bool,
+    /// Per-wallet `getSignaturesForAddress` lookback used exclusively by
+    /// the seed scan. Bounded by Solana's RPC hard cap of 1000. Kept
+    /// separate from `lookback_signatures` (used by the polling loop) so
+    /// boot can scan deeper than a hot poll.
+    #[serde(default = "default_wallet_seed_max_signatures")]
+    pub seed_max_signatures_per_wallet: usize,
+    /// Hard wall-clock cap for the whole boot scan. When exhausted the
+    /// scan returns whatever it aggregated with `budget_exhausted=true`.
+    #[serde(default = "default_wallet_seed_budget_ms")]
+    pub seed_budget_ms: u64,
+    /// Reserved for future parallelism. Current implementation scans one
+    /// wallet at a time (serial), matching the polling loop's cadence.
+    #[serde(default = "default_wallet_seed_concurrency")]
+    pub seed_concurrency: usize,
+    /// Synthetic `HotMintTracker::seed_boost` hits injected per seeded
+    /// mint when `pin_seeded_mints=false`. Sets the initial ranking so
+    /// the first promoter tick already sees the seed near the top of
+    /// `top_n`. Ignored when `pin_seeded_mints=true`.
+    #[serde(default = "default_wallet_seed_boost_weight")]
+    pub seed_boost_weight: u32,
 }
 
 impl Default for WalletFollowersConfig {
@@ -136,6 +172,12 @@ impl Default for WalletFollowersConfig {
             weight: default_wallet_followers_weight(),
             programs: default_wallet_followers_programs(),
             wallets: Vec::new(),
+            seed_top_n: 0,
+            pin_seeded_mints: false,
+            seed_max_signatures_per_wallet: default_wallet_seed_max_signatures(),
+            seed_budget_ms: default_wallet_seed_budget_ms(),
+            seed_concurrency: default_wallet_seed_concurrency(),
+            seed_boost_weight: default_wallet_seed_boost_weight(),
         }
     }
 }
@@ -158,6 +200,18 @@ fn default_wallet_followers_weight() -> u32 {
 }
 fn default_wallet_followers_programs() -> Vec<String> {
     vec!["pump_amm".to_string(), "dlmm".to_string()]
+}
+fn default_wallet_seed_max_signatures() -> usize {
+    500
+}
+fn default_wallet_seed_budget_ms() -> u64 {
+    30_000
+}
+fn default_wallet_seed_concurrency() -> usize {
+    1
+}
+fn default_wallet_seed_boost_weight() -> u32 {
+    100
 }
 
 /// Promoter (M3b): auto-populate the active allowlist from `HotMintTracker`
@@ -437,7 +491,21 @@ pub struct RouteShardsConfig {
 pub struct SenderConfig {
     pub primary: String,
     pub send_rpc: bool,
+    /// When `true`, transactions are dispatched in parallel to **every** sender
+    /// whose section has `enabled=true`. The `primary` field is ignored in
+    /// that mode. When `false` (default), only the provider matching `primary`
+    /// is used — this preserves the pre-multi-sender single-provider flow.
+    #[serde(default)]
+    pub broadcast: bool,
     pub helius: HeliusSenderConfig,
+    /// Temporal Nozomi (SWQOS) sender. Off by default; enable and populate
+    /// `endpoint` + `tip_accounts` in the operator-owned production config.
+    #[serde(default)]
+    pub nozomi: NozomiSenderConfig,
+    /// Astralane sender. Off by default; enable and populate `endpoint`,
+    /// `api_key`, and `tip_accounts` in the operator-owned production config.
+    #[serde(default)]
+    pub astralan: AstralanSenderConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -468,6 +536,141 @@ pub struct HeliusSenderConfig {
 }
 
 impl HeliusSenderConfig {
+    pub fn tip_lamports_range(&self) -> (u64, u64) {
+        (
+            self.tip_lamports_min.unwrap_or(self.tip_lamports),
+            self.tip_lamports_max.unwrap_or(self.tip_lamports),
+        )
+    }
+}
+
+/// Config for Temporal Nozomi SWQOS sender.
+///
+/// Auth is via `?c=<API_KEY>` query param appended to the endpoint URL — no
+/// separate header. Set `endpoint` to the JSON-RPC path (Nozomi serves it at
+/// `/`), e.g.
+///   `https://nozomi.temporal.xyz/?c=YOUR_KEY`               (auto-routed)
+///   `http://fra2.nozomi.temporal.xyz/?c=YOUR_KEY`           (Frankfurt direct, plain HTTP → lowest latency for VPS)
+///
+/// Nozomi's own docs recommend sending the same tx to multiple regional
+/// endpoints in parallel (rate limits are per-region). To do so, add extra
+/// `[sender.nozomi]` blocks in a future array form, or run multiple bot
+/// instances pinned to different regions. Today only a single endpoint per
+/// section is supported.
+///
+/// Tip accounts default to the full official Nozomi set — operators only
+/// need to plug in the endpoint URL and tip lamports.
+#[derive(Debug, Deserialize, Clone)]
+pub struct NozomiSenderConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, deserialize_with = "serde_string_or_env_default")]
+    pub endpoint: String,
+    #[serde(default = "default_generic_sender_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub tip_lamports: u64,
+    #[serde(default)]
+    pub tip_lamports_min: Option<u64>,
+    #[serde(default)]
+    pub tip_lamports_max: Option<u64>,
+    #[serde(default = "crate::sender::default_nozomi_tip_accounts_csv")]
+    pub tip_accounts: String,
+    #[serde(default)]
+    pub connection_warming_enabled: bool,
+    #[serde(default = "default_generic_sender_warming_interval_ms")]
+    pub connection_warming_interval_ms: u64,
+    /// Optional health-ping URL. Kept opt-in because SWQOS endpoints don't
+    /// always expose a `/ping` route and we don't want to auto-derive one.
+    #[serde(default, deserialize_with = "serde_string_or_env_default")]
+    pub ping_endpoint: String,
+}
+
+impl Default for NozomiSenderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            timeout_ms: default_generic_sender_timeout_ms(),
+            tip_lamports: 0,
+            tip_lamports_min: None,
+            tip_lamports_max: None,
+            tip_accounts: crate::sender::default_nozomi_tip_accounts_csv(),
+            connection_warming_enabled: false,
+            connection_warming_interval_ms: default_generic_sender_warming_interval_ms(),
+            ping_endpoint: String::new(),
+        }
+    }
+}
+
+impl NozomiSenderConfig {
+    pub fn tip_lamports_range(&self) -> (u64, u64) {
+        (
+            self.tip_lamports_min.unwrap_or(self.tip_lamports),
+            self.tip_lamports_max.unwrap_or(self.tip_lamports),
+        )
+    }
+}
+
+/// Config for Astralane low-latency sender.
+///
+/// Auth is via `?api-key=<key>` query param (same convention as Helius). If
+/// the operator embeds `api-key=` directly in `endpoint`, the `api_key` field
+/// is optional; otherwise the plan appends it automatically.
+///
+/// Endpoint pattern (see <https://astralane.gitbook.io/docs/low-latency/endpoints-and-configs>):
+///   Global:    `https://edge.astralane.io/iris?api-key=YOUR_KEY`
+///   Regional:  `http://<region>.gateway.astralane.io/iris?api-key=YOUR_KEY`
+///              regions: fr/fr2, la, jp, ny, ams/ams2, lim, sg, lit
+///
+/// Method: standard `sendTransaction` JSON-RPC with base64-encoded tx (also
+/// supports sendBundle/sendIdeal/sendPaladin — not exposed here). Tip
+/// accounts default to the full documented Astralane set.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AstralanSenderConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, deserialize_with = "serde_string_or_env_default")]
+    pub endpoint: String,
+    #[serde(default, deserialize_with = "serde_string_or_env_default")]
+    pub api_key: String,
+    #[serde(default = "default_generic_sender_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub tip_lamports: u64,
+    #[serde(default)]
+    pub tip_lamports_min: Option<u64>,
+    #[serde(default)]
+    pub tip_lamports_max: Option<u64>,
+    #[serde(default = "crate::sender::default_astralan_tip_accounts_csv")]
+    pub tip_accounts: String,
+    #[serde(default)]
+    pub connection_warming_enabled: bool,
+    #[serde(default = "default_generic_sender_warming_interval_ms")]
+    pub connection_warming_interval_ms: u64,
+    #[serde(default, deserialize_with = "serde_string_or_env_default")]
+    pub ping_endpoint: String,
+}
+
+impl Default for AstralanSenderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            api_key: String::new(),
+            timeout_ms: default_generic_sender_timeout_ms(),
+            tip_lamports: 0,
+            tip_lamports_min: None,
+            tip_lamports_max: None,
+            tip_accounts: crate::sender::default_astralan_tip_accounts_csv(),
+            connection_warming_enabled: false,
+            connection_warming_interval_ms: default_generic_sender_warming_interval_ms(),
+            ping_endpoint: String::new(),
+        }
+    }
+}
+
+impl AstralanSenderConfig {
     pub fn tip_lamports_range(&self) -> (u64, u64) {
         (
             self.tip_lamports_min.unwrap_or(self.tip_lamports),
@@ -626,8 +829,15 @@ impl AppConfig {
             anyhow::bail!("runtime.environment must be `controlled` for V1");
         }
 
-        if self.runtime.allowed_mints.is_empty() {
-            anyhow::bail!("runtime.allowed_mints must not be empty in controlled mode");
+        // V1 + V3: empty `allowed_mints` is only tolerated when the boot is
+        // going to seed from a copy-wallet scan. See docs/WALLET_SEEDING.md.
+        let seeding_enabled = self.runtime.wallet_followers.enabled
+            && self.runtime.wallet_followers.seed_top_n > 0;
+        if self.runtime.allowed_mints.is_empty() && !seeding_enabled {
+            anyhow::bail!(
+                "runtime.allowed_mints must not be empty in controlled mode unless \
+                 runtime.wallet_followers is enabled with seed_top_n > 0 (copy-wallet seed extraction)"
+            );
         }
 
         for mint in &self.runtime.allowed_mints {
@@ -741,13 +951,90 @@ impl AppConfig {
             }
             for program in &self.runtime.wallet_followers.programs {
                 match program.as_str() {
-                    "pump_amm" | "pump" | "dlmm" => {}
+                    "pump_amm" | "pump" | "dlmm" | "cpmm" | "raydium_cpmm" | "damm_v2"
+                    | "meteora_damm_v2" => {}
                     other => anyhow::bail!(
-                        "runtime.wallet_followers.programs contains unknown alias `{}` (expected `pump_amm`, `pump`, or `dlmm`)",
+                        "runtime.wallet_followers.programs contains unknown alias `{}` (expected `pump_amm`, `pump`, `dlmm`, `cpmm`/`raydium_cpmm`, or `damm_v2`/`meteora_damm_v2`)",
                         other
                     ),
                 }
             }
+
+            // V2 + seed sanity: when seed_top_n > 0 we need enough runtime
+            // knobs to actually run the scan and route the extracted mints
+            // through the promoter/tracker pipeline (or the pinned boot
+            // pipeline if `pin_seeded_mints=true`).
+            if self.runtime.wallet_followers.seed_top_n > 0 {
+                // V2: seed extraction needs at least one source wallet. The
+                // outer `wallets.is_empty()` bail already covers the
+                // wallet_followers-enabled case; re-assert here for clarity.
+                if self.runtime.wallet_followers.wallets.is_empty() {
+                    anyhow::bail!(
+                        "runtime.wallet_followers.seed_top_n>0 requires at least one entry in wallets"
+                    );
+                }
+                if self.runtime.wallet_followers.seed_max_signatures_per_wallet == 0 {
+                    anyhow::bail!(
+                        "runtime.wallet_followers.seed_max_signatures_per_wallet must be >= 1 when seed_top_n > 0"
+                    );
+                }
+                if self.runtime.wallet_followers.seed_max_signatures_per_wallet > 1000 {
+                    anyhow::bail!(
+                        "runtime.wallet_followers.seed_max_signatures_per_wallet must be <= 1000 (Solana RPC hard cap)"
+                    );
+                }
+                if self.runtime.wallet_followers.seed_budget_ms == 0 {
+                    anyhow::bail!(
+                        "runtime.wallet_followers.seed_budget_ms must be > 0 when seed_top_n > 0"
+                    );
+                }
+                if self.runtime.wallet_followers.seed_concurrency == 0 {
+                    anyhow::bail!(
+                        "runtime.wallet_followers.seed_concurrency must be >= 1 when seed_top_n > 0"
+                    );
+                }
+
+                // V4: non-pin path relies on the promoter FSM to discover
+                // seed mints lazily, which in turn requires the hot-mint
+                // tracker. Pin path skips both (goes through the boot
+                // pipeline directly).
+                if !self.runtime.wallet_followers.pin_seeded_mints {
+                    if self.runtime.wallet_followers.seed_boost_weight == 0 {
+                        anyhow::bail!(
+                            "runtime.wallet_followers.seed_boost_weight must be >= 1 when seed_top_n > 0 and pin_seeded_mints=false"
+                        );
+                    }
+                    if !self.runtime.promoter.enabled {
+                        anyhow::bail!(
+                            "runtime.wallet_followers.seed_top_n>0 with pin_seeded_mints=false requires runtime.promoter.enabled=true"
+                        );
+                    }
+                    // hot_mints check is transitively covered by the
+                    // promoter.enabled → hot_mints.enabled bail above, but
+                    // asserting it here gives a clearer error surface.
+                    if !self.runtime.hot_mints.enabled {
+                        anyhow::bail!(
+                            "runtime.wallet_followers.seed_top_n>0 with pin_seeded_mints=false requires runtime.hot_mints.enabled=true"
+                        );
+                    }
+                }
+                // V5: pin_seeded_mints=true adds no extra coupling — the
+                // seeded mints join `allowed_mints` before the boot
+                // pipeline runs, so the existing base validation applies.
+            }
+        }
+
+        // V1 companion: `seed_top_n > 0` is only meaningful when the
+        // wallet_followers loop is on (either as a live poller or a
+        // one-shot boot scanner). The extractor itself does not require
+        // the polling loop, but we mandate `enabled=true` so operators
+        // opt in explicitly.
+        if !self.runtime.wallet_followers.enabled
+            && self.runtime.wallet_followers.seed_top_n > 0
+        {
+            anyhow::bail!(
+                "runtime.wallet_followers.seed_top_n>0 requires runtime.wallet_followers.enabled=true"
+            );
         }
 
         if self.routes.max_dlmm_per_tx == 0 {
@@ -779,15 +1066,14 @@ impl AppConfig {
         validate_stream_endpoint("rabbitstream", &self.rabbitstream, true)?;
 
         match self.sender.primary.as_str() {
-            "rpc" | "helius" => {}
-            other => anyhow::bail!("sender.primary must be `rpc` or `helius`, got `{}`", other),
+            "rpc" | "helius" | "nozomi" | "astralan" => {}
+            other => anyhow::bail!(
+                "sender.primary must be `rpc`, `helius`, `nozomi`, or `astralan`, got `{}`",
+                other
+            ),
         }
 
-        if self.sender.primary == "helius" {
-            if !self.sender.helius.enabled {
-                anyhow::bail!("sender.helius.enabled must be true when sender.primary=helius");
-            }
-
+        if self.sender.helius.enabled {
             if self.sender.helius.endpoint.trim().is_empty() {
                 anyhow::bail!("sender.helius.endpoint is required when Helius is enabled");
             }
@@ -820,6 +1106,88 @@ impl AppConfig {
                 anyhow::bail!(
                     "sender.helius.connection_warming_interval_ms must be greater than zero when connection warming is enabled"
                 );
+            }
+        }
+
+        if self.sender.nozomi.enabled {
+            if self.sender.nozomi.endpoint.trim().is_empty() {
+                anyhow::bail!("sender.nozomi.endpoint is required when Nozomi is enabled");
+            }
+            let (tip_min, tip_max) = self.sender.nozomi.tip_lamports_range();
+            if tip_min == 0 || tip_max == 0 {
+                anyhow::bail!("sender.nozomi tip lamports must be greater than zero");
+            }
+            if tip_min > tip_max {
+                anyhow::bail!(
+                    "sender.nozomi.tip_lamports_min must be <= sender.nozomi.tip_lamports_max"
+                );
+            }
+            validate_pubkey_csv(
+                "sender.nozomi.tip_accounts",
+                &self.sender.nozomi.tip_accounts,
+            )?;
+            if self.sender.nozomi.connection_warming_enabled
+                && self.sender.nozomi.connection_warming_interval_ms == 0
+            {
+                anyhow::bail!(
+                    "sender.nozomi.connection_warming_interval_ms must be greater than zero when connection warming is enabled"
+                );
+            }
+        }
+
+        if self.sender.astralan.enabled {
+            if self.sender.astralan.endpoint.trim().is_empty() {
+                anyhow::bail!("sender.astralan.endpoint is required when Astralan is enabled");
+            }
+            let (tip_min, tip_max) = self.sender.astralan.tip_lamports_range();
+            if tip_min == 0 || tip_max == 0 {
+                anyhow::bail!("sender.astralan tip lamports must be greater than zero");
+            }
+            if tip_min > tip_max {
+                anyhow::bail!(
+                    "sender.astralan.tip_lamports_min must be <= sender.astralan.tip_lamports_max"
+                );
+            }
+            validate_pubkey_csv(
+                "sender.astralan.tip_accounts",
+                &self.sender.astralan.tip_accounts,
+            )?;
+            if self.sender.astralan.connection_warming_enabled
+                && self.sender.astralan.connection_warming_interval_ms == 0
+            {
+                anyhow::bail!(
+                    "sender.astralan.connection_warming_interval_ms must be greater than zero when connection warming is enabled"
+                );
+            }
+        }
+
+        // Consistency: enforce that we can actually send when live sends are on.
+        if self.execution.send_live_transactions {
+            let helius_active = self.sender.helius.enabled;
+            let nozomi_active = self.sender.nozomi.enabled;
+            let astralan_active = self.sender.astralan.enabled;
+            let any_active = helius_active || nozomi_active || astralan_active;
+
+            if self.sender.broadcast {
+                if !any_active {
+                    anyhow::bail!(
+                        "execution.send_live_transactions=true and sender.broadcast=true but no sender is enabled — enable at least one of sender.{{helius,nozomi,astralan}}"
+                    );
+                }
+            } else {
+                match self.sender.primary.as_str() {
+                    "helius" if !helius_active => anyhow::bail!(
+                        "sender.helius.enabled must be true when sender.primary=helius and send_live_transactions=true"
+                    ),
+                    "nozomi" if !nozomi_active => anyhow::bail!(
+                        "sender.nozomi.enabled must be true when sender.primary=nozomi and send_live_transactions=true"
+                    ),
+                    "astralan" if !astralan_active => anyhow::bail!(
+                        "sender.astralan.enabled must be true when sender.primary=astralan and send_live_transactions=true"
+                    ),
+                    // `rpc` is a dry-run mode; no live sender is required.
+                    _ => {}
+                }
             }
         }
 
@@ -895,6 +1263,14 @@ fn default_helius_connection_warming_interval_ms() -> u64 {
     5_000
 }
 
+fn default_generic_sender_timeout_ms() -> u64 {
+    700
+}
+
+fn default_generic_sender_warming_interval_ms() -> u64 {
+    5_000
+}
+
 fn ensure_parent_dir(field: &str, path: &str) -> anyhow::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
@@ -925,5 +1301,50 @@ mod tests {
         let result = resolve_optional_env_string("${MISSING_OPTIONAL_CONFIG_TEST}").unwrap();
 
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn nozomi_default_is_disabled_with_official_tip_accounts() {
+        let cfg = NozomiSenderConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.endpoint.is_empty());
+        // Defaults preload the full official set so operators only need to
+        // flip `enabled=true` and paste an endpoint + tip lamports.
+        assert_eq!(
+            cfg.tip_accounts,
+            crate::sender::default_nozomi_tip_accounts_csv()
+        );
+        let (min, max) = cfg.tip_lamports_range();
+        // Zero lamports on defaults — validation forces the operator to set
+        // real values when enabling the sender.
+        assert_eq!(min, 0);
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn astralan_default_is_disabled_with_official_tip_accounts() {
+        let cfg = AstralanSenderConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.endpoint.is_empty());
+        assert!(cfg.api_key.is_empty());
+        assert_eq!(
+            cfg.tip_accounts,
+            crate::sender::default_astralan_tip_accounts_csv()
+        );
+    }
+
+    #[test]
+    fn tip_lamports_range_falls_back_to_base_when_bounds_absent() {
+        let mut nozomi = NozomiSenderConfig::default();
+        nozomi.tip_lamports = 1_500_000;
+        assert_eq!(nozomi.tip_lamports_range(), (1_500_000, 1_500_000));
+
+        nozomi.tip_lamports_min = Some(1_000_000);
+        nozomi.tip_lamports_max = Some(3_000_000);
+        assert_eq!(nozomi.tip_lamports_range(), (1_000_000, 3_000_000));
+
+        let mut astralan = AstralanSenderConfig::default();
+        astralan.tip_lamports = 500_000;
+        assert_eq!(astralan.tip_lamports_range(), (500_000, 500_000));
     }
 }

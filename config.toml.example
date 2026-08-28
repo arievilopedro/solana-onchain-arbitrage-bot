@@ -18,6 +18,11 @@ x_token = "${RABBITSTREAM_X_TOKEN}"
 
 [runtime]
 environment = "controlled"
+# Static allowlist. May be left as `allowed_mints = []` ONLY when
+# `[runtime.wallet_followers]` below is enabled with `seed_top_n > 0`; the
+# boot will then derive its initial mint set from the recent trade history
+# of the configured copy wallets. See docs/WALLET_SEEDING.md for the full
+# runbook (pin vs non-pin, debug logs, expected boot latencies).
 allowed_mints = [
   "11111111111111111111111111111111",
 ]
@@ -67,7 +72,30 @@ enabled = false
 poll_interval_ms = 60000          # per-cycle sleep between full wallet passes
 lookback_signatures = 100         # max signatures fetched per wallet per poll
 weight = 20                       # synthetic hits per matched tx
-programs = ["pump_amm", "dlmm"]   # empty = accept every tx
+programs = ["pump_amm", "dlmm"]   # aliases: pump_amm/pump, dlmm, cpmm/raydium_cpmm, damm_v2/meteora_damm_v2. Empty = accept every tx.
+
+# --- Wallet-seeded boot (allowlist bootstrapping) ------------------------
+# When `seed_top_n > 0`, the boot runs a one-shot RPC scan across every
+# wallet in `[[runtime.wallet_followers.wallets]]` and picks the top-N
+# most-frequently-traded mints (tie-break: most recent slot). 0 disables.
+seed_top_n = 0
+# true  → seeded mints join `allowed_mints` and go through the full boot
+#         pipeline synchronously (discovery + ATA + ALT + registry + geyser
+#         subscription). Best when the seed set is stable and small.
+# false → seeded mints are planted into `HotMintTracker` via seed_boost;
+#         the promoter FSM discovers them lazily on the next tick. Requires
+#         `runtime.promoter.enabled=true` and `runtime.hot_mints.enabled=true`.
+pin_seeded_mints = false
+# Per-wallet RPC lookback for the seed scan (max 1000 per Solana's cap).
+seed_max_signatures_per_wallet = 500
+# Hard wall-clock cap for the whole seed scan. When exhausted the scan
+# returns whatever it aggregated with a `budget_exhausted=true` log line.
+seed_budget_ms = 30000
+# Reserved for future parallelism (currently serial: 1 wallet at a time).
+seed_concurrency = 1
+# Synthetic HotMintTracker hits injected per seeded mint on the non-pin
+# path. Ignored when `pin_seeded_mints=true`.
+seed_boost_weight = 100
 
 # Repeat this block for each wallet (1-3 recommended).
 # [[runtime.wallet_followers.wallets]]
@@ -138,8 +166,17 @@ plan_file = "state/route_shards.plan.json"
 max_addresses = 256
 
 [sender]
+# `primary` picks the single provider when `broadcast=false`. Accepted values:
+# "rpc" (dry-run/no live send), "helius", "nozomi", "astralan".
 primary = "helius"
 send_rpc = false
+# When true, the bot dispatches every trigger transaction in PARALLEL to every
+# provider whose block has `enabled=true`. Each provider gets its own tokio
+# task and its own outcome logged (per-provider signature / latency). This is
+# the "dois em simultaneo" toggle — set it to true and enable e.g. Helius +
+# Nozomi to fan-out to both. When false (default) only the `primary` provider
+# is used, preserving the pre-multi-sender single-provider flow.
+broadcast = false
 
 [sender.helius]
 enabled = true
@@ -157,6 +194,51 @@ tip_lamports = 1000000
 tip_lamports_min = 1000000
 tip_lamports_max = 2000000
 tip_accounts = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE,D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ,9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta,5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn,2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD,2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ,wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF,3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT,4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey,4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or"
+
+[sender.nozomi]
+# Temporal Nozomi SWQOS sender. Auth is via `?c=<API_KEY>` query param
+# embedded directly in the endpoint URL (no separate header). Nozomi serves
+# its JSON-RPC at `/`, e.g.:
+#   endpoint = "https://nozomi.temporal.xyz/?c=${NOZOMI_API_KEY}"        (auto-routed)
+#   endpoint = "http://fra2.nozomi.temporal.xyz/?c=${NOZOMI_API_KEY}"     (Frankfurt direct — plain HTTP recommended for lowest VPS latency)
+# Nozomi rate-limits per region; to send to multiple regions in parallel run
+# multiple bot instances or add regional endpoint variants (single-endpoint
+# per-section for now).
+enabled = false
+endpoint = "${NOZOMI_SENDER_URL}"
+timeout_ms = 700
+# tip_lamports_min/max randomize per tx if set. Nozomi requires a SOL tip
+# transferred to one of the tip_accounts below.
+tip_lamports = 1000000
+tip_lamports_min = 1000000
+tip_lamports_max = 2000000
+# Default = full official Nozomi tip account set (17 addresses). Override
+# only if you want to pin to a subset.
+# tip_accounts = "TEMPaMeCRFAS9EKF53Jd6KpHxgL47uWLcpFArU1Fanq,..."
+connection_warming_enabled = false
+connection_warming_interval_ms = 5000
+# Optional health-ping URL (opt-in — Nozomi doesn't expose a standard /ping).
+# ping_endpoint = ""
+
+[sender.astralan]
+# Astralane low-latency sender. Auth via `?api-key=<key>` query param — same
+# convention as Helius. If the operator embeds api-key= directly in
+# `endpoint`, `api_key` can be left blank.
+# Endpoint patterns (see https://astralane.gitbook.io/docs/low-latency/endpoints-and-configs):
+#   Global:    endpoint = "https://edge.astralane.io/iris"
+#   Regional:  endpoint = "http://fr.gateway.astralane.io/iris"           # regions: fr/fr2, la, jp, ny, ams/ams2, lim, sg, lit
+enabled = false
+endpoint = "${ASTRALAN_SENDER_URL}"
+api_key = "${ASTRALAN_SENDER_API_KEY}"
+timeout_ms = 700
+tip_lamports = 1000000
+tip_lamports_min = 1000000
+tip_lamports_max = 2000000
+# Default = full documented Astralane tip account set (17 addresses).
+# tip_accounts = "astrazznxsGuJEjNn98UUqQhcXFupPWobbGGpUXjw82,..."
+connection_warming_enabled = false
+connection_warming_interval_ms = 5000
+# ping_endpoint = ""
 
 [compute]
 default_limit = 600000

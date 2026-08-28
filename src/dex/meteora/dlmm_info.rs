@@ -156,7 +156,7 @@ impl DlmmInfo {
         let bin_array_index = self.bin_id_to_bin_array_index(self.active_id)?;
 
         let mut bin_arrays = Vec::new();
-        let offsets = [-1, 0, 1];
+        let offsets = [-2, -1, 0, 1, 2];
 
         for offset in offsets {
             let array_idx = bin_array_index + offset;

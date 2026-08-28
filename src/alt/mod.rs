@@ -36,6 +36,35 @@ pub enum RouteShardStatus {
     Deactivated,
 }
 
+/// Header globals reserved once per shard on creation. These are constants
+/// used by many pools of the same program family (Raydium CPMM authority,
+/// Meteora DAMM v2 authorities) or program IDs / sysvars referenced by every
+/// transaction. Storing them in the ALT header lets every pool that needs
+/// them reference the ALT index (1 byte) instead of the full pubkey (32
+/// bytes) in the transaction, shrinking the wire size.
+///
+/// Optional per shard: `None` on shards created before Fase 0 (backward
+/// compat). Those shards continue to work but their CPMM / DAMM v2 pools
+/// pay the wire cost of inline addresses.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShardGlobalsRecord {
+    pub pump_amm_program_id_index: u8,
+    pub dlmm_program_id_index: u8,
+    pub raydium_cp_program_id_index: u8,
+    pub damm_v2_program_id_index: u8,
+    pub raydium_cp_authority_index: u8,
+    pub damm_v2_event_authority_index: u8,
+    pub damm_v2_pool_authority_index: u8,
+    pub sysvar_instructions_index: u8,
+}
+
+impl ShardGlobalsRecord {
+    /// Number of slots the header consumes at the start of every shard that
+    /// was created with globals reserved. Used by the planner when computing
+    /// remaining capacity for per-mint data.
+    pub const HEADER_SLOTS: usize = 8;
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RouteShardRecord {
     pub used: usize,
@@ -43,6 +72,11 @@ pub struct RouteShardRecord {
     pub created_slot: u64,
     pub last_extended_slot: u64,
     pub status: RouteShardStatus,
+    /// Header globals reserved on shard creation. `None` for shards created
+    /// before Fase 0; those keep working but do not benefit from ALT-backed
+    /// dedup of program IDs / global PDAs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub globals: Option<ShardGlobalsRecord>,
 }
 
 impl RouteShardRecord {
@@ -57,6 +91,30 @@ pub struct DlmmAltBlockRecord {
     pub indexes: Vec<u8>,
 }
 
+/// Per-mint block record for a Raydium CPMM pool. Stores four per-pool
+/// indexes (pool, token_vault, base_vault, observation) plus the ALT index
+/// of the `amm_config` account referenced by this pool. `amm_config` is
+/// deduplicated shard-wide: multiple pools sharing the same config record
+/// the same index without occupying additional ALT slots.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CpmmAltBlockRecord {
+    pub pool: String,
+    pub amm_config: String,
+    /// [pool, token_vault, base_vault, observation]
+    pub indexes: Vec<u8>,
+    pub amm_config_index: u8,
+}
+
+/// Per-mint block record for a Meteora DAMM v2 pool. Stores three per-pool
+/// indexes (pool, token_vault, base_vault). Global authorities and program
+/// ID live in the shard header (see `ShardGlobalsRecord`).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DammV2AltBlockRecord {
+    pub pool: String,
+    /// [pool, token_vault, base_vault]
+    pub indexes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MintRouteBlockRecord {
     pub shard: String,
@@ -67,6 +125,15 @@ pub struct MintRouteBlockRecord {
     /// files; populated by Fix B when the planner extends into new shards.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extensions: Vec<MintRouteExtension>,
+    /// Raydium CPMM pools registered in this mint's primary shard. Empty
+    /// when the mint has no CPMM routes or when the shard was created
+    /// before Fase 0 (schema is purely additive; serde defaults to []).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpmm: Vec<CpmmAltBlockRecord>,
+    /// Meteora DAMM v2 pools registered in this mint's primary shard. Same
+    /// backward-compat semantics as `cpmm`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub damm_v2: Vec<DammV2AltBlockRecord>,
 }
 
 impl MintRouteBlockRecord {
@@ -87,14 +154,40 @@ impl MintRouteBlockRecord {
                 ext.dlmm.iter().any(|record| record.lb_pair == target)
             })
     }
+
+    /// True if any known Raydium CPMM pool (primary or extension) matches.
+    pub fn contains_cpmm(&self, pool: &Pubkey) -> bool {
+        let target = pool.to_string();
+        self.cpmm.iter().any(|record| record.pool == target)
+            || self
+                .extensions
+                .iter()
+                .any(|ext| ext.cpmm.iter().any(|record| record.pool == target))
+    }
+
+    /// True if any known Meteora DAMM v2 pool (primary or extension) matches.
+    pub fn contains_damm_v2(&self, pool: &Pubkey) -> bool {
+        let target = pool.to_string();
+        self.damm_v2.iter().any(|record| record.pool == target)
+            || self
+                .extensions
+                .iter()
+                .any(|ext| ext.damm_v2.iter().any(|record| record.pool == target))
+    }
 }
 
-/// A secondary shard record for a mint whose primary shard filled up. Only
-/// stores DLMM triples (no base); the base always lives in the primary shard.
+/// A secondary shard record for a mint whose primary shard filled up. Stores
+/// pool-specific address blocks; the base always lives in the primary shard.
+/// v1 extensions only carried DLMM triples; Fase 0 adds optional CPMM and
+/// DAMM v2 blocks via serde defaults.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MintRouteExtension {
     pub shard: String,
     pub dlmm: Vec<DlmmAltBlockRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpmm: Vec<CpmmAltBlockRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub damm_v2: Vec<DammV2AltBlockRecord>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -173,6 +266,27 @@ impl RouteShardStore {
                     anyhow::bail!("mint {} dlmm {} must have 3 indexes", mint, dlmm.lb_pair);
                 }
             }
+            for cpmm in &block.cpmm {
+                parse_pubkey(&cpmm.pool)?;
+                parse_pubkey(&cpmm.amm_config)?;
+                if cpmm.indexes.len() != 4 {
+                    anyhow::bail!(
+                        "mint {} cpmm {} must have 4 indexes (pool, token_vault, base_vault, observation)",
+                        mint,
+                        cpmm.pool
+                    );
+                }
+            }
+            for damm_v2 in &block.damm_v2 {
+                parse_pubkey(&damm_v2.pool)?;
+                if damm_v2.indexes.len() != 3 {
+                    anyhow::bail!(
+                        "mint {} damm_v2 {} must have 3 indexes (pool, token_vault, base_vault)",
+                        mint,
+                        damm_v2.pool
+                    );
+                }
+            }
             let mut seen_extension_shards: HashSet<&str> = HashSet::new();
             seen_extension_shards.insert(block.shard.as_str());
             for extension in &block.extensions {
@@ -198,9 +312,12 @@ impl RouteShardStore {
                         extension.shard
                     );
                 }
-                if extension.dlmm.is_empty() {
+                let extension_has_any_pool = !extension.dlmm.is_empty()
+                    || !extension.cpmm.is_empty()
+                    || !extension.damm_v2.is_empty();
+                if !extension_has_any_pool {
                     anyhow::bail!(
-                        "mint {} extension shard {} must contain at least one DLMM",
+                        "mint {} extension shard {} must contain at least one pool (dlmm, cpmm, or damm_v2)",
                         mint,
                         extension.shard
                     );
@@ -212,6 +329,27 @@ impl RouteShardStore {
                             "mint {} extension dlmm {} must have 3 indexes",
                             mint,
                             dlmm.lb_pair
+                        );
+                    }
+                }
+                for cpmm in &extension.cpmm {
+                    parse_pubkey(&cpmm.pool)?;
+                    parse_pubkey(&cpmm.amm_config)?;
+                    if cpmm.indexes.len() != 4 {
+                        anyhow::bail!(
+                            "mint {} extension cpmm {} must have 4 indexes",
+                            mint,
+                            cpmm.pool
+                        );
+                    }
+                }
+                for damm_v2 in &extension.damm_v2 {
+                    parse_pubkey(&damm_v2.pool)?;
+                    if damm_v2.indexes.len() != 3 {
+                        anyhow::bail!(
+                            "mint {} extension damm_v2 {} must have 3 indexes",
+                            mint,
+                            damm_v2.pool
                         );
                     }
                 }
@@ -794,8 +932,13 @@ fn split_route_shard_operation(
     let mut split = Vec::new();
     if parsed_addresses.first() == Some(&mint_pubkey) {
         validate_mint_block_addresses(mint_pubkey, &parsed_addresses)?;
-        let first_dlmm_capacity = (ROUTE_SHARD_EXTEND_ADDRESSES_PER_TX - 4) / 3;
-        let first_end = 4 + first_dlmm_capacity * 3;
+        // Base length is 4 (mint + pump triple) when pump is present, or 1
+        // (mint only) when the composition has no pump. Detect via tail size:
+        // with-pump layouts satisfy (tail - 3) % 3 == 0 with tail >= 3.
+        let tail = parsed_addresses.len() - 1;
+        let base_len = if tail >= 3 && (tail - 3) % 3 == 0 { 4 } else { 1 };
+        let first_dlmm_capacity = (ROUTE_SHARD_EXTEND_ADDRESSES_PER_TX - base_len) / 3;
+        let first_end = base_len + first_dlmm_capacity * 3;
         split.push(PendingRouteShardOperation {
             version: operation.version,
             operation: PendingRouteShardOperationKind::ExtendShard {
@@ -899,13 +1042,27 @@ fn ensure_route_shard_transaction_simulates(
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StableMintRouteAccounts {
     pub mint: Pubkey,
-    pub pump_pool: Pubkey,
-    pub pump_token_vault: Pubkey,
-    pub pump_base_vault: Pubkey,
+    /// Pump AMM pool for this mint. Optional because the Discovery gate now
+    /// accepts any composition with at least two pool types (Pump not
+    /// required — Raydium CPMM + Meteora DLMM is a valid arb composition, for
+    /// example). When `None`, the base layout of [`stable_addresses`] is just
+    /// `[mint]` (1 slot instead of 4).
+    pub pump: Option<StablePumpRouteAccounts>,
     pub dlmms: Vec<StableDlmmRouteAccounts>,
+    /// Extra CPMM pools bound to this mint. Not yet persisted in the ALT
+    /// shard store (planner integration is a follow-up step); populated so
+    /// downstream Discovery/gate code can already reason about full mint
+    /// composition.
+    pub cpmms: Vec<StableCpmmRouteAccounts>,
+    /// Extra DAMM v2 pools bound to this mint. See `cpmms` doc.
+    pub damm_v2s: Vec<StableDammV2RouteAccounts>,
 }
 
 impl StableMintRouteAccounts {
+    /// Discovery gate: accept any composition with at least two pool types
+    /// (Pump AMM, DLMM, Raydium CPMM, or DAMM v2). Rationale: with only one
+    /// pool type there is no cross-venue arb, so promoting the mint to an
+    /// ALT is wasted rent.
     pub fn from_mint_runtime_state(
         state: &MintRuntimeState,
         min_base_liquidity_lamports: u64,
@@ -915,7 +1072,12 @@ impl StableMintRouteAccounts {
         let pump = state
             .eligible_pumps(min_base_liquidity_lamports, max_state_age_ms, now_ms)
             .into_iter()
-            .next()?;
+            .next()
+            .map(|p| StablePumpRouteAccounts {
+                pool: p.pool,
+                token_vault: p.token_vault,
+                base_vault: p.base_vault,
+            });
         let dlmms = state
             .eligible_dlmms(min_base_liquidity_lamports, max_state_age_ms, now_ms)
             .into_iter()
@@ -925,31 +1087,101 @@ impl StableMintRouteAccounts {
                 base_vault: dlmm.base_vault,
             })
             .collect::<Vec<_>>();
+        let cpmms = state
+            .eligible_raydium_cps(min_base_liquidity_lamports, max_state_age_ms, now_ms)
+            .into_iter()
+            .map(|cp| StableCpmmRouteAccounts {
+                pool: cp.pool,
+                amm_config: cp.amm_config,
+                token_vault: cp.token_vault,
+                base_vault: cp.base_vault,
+                observation: cp.observation,
+            })
+            .collect::<Vec<_>>();
+        let damm_v2s = state
+            .eligible_damm_v2s(min_base_liquidity_lamports, max_state_age_ms, now_ms)
+            .into_iter()
+            .map(|dv| StableDammV2RouteAccounts {
+                pool: dv.pool,
+                token_vault: dv.token_vault,
+                base_vault: dv.base_vault,
+            })
+            .collect::<Vec<_>>();
 
-        if dlmms.is_empty() {
+        let pool_types_present = (pump.is_some() as usize)
+            + (!dlmms.is_empty() as usize)
+            + (!cpmms.is_empty() as usize)
+            + (!damm_v2s.is_empty() as usize);
+        if pool_types_present < 2 {
             return None;
         }
 
         Some(Self {
             mint: state.mint,
-            pump_pool: pump.pool,
-            pump_token_vault: pump.token_vault,
-            pump_base_vault: pump.base_vault,
+            pump,
             dlmms,
+            cpmms,
+            damm_v2s,
         })
     }
 
+    /// ALT base + DLMM addresses. Layout (variable length):
+    ///   `[mint, (pump.pool, pump.token_vault, pump.base_vault)?,
+    ///     dlmm[0].lb_pair, dlmm[0].token_vault, dlmm[0].base_vault, …]`.
+    ///
+    /// CPMM and DAMM v2 addresses are NOT included yet — that requires the
+    /// planner to grow variable-length trailing blocks and dedup shared
+    /// `amm_config` across pools. Until that lands, CPMM/DAMM v2 pools go
+    /// inline in the tx (larger wire size, but functional).
     pub fn stable_addresses(&self) -> Vec<Pubkey> {
-        let mut out = vec![
-            self.mint,
-            self.pump_pool,
-            self.pump_token_vault,
-            self.pump_base_vault,
-        ];
+        let mut out = vec![self.mint];
+        if let Some(pump) = &self.pump {
+            out.extend(pump.stable_addresses());
+        }
         for dlmm in &self.dlmms {
             out.extend(dlmm.stable_addresses());
         }
         out
+    }
+
+    /// Base slot count reserved for `[mint, (pump 3)?]` — 1 if `pump=None`,
+    /// 4 if `pump=Some`. Used by the planner to compute where the first DLMM
+    /// triple starts.
+    pub fn base_slot_count(&self) -> usize {
+        if self.pump.is_some() {
+            4
+        } else {
+            1
+        }
+    }
+
+    /// Full ALT footprint including CPMM and DAMM v2 pools. Separate from
+    /// [`stable_addresses`] because the planner does not yet pack CPMM/DAMM v2
+    /// into the shard.
+    pub fn stable_addresses_all(&self) -> Vec<Pubkey> {
+        let mut out = self.stable_addresses();
+        for cpmm in &self.cpmms {
+            out.extend(cpmm.stable_addresses());
+        }
+        for damm in &self.damm_v2s {
+            out.extend(damm.stable_addresses());
+        }
+        out
+    }
+}
+
+/// Pump AMM per-pool ALT addresses. Kept alongside [`StableMintRouteAccounts`]
+/// so future refactors can lift `pump` into an `Option<StablePumpRouteAccounts>`.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StablePumpRouteAccounts {
+    pub pool: Pubkey,
+    pub token_vault: Pubkey,
+    pub base_vault: Pubkey,
+}
+
+impl StablePumpRouteAccounts {
+    pub fn stable_addresses(&self) -> [Pubkey; 3] {
+        [self.pool, self.token_vault, self.base_vault]
     }
 }
 
@@ -963,6 +1195,59 @@ pub struct StableDlmmRouteAccounts {
 impl StableDlmmRouteAccounts {
     pub fn stable_addresses(&self) -> [Pubkey; 3] {
         [self.lb_pair, self.token_vault, self.base_vault]
+    }
+}
+
+/// Raydium CPMM per-pool ALT addresses.
+///
+/// `amm_config` is stored here because it must live in the ALT alongside the
+/// per-pool accounts even though it is deduplicated across pools that share it
+/// (the planner will collapse duplicates into a single index — see Fase 0.d).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StableCpmmRouteAccounts {
+    pub pool: Pubkey,
+    pub amm_config: Pubkey,
+    pub token_vault: Pubkey,
+    pub base_vault: Pubkey,
+    pub observation: Pubkey,
+}
+
+impl StableCpmmRouteAccounts {
+    /// Order matches [`CpmmAltBlockRecord::indexes`] layout:
+    /// `[pool, token_vault, base_vault, observation]`. `amm_config` is
+    /// intentionally not in this array — it lives in a separate slot
+    /// (`amm_config_index`) so duplicates across pools dedupe.
+    pub fn per_pool_addresses(&self) -> [Pubkey; 4] {
+        [self.pool, self.token_vault, self.base_vault, self.observation]
+    }
+
+    /// Full address footprint (per-pool + `amm_config`) — used only by the
+    /// naive `stable_addresses_all` traversal; planner uses `per_pool_addresses`
+    /// plus a dedicated dedup path for `amm_config`.
+    pub fn stable_addresses(&self) -> [Pubkey; 5] {
+        [
+            self.pool,
+            self.token_vault,
+            self.base_vault,
+            self.observation,
+            self.amm_config,
+        ]
+    }
+}
+
+/// Meteora DAMM v2 per-pool ALT addresses. Global constants
+/// (`event_authority`, `pool_authority`) live in the shard header, not per
+/// pool.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StableDammV2RouteAccounts {
+    pub pool: Pubkey,
+    pub token_vault: Pubkey,
+    pub base_vault: Pubkey,
+}
+
+impl StableDammV2RouteAccounts {
+    pub fn stable_addresses(&self) -> [Pubkey; 3] {
+        [self.pool, self.token_vault, self.base_vault]
     }
 }
 
@@ -1037,10 +1322,11 @@ impl RouteShardPlanner {
             anyhow::bail!("route shard capacity must be between 1 and 256");
         }
 
+        // Empty allowed_mints is legitimate: seed-from-wallets mode (see
+        // `docs/WALLET_SEEDING.md`) boots with no allowed mints and lets the
+        // promoter admit them incrementally. `plan_mint_block` and
+        // `ensure_allowed` remain no-ops for an empty set (nothing to plan).
         let allowed_mints = allowed_mints.into_iter().collect::<HashSet<_>>();
-        if allowed_mints.is_empty() {
-            anyhow::bail!("allowed_mints must not be empty");
-        }
 
         Ok(Self {
             store,
@@ -1296,6 +1582,7 @@ impl RouteShardPlanner {
                 created_slot: slot,
                 last_extended_slot: 0,
                 status: RouteShardStatus::Active,
+                globals: None,
             });
 
         let start = shard_record.used;
@@ -1311,8 +1598,9 @@ impl RouteShardPlanner {
         }
         self.store.active_shard = Some(shard_key.clone());
 
-        let base_indexes = index_range(start, 4)?;
-        let mut cursor = start + 4;
+        let base_len = route.base_slot_count();
+        let base_indexes = index_range(start, base_len)?;
+        let mut cursor = start + base_len;
         let mut dlmm_records = Vec::with_capacity(route.dlmms.len());
         for dlmm in &route.dlmms {
             dlmm_records.push(DlmmAltBlockRecord {
@@ -1331,6 +1619,8 @@ impl RouteShardPlanner {
                 },
                 dlmm: dlmm_records,
                 extensions: Vec::new(),
+                cpmm: Vec::new(),
+                damm_v2: Vec::new(),
             },
         );
         self.store.validate()
@@ -1410,6 +1700,8 @@ impl RouteShardPlanner {
             block.extensions.push(MintRouteExtension {
                 shard: shard_key,
                 dlmm: vec![record],
+                cpmm: Vec::new(),
+                damm_v2: Vec::new(),
             });
         }
         self.store.validate()
@@ -1491,6 +1783,7 @@ impl RouteShardPlanner {
                             created_slot: slot,
                             last_extended_slot: 0,
                             status: RouteShardStatus::Active,
+                            globals: None,
                         });
                 if shard_record.used != 0 {
                     anyhow::bail!(
@@ -1545,14 +1838,33 @@ fn parse_pubkeys(values: &[String]) -> anyhow::Result<Vec<Pubkey>> {
     values.iter().map(|value| parse_pubkey(value)).collect()
 }
 
+/// Validate a pending mint-block address list against the on-wire layout
+/// produced by [`StableMintRouteAccounts::stable_addresses`].
+///
+/// Accepted layouts (variable base):
+/// - `[mint, pump*3, dlmm*3n]` (n ≥ 1) — pump + at least one DLMM (historic).
+/// - `[mint, dlmm*3n]` (n ≥ 2) — no pump, ≥ 2 DLMMs. n=1 (length 4) is
+///   indistinguishable from `[mint, pump*3]`; the disambiguation defaults to
+///   pump-present for length-4 blocks. Non-pump mint blocks with a single
+///   DLMM are not yet supported through this reconstruction path (they would
+///   need a `PendingRouteShardOperationKind` schema extension).
 fn validate_mint_block_addresses(mint: Pubkey, addresses: &[Pubkey]) -> anyhow::Result<()> {
-    if addresses.len() < 7 || (addresses.len() - 4) % 3 != 0 {
-        anyhow::bail!(
-            "mint route block must contain 4 base addresses plus one or more DLMM triples"
-        );
+    if addresses.is_empty() {
+        anyhow::bail!("mint route block must contain at least the mint address");
     }
     if addresses[0] != mint {
         anyhow::bail!("mint route block first address must be the mint");
+    }
+    let tail = addresses.len() - 1;
+    // Layout A: pump-present. tail is 3 (pump only) or 3 + 3n (pump + n DLMM).
+    let with_pump_ok = tail >= 3 && (tail - 3) % 3 == 0;
+    // Layout B: no pump, ≥ 2 DLMM triples (n=1 collides with Layout A above).
+    let without_pump_ok = tail >= 6 && tail % 3 == 0;
+    if !with_pump_ok && !without_pump_ok {
+        anyhow::bail!(
+            "mint route block has {} trailing addresses; expected pump+DLMM triples (3, 6, 9, …) or DLMM-only (6, 9, …)",
+            tail
+        );
     }
     Ok(())
 }
@@ -1562,17 +1874,33 @@ fn stable_mint_route_from_addresses(
 ) -> anyhow::Result<StableMintRouteAccounts> {
     let addresses = parse_pubkeys(addresses)?;
     validate_mint_block_addresses(addresses[0], &addresses)?;
-    let dlmms = addresses[4..]
+    let tail = addresses.len() - 1;
+    // Disambiguation: length-4 defaults to pump-present (historic layout).
+    // Length `1 + 3n` with n ≥ 2 is the pump-absent DLMM-only case.
+    let has_pump = tail >= 3 && (tail - 3) % 3 == 0;
+    let (pump, dlmm_start) = if has_pump {
+        (
+            Some(StablePumpRouteAccounts {
+                pool: addresses[1],
+                token_vault: addresses[2],
+                base_vault: addresses[3],
+            }),
+            4,
+        )
+    } else {
+        (None, 1)
+    };
+    let dlmms = addresses[dlmm_start..]
         .chunks(3)
         .map(stable_dlmm_from_addresses)
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(StableMintRouteAccounts {
         mint: addresses[0],
-        pump_pool: addresses[1],
-        pump_token_vault: addresses[2],
-        pump_base_vault: addresses[3],
+        pump,
         dlmms,
+        cpmms: Vec::new(),
+        damm_v2s: Vec::new(),
     })
 }
 
@@ -1606,9 +1934,11 @@ mod tests {
     fn mint_route(mint: Pubkey, dlmm_count: u8) -> StableMintRouteAccounts {
         StableMintRouteAccounts {
             mint,
-            pump_pool: pk(2),
-            pump_token_vault: pk(3),
-            pump_base_vault: pk(4),
+            pump: Some(StablePumpRouteAccounts {
+                pool: pk(2),
+                token_vault: pk(3),
+                base_vault: pk(4),
+            }),
             dlmms: (0..dlmm_count)
                 .map(|i| StableDlmmRouteAccounts {
                     lb_pair: pk(10 + i * 3),
@@ -1616,7 +1946,70 @@ mod tests {
                     base_vault: pk(12 + i * 3),
                 })
                 .collect(),
+            cpmms: Vec::new(),
+            damm_v2s: Vec::new(),
         }
+    }
+
+    #[test]
+    fn planner_new_accepts_empty_allowed_mints() {
+        // Seed-from-wallets mode boots with allowed_mints=[]; the planner
+        // must still be constructible so the promoter can admit mints later.
+        let empty: [Pubkey; 0] = [];
+        let planner = RouteShardPlanner::new(RouteShardStore::empty(), empty, 256).unwrap();
+        // plan_mint_block for any mint rejects: mint is not in the empty
+        // allowlist, so ensure_allowed bails (existing behavior).
+        let mint = pk(1);
+        let route = mint_route(mint, 1);
+        assert!(planner.plan_mint_block(&route).is_err());
+    }
+
+    #[test]
+    fn planner_plans_mint_block_without_pump_when_multiple_dlmms_present() {
+        // With pump=None and 2 DLMMs we still have 2 pool types (both DLMM
+        // instances counted as the DLMM type; but any arb needs 2 pool types)
+        // — this test focuses on the ALT planner accepting the address layout
+        // [mint, dlmm*3, dlmm*3] (base_len=1). Discovery-gate rules are
+        // enforced upstream in `from_mint_runtime_state`.
+        let mint = pk(1);
+        let planner = RouteShardPlanner::new(RouteShardStore::empty(), [mint], 256).unwrap();
+        let route = StableMintRouteAccounts {
+            mint,
+            pump: None,
+            dlmms: vec![
+                StableDlmmRouteAccounts {
+                    lb_pair: pk(10),
+                    token_vault: pk(11),
+                    base_vault: pk(12),
+                },
+                StableDlmmRouteAccounts {
+                    lb_pair: pk(13),
+                    token_vault: pk(14),
+                    base_vault: pk(15),
+                },
+            ],
+            cpmms: Vec::new(),
+            damm_v2s: Vec::new(),
+        };
+
+        // stable_addresses layout: [mint, dlmm0*3, dlmm1*3] = 7 addresses
+        assert_eq!(route.stable_addresses().len(), 7);
+        assert_eq!(route.base_slot_count(), 1);
+
+        // NOTE: `stable_mint_route_from_addresses` cannot distinguish
+        // [mint, pump*3, dlmm*3] from [mint, dlmm*3, dlmm*3] purely by length
+        // and currently defaults to pump-present. That reverse-parse
+        // disambiguation is a separate schema concern (would need a tag) and
+        // is not exercised by the routing/planner flow, which always writes
+        // the on-chain ALT indexes from the forward `stable_addresses()`
+        // layout. This test covers only forward + planner acceptance.
+
+        // Planner should accept and produce a CreateShard operation.
+        let plan = planner.plan_mint_block(&route).unwrap().unwrap();
+        assert!(matches!(
+            plan,
+            PlannedRouteShardExtension::CreateShard { .. }
+        ));
     }
 
     #[test]
@@ -1947,7 +2340,7 @@ mod tests {
             StableMintRouteAccounts::from_mint_runtime_state(&state, 1_000, 500, now_ms).unwrap();
 
         assert_eq!(stable.mint, mint);
-        assert_eq!(stable.pump_pool, pk(2));
+        assert_eq!(stable.pump.as_ref().unwrap().pool, pk(2));
         assert_eq!(stable.dlmms[0].lb_pair, pk(12));
     }
 
@@ -2193,13 +2586,13 @@ mod tests {
         // Full route now including both DLMMs must return None.
         let full_route = StableMintRouteAccounts {
             mint,
-            pump_pool: initial.pump_pool,
-            pump_token_vault: initial.pump_token_vault,
-            pump_base_vault: initial.pump_base_vault,
+            pump: initial.pump.clone(),
             dlmms: vec![
                 initial.dlmms[0].clone(),
                 new_dlmm.clone(),
             ],
+            cpmms: Vec::new(),
+            damm_v2s: Vec::new(),
         };
         assert!(planner.plan_next_dlmm_extension(&full_route).unwrap().is_none());
     }
