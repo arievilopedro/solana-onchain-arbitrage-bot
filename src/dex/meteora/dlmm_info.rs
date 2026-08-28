@@ -155,8 +155,12 @@ impl DlmmInfo {
     pub fn calculate_bin_arrays(&self, pair_pubkey: &Pubkey) -> Result<Vec<Pubkey>> {
         let bin_array_index = self.bin_id_to_bin_array_index(self.active_id)?;
 
+        // Emit 3 bin_arrays centred on the active bin (covers ~210 bins of
+        // price range). Reference executors on-chain (SolanaMevBot) use the
+        // same width; going wider costs 32 B per extra array and risks
+        // exceeding the 1232 B packet limit on multi-DLMM triggers.
         let mut bin_arrays = Vec::new();
-        let offsets = [-2, -1, 0, 1, 2];
+        let offsets = [-1, 0, 1];
 
         for offset in offsets {
             let array_idx = bin_array_index + offset;
@@ -172,7 +176,8 @@ impl DlmmInfo {
     }
 
     pub fn bin_id_to_bin_array_index(&self, bin_id: i32) -> Result<i32> {
-        let (idx, rem) = self.div_rem(bin_id, 70);
+        const BIN_ARRAY_SIZE: i32 = 70;
+        let (idx, rem) = self.div_rem(bin_id, BIN_ARRAY_SIZE);
 
         if bin_id.is_negative() && rem != 0 {
             Ok(idx - 1)
@@ -199,5 +204,64 @@ impl LbPair {
         let lb_pair = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const LbPair) };
 
         Ok(lb_pair)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info_with_active_id(active_id: i32) -> DlmmInfo {
+        // Only `active_id` matters for the bin_array PDA calculation; the
+        // remaining fields can be zeroed.
+        let mut lb_pair: LbPair = unsafe { std::mem::zeroed() };
+        lb_pair.active_id = active_id;
+        DlmmInfo {
+            token_x_mint: Pubkey::default(),
+            token_y_mint: Pubkey::default(),
+            token_x_vault: Pubkey::default(),
+            token_y_vault: Pubkey::default(),
+            oracle: Pubkey::default(),
+            active_id,
+            lb_pair,
+        }
+    }
+
+    #[test]
+    fn calculate_bin_arrays_returns_three_pdas_centered_on_active_id() {
+        let info = info_with_active_id(140); // bin_array_index = 2
+        let pair = Pubkey::new_unique();
+        let arrays = info.calculate_bin_arrays(&pair).unwrap();
+
+        assert_eq!(arrays.len(), 3, "must emit exactly 3 bin_arrays");
+
+        let expected: Vec<Pubkey> = [1i64, 2, 3]
+            .iter()
+            .map(|idx| {
+                let seeds = [BIN_ARRAY, pair.as_ref(), &idx.to_le_bytes()[0..8]];
+                Pubkey::find_program_address(&seeds, &dlmm_program_id()).0
+            })
+            .collect();
+        assert_eq!(arrays, expected);
+    }
+
+    #[test]
+    fn calculate_bin_arrays_handles_negative_active_id() {
+        // Negative active_id with non-zero remainder floors toward -inf:
+        // bin_id_to_bin_array_index(-100) = (-100/70=-1) - 1 = -2.
+        // Offsets [-1, 0, 1] therefore yield indices [-3, -2, -1].
+        let info = info_with_active_id(-100);
+        let pair = Pubkey::new_unique();
+        let arrays = info.calculate_bin_arrays(&pair).unwrap();
+
+        assert_eq!(arrays.len(), 3);
+        let expected: Vec<Pubkey> = [-3i64, -2, -1]
+            .iter()
+            .map(|idx| {
+                let seeds = [BIN_ARRAY, pair.as_ref(), &idx.to_le_bytes()[0..8]];
+                Pubkey::find_program_address(&seeds, &dlmm_program_id()).0
+            })
+            .collect();
+        assert_eq!(arrays, expected);
     }
 }
