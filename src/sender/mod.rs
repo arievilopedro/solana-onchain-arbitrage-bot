@@ -760,6 +760,83 @@ impl SenderPool {
         }
         outcomes
     }
+
+    /// Return `(provider_name, tip_config)` pairs for every provider in the
+    /// pool that exposes a tip config. Order matches provider registration.
+    ///
+    /// Used by the transaction assembly path to build one TX per provider,
+    /// each carrying a tip transfer to that provider's own tip account.
+    pub fn provider_tips(&self) -> Vec<(&'static str, SenderTipConfig)> {
+        self.providers
+            .iter()
+            .filter_map(|p| p.tip_config().map(|tip| (p.provider(), tip.clone())))
+            .collect()
+    }
+
+    /// Dispatch a set of pre-tagged transactions where each entry targets a
+    /// single provider by name. Each provider still runs in its own
+    /// `tokio::spawn` task; unmatched entries yield a per-tx error outcome so
+    /// callers can log the mismatch. Returns outcomes in dispatch order.
+    ///
+    /// This is the multi-provider counterpart of `broadcast`: instead of
+    /// sending one TX to all providers, it sends N TXs (potentially one per
+    /// provider × spam copies) each to its own provider. Provider-specific
+    /// tip transfers must already be embedded in each TX by the caller (see
+    /// `SenderPool::provider_tips`).
+    pub async fn dispatch_tagged(
+        &self,
+        tagged_txs: Vec<(&'static str, Arc<VersionedTransaction>)>,
+    ) -> Vec<BroadcastOutcome> {
+        if tagged_txs.is_empty() || self.providers.is_empty() {
+            return Vec::new();
+        }
+
+        let mut handles = Vec::with_capacity(tagged_txs.len());
+        for (target, tx) in tagged_txs {
+            let provider = self
+                .providers
+                .iter()
+                .find(|p| p.provider() == target)
+                .cloned();
+            handles.push(tokio::spawn(async move {
+                let started = Instant::now();
+                match provider {
+                    Some(provider) => {
+                        let result = provider.send_transaction(&tx).await;
+                        BroadcastOutcome {
+                            provider: provider.provider(),
+                            result,
+                            latency: started.elapsed(),
+                        }
+                    }
+                    None => BroadcastOutcome {
+                        provider: target,
+                        result: Err(anyhow::anyhow!(
+                            "sender pool has no provider matching tagged tx target `{}`",
+                            target
+                        )),
+                        latency: started.elapsed(),
+                    },
+                }
+            }));
+        }
+
+        let mut outcomes = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.await {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(join_err) => outcomes.push(BroadcastOutcome {
+                    provider: "unknown",
+                    result: Err(anyhow::anyhow!(
+                        "sender dispatch_tagged task panicked: {}",
+                        join_err
+                    )),
+                    latency: Duration::ZERO,
+                }),
+            }
+        }
+        outcomes
+    }
 }
 
 #[cfg(test)]

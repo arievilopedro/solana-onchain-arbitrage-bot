@@ -717,6 +717,12 @@ struct RouteExecutionCache {
     packer: FixedDlmmRoutePacker,
     #[cfg_attr(not(feature = "geyser"), allow(dead_code))]
     params: ControlledExecutionParams,
+    /// Per-provider tip configs snapshot at load time. One entry per enabled
+    /// sender provider (respects broadcast/primary). Compile-time uses this to
+    /// build one TX per provider with a tip transfer to that provider's own
+    /// tip account.
+    #[cfg_attr(not(feature = "geyser"), allow(dead_code))]
+    provider_tips: Vec<(&'static str, SenderTipConfig)>,
     nonce_manager: Option<Arc<NonceManager>>,
 }
 
@@ -759,6 +765,7 @@ impl RouteExecutionCache {
             .collect::<HashMap<_, _>>();
         let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
         let params = controlled_execution_params(config)?;
+        let provider_tips = sender_tips_per_provider(config)?;
 
         // Initialize nonce manager if enabled
         let nonce_manager = if config.nonce.enabled && !config.nonce.accounts.is_empty() {
@@ -789,6 +796,7 @@ impl RouteExecutionCache {
             route_alts,
             packer,
             params,
+            provider_tips,
             nonce_manager,
         })
     }
@@ -1459,16 +1467,18 @@ async fn process_axion_trigger(
         return Ok(());
     }
 
-    // When spam is enabled, expand the send cap by the spam multiplier so a
-    // user asking for e.g. trigger_send_max_transactions=1 with spam.copies=5
-    // gets all 5 copies out. Users can still hard-cap by setting spam.copies=1
-    // (or spam.enabled=false).
+    // Each route produces `providers × spam_copies` TXs (one per provider per
+    // spam copy). `trigger_send_max_transactions` still expresses a cap in
+    // "route copies"; multiply by both spam_copies and the number of enabled
+    // providers so the cap is not silently under-applied when broadcast=true.
     let spam_copies = spam_copies_per_route(&config);
+    let providers_count = sender_pool.len().max(1);
     let max_transactions = config
         .execution
         .trigger_send_max_transactions
         .max(1)
-        .saturating_mul(spam_copies);
+        .saturating_mul(spam_copies)
+        .saturating_mul(providers_count);
     let txs: Vec<_> = txs.into_iter().take(max_transactions).collect();
     if txs.is_empty() {
         tracing::debug!(
@@ -1495,17 +1505,23 @@ async fn process_axion_trigger(
     } else {
         0
     };
-    for (tx_index, tx) in txs.into_iter().enumerate() {
+    for (tx_index, tagged) in txs.into_iter().enumerate() {
         if stagger_us > 0 && tx_index > 0 {
             tokio::time::sleep(std::time::Duration::from_micros(stagger_us)).await;
         }
         let sender_pool = sender_pool.clone();
         let trigger_signature = trigger_signature.clone();
         let trigger_to_spawn_ms = trigger_received_at.elapsed().as_millis();
+        let TaggedTransaction { provider, tx } = tagged;
         let tx = Arc::new(tx);
         tokio::spawn(async move {
             let send_started_at = Instant::now();
-            let outcomes = sender_pool.broadcast(tx).await;
+            // Tagged dispatch: the TX carries a tip transfer to `provider`'s
+            // own tip account, so it is sent only to that provider. Prevents
+            // silent tip=0 rejects on other providers when broadcast=true.
+            let outcomes = sender_pool
+                .dispatch_tagged(vec![(provider, tx)])
+                .await;
             let broadcast_ms = send_started_at.elapsed().as_millis();
             let trigger_to_ack_ms = trigger_received_at.elapsed().as_millis();
             for outcome in outcomes {
@@ -2584,10 +2600,21 @@ struct ControlledTxDryRunSummary {
 }
 
 #[cfg(feature = "geyser")]
+#[derive(Debug)]
+struct TaggedTransaction {
+    /// Sender provider this TX is destined for (e.g. `"helius"`, `"nozomi"`,
+    /// `"astralan"`). The dispatch layer routes the TX only to this provider
+    /// because the embedded tip transfer targets that provider's own tip
+    /// account.
+    provider: &'static str,
+    tx: VersionedTransaction,
+}
+
+#[cfg(feature = "geyser")]
 #[derive(Debug, Default)]
 struct ControlledMintCompilation {
     summary: ControlledTxDryRunSummary,
-    transactions: Vec<VersionedTransaction>,
+    transactions: Vec<TaggedTransaction>,
 }
 
 #[derive(Debug, Clone)]
@@ -2764,7 +2791,7 @@ fn compile_controlled_mint_routes(
         RouteShardLookupResolver::load(&config.lookup_tables.route_shards.state_file)
             .context("failed to load route shard resolver")?;
     let packer = FixedDlmmRoutePacker::new(config.routes.max_dlmm_per_tx)?;
-    let params = controlled_execution_params(config)?;
+    let provider_tips = sender_tips_per_provider(config)?;
     let now_ms = now_ms();
     let mut compilation = ControlledMintCompilation::default();
     let route_groups = pack_execution_route_groups(
@@ -2784,21 +2811,32 @@ fn compile_controlled_mint_routes(
             continue;
         };
         let lookup_tables = lookup_tables_for_route(&protocol_alt, &route_alt);
-        for _copy in 0..spam_copies {
-            match build_controlled_transaction(
-                wallet,
-                &route,
-                mint_state.token_program,
-                recent_blockhash,
-                &lookup_tables,
-                params.clone(),
-            ) {
-                Ok(tx) => {
-                    compilation.summary.compiled += 1;
-                    compilation.transactions.push(tx);
-                }
-                Err(_) => {
-                    compilation.summary.compile_failed += 1;
+        // Fan out: one TX per (provider × spam copy). Each TX carries a tip
+        // transfer to that provider's own tip account so a downstream tagged
+        // dispatch never sends a tx to a provider whose tip account doesn't
+        // appear in the tx (which would cause silent tip=0 rejects).
+        for (provider_name, tip_cfg) in &provider_tips {
+            for _copy in 0..spam_copies {
+                let params =
+                    controlled_execution_params_with_tip(config, Some(tip_cfg.clone()));
+                match build_controlled_transaction(
+                    wallet,
+                    &route,
+                    mint_state.token_program,
+                    recent_blockhash,
+                    &lookup_tables,
+                    params,
+                ) {
+                    Ok(tx) => {
+                        compilation.summary.compiled += 1;
+                        compilation.transactions.push(TaggedTransaction {
+                            provider: provider_name,
+                            tx,
+                        });
+                    }
+                    Err(_) => {
+                        compilation.summary.compile_failed += 1;
+                    }
                 }
             }
         }
@@ -2871,48 +2909,56 @@ fn compile_controlled_mint_routes_cached(
     let spam_copies = spam_copies_per_route(config);
     for route in route_groups {
         compilation.summary.routes += 1;
-        for _copy in 0..spam_copies {
-            let params = controlled_execution_params_with_tip(
-                config,
-                route_execution_cache.params.sender_tip.clone(),
-            );
-            let build_result = if let Some(nonce_mgr) = &route_execution_cache.nonce_manager {
-                if let Some((nonce_pubkey, nonce_hash, _authority)) = nonce_mgr.next_nonce() {
-                    nonce_mgr.mark_in_flight(&nonce_pubkey);
-                    build_controlled_transaction_with_nonce(
+        // Fan out: one TX per (provider × spam copy). Each TX carries a tip
+        // transfer to that provider's own tip account so a downstream tagged
+        // dispatch never sends a tx to a provider whose tip account doesn't
+        // appear in the tx (which would cause silent tip=0 rejects on
+        // Nozomi/Astralan).
+        for (provider_name, tip_cfg) in &route_execution_cache.provider_tips {
+            for _copy in 0..spam_copies {
+                let params =
+                    controlled_execution_params_with_tip(config, Some(tip_cfg.clone()));
+                let build_result = if let Some(nonce_mgr) = &route_execution_cache.nonce_manager {
+                    if let Some((nonce_pubkey, nonce_hash, _authority)) = nonce_mgr.next_nonce() {
+                        nonce_mgr.mark_in_flight(&nonce_pubkey);
+                        build_controlled_transaction_with_nonce(
+                            wallet,
+                            &route,
+                            mint_state.token_program,
+                            nonce_hash,
+                            nonce_pubkey,
+                            &lookup_tables,
+                            params,
+                        )
+                    } else {
+                        tracing::warn!(
+                            "trigger nonce unavailable: mint={} reason=all_nonces_in_flight",
+                            mint
+                        );
+                        compilation.summary.compile_failed += 1;
+                        continue;
+                    }
+                } else {
+                    build_controlled_transaction(
                         wallet,
                         &route,
                         mint_state.token_program,
-                        nonce_hash,
-                        nonce_pubkey,
+                        recent_blockhash,
                         &lookup_tables,
                         params,
                     )
-                } else {
-                    tracing::warn!(
-                        "trigger nonce unavailable: mint={} reason=all_nonces_in_flight",
-                        mint
-                    );
-                    compilation.summary.compile_failed += 1;
-                    continue;
-                }
-            } else {
-                build_controlled_transaction(
-                    wallet,
-                    &route,
-                    mint_state.token_program,
-                    recent_blockhash,
-                    &lookup_tables,
-                    params,
-                )
-            };
-            match build_result {
-                Ok(tx) => {
-                    compilation.summary.compiled += 1;
-                    compilation.transactions.push(tx);
-                }
-                Err(_) => {
-                    compilation.summary.compile_failed += 1;
+                };
+                match build_result {
+                    Ok(tx) => {
+                        compilation.summary.compiled += 1;
+                        compilation.transactions.push(TaggedTransaction {
+                            provider: provider_name,
+                            tx,
+                        });
+                    }
+                    Err(_) => {
+                        compilation.summary.compile_failed += 1;
+                    }
                 }
             }
         }
@@ -3200,6 +3246,63 @@ fn sender_tip_config(config: &AppConfig) -> anyhow::Result<Option<SenderTipConfi
     }
 
     Ok(HeliusSenderPlan::from_config(&config.sender.helius)?.map(|plan| plan.tip))
+}
+
+/// Enumerate `(provider_name, tip_config)` pairs for every sender provider
+/// that will actually receive a transaction under the current sender config.
+///
+/// - When `broadcast=true`: every enabled provider (Helius, Nozomi, Astralan)
+///   is included. Each provider gets its own dedicated TX carrying a tip
+///   transfer to that provider's own tip account (fixes silent tip=0 rejects
+///   observed on Nozomi/Astralan when the same tx was broadcast to all).
+/// - When `broadcast=false`: only the `primary` provider is included, so the
+///   pre-existing single-provider behaviour is preserved verbatim.
+///
+/// Providers that are not `enabled` in config are omitted. Order matches the
+/// registration order used by `SenderPool::from_config` so downstream logs are
+/// stable.
+fn sender_tips_per_provider(
+    config: &AppConfig,
+) -> anyhow::Result<Vec<(&'static str, SenderTipConfig)>> {
+    let mut tips: Vec<(&'static str, SenderTipConfig)> = Vec::new();
+
+    let helius = HeliusSenderPlan::from_config(&config.sender.helius)?.map(|plan| plan.tip);
+    let nozomi = NozomiSenderPlan::from_config(&config.sender.nozomi)?.map(|plan| plan.tip);
+    let astralan = AstralanSenderPlan::from_config(&config.sender.astralan)?.map(|plan| plan.tip);
+
+    if config.sender.broadcast {
+        if let Some(tip) = helius {
+            tips.push(("helius", tip));
+        }
+        if let Some(tip) = nozomi {
+            tips.push(("nozomi", tip));
+        }
+        if let Some(tip) = astralan {
+            tips.push(("astralan", tip));
+        }
+    } else {
+        match config.sender.primary.as_str() {
+            "helius" => {
+                if let Some(tip) = helius {
+                    tips.push(("helius", tip));
+                }
+            }
+            "nozomi" => {
+                if let Some(tip) = nozomi {
+                    tips.push(("nozomi", tip));
+                }
+            }
+            "astralan" => {
+                if let Some(tip) = astralan {
+                    tips.push(("astralan", tip));
+                }
+            }
+            // "rpc" or unknown = no tagged sender; caller must handle empty vec.
+            _ => {}
+        }
+    }
+
+    Ok(tips)
 }
 
 fn controlled_execution_params(config: &AppConfig) -> anyhow::Result<ControlledExecutionParams> {
