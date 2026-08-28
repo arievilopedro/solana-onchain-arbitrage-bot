@@ -960,9 +960,7 @@ fn run_rabbitstream_trigger_worker(
                         if !seen.insert(signal.signature.clone()) {
                             // Duplicate signature (same trigger seen twice
                             // across reconnects or the parser emitted twice).
-                            // Log at INFO so we can distinguish "no signal
-                            // arrived" from "signal arrived but was deduped".
-                            tracing::info!(
+                            tracing::debug!(
                                 "rabbitstream axion trigger dedup: mint={} slot={} sig={}",
                                 signal.mint,
                                 signal.slot,
@@ -1008,7 +1006,7 @@ fn run_rabbitstream_trigger_worker(
                         signal.raw_amount,
                     )?;
                     if sol_amount < config_iter.axion.min_sol {
-                        tracing::info!(
+                        tracing::debug!(
                             "rabbitstream axion trigger filtered: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={} side={} raw_amount={}",
                             signal.mint,
                             signal.slot,
@@ -1033,7 +1031,7 @@ fn run_rabbitstream_trigger_worker(
                             if now.duration_since(*last_trigger)
                                 < Duration::from_millis(config_iter.axion.cooldown_ms)
                             {
-                                tracing::info!(
+                                tracing::debug!(
                                     "rabbitstream axion trigger skipped: mint={} slot={} sig={} reason=cooldown cooldown_ms={}",
                                     signal.mint,
                                     signal.slot,
@@ -2201,7 +2199,7 @@ async fn run_single_geyser_account_worker(
         if account_updates_received <= INITIAL_LOG_BURST
             || account_updates_received % SAMPLED_LOG_EVERY == 0
         {
-            info!(
+            tracing::debug!(
                 "gRPC account update arrived: worker={} n={} owner={} pubkey={} slot={} data_len={}",
                 worker_index,
                 account_updates_received,
@@ -2350,38 +2348,27 @@ async fn run_single_geyser_account_worker(
                 );
             }
         } else if report.ignored_not_pool_program {
-            // Promoted to INFO: this being the dominant outcome means our
-            // subscription owner filter is too broad (extra accounts leaking
-            // through) — should be rare with the mint-scoped subscriptions.
-            info!(
+            tracing::debug!(
                 "gRPC account update ignored: reason=not_pool_program owner={} pubkey={} slot={}",
                 update.owner, update.pubkey, update.slot
             );
         } else if report.ignored_not_pool_account {
-            // Promoted to INFO: the account is owned by pump/dlmm but did NOT
-            // decode as a pool account (wrong discriminator / length). If
-            // frequent for the same pubkey, our parser is out of date.
-            info!(
+            tracing::debug!(
                 "gRPC account update ignored: reason=not_pool_account owner={} pubkey={} slot={}",
                 update.owner, update.pubkey, update.slot
             );
         } else if report.ignored_not_allowlisted {
-            // Promoted to INFO: pool decoded fine but its base mint is not in
-            // the current allowlist snapshot. If this fires for a mint we
-            // expect to be allowlisted, the snapshot is stale.
-            info!(
+            tracing::debug!(
                 "gRPC account update ignored: reason=not_allowlisted owner={} pubkey={} slot={}",
                 update.owner, update.pubkey, update.slot
             );
         } else if report.ignored_missing_mint_state {
-            // Promoted to INFO: the mint IS allowlisted but has no registry
-            // entry yet. Suggests race between promoter and gRPC subscription.
-            info!(
+            tracing::debug!(
                 "gRPC account update ignored: reason=missing_mint_state owner={} pubkey={} slot={}",
                 update.owner, update.pubkey, update.slot
             );
         } else if report.ignored_non_sol_route {
-            info!(
+            tracing::debug!(
                 "gRPC account update ignored: reason=non_sol_route owner={} pubkey={} slot={}",
                 update.owner, update.pubkey, update.slot
             );
@@ -3039,7 +3026,7 @@ fn pack_with_optional_alt_filter(
         // Promoted to INFO: when the route shard ALT is missing accounts for
         // a DLMM pool, that pool is silently dropped from the pack. If this
         // repeats for the same mint the shard needs to be extended.
-        tracing::info!(
+        tracing::debug!(
             "route shard filter dropped {} dlmm(s) for mint {} (eligible={}, addressable={})",
             total_eligible - filtered_dlmms.len(),
             mint_state.mint,
@@ -3121,7 +3108,7 @@ fn pack_with_optional_alt_filter(
                 .liquidity
                 .map(|liq| (now_ms.saturating_sub(liq.updated_at_ms), liq.base_lamports))
                 .unwrap_or((0, 0));
-            tracing::info!(
+            tracing::debug!(
                 "  pool_reject pump[{}] pool={} eligibility={:?} enabled={} age_ms={} base_lamports={} last_update_slot={}",
                 idx,
                 pool.pool,
@@ -3139,7 +3126,7 @@ fn pack_with_optional_alt_filter(
                 .liquidity
                 .map(|liq| (now_ms.saturating_sub(liq.updated_at_ms), liq.base_lamports))
                 .unwrap_or((0, 0));
-            tracing::info!(
+            tracing::debug!(
                 "  pool_reject dlmm[{}] lb_pair={} eligibility={:?} enabled={} age_ms={} base_lamports={} last_update_slot={}",
                 idx,
                 pool.lb_pair,
@@ -3157,7 +3144,7 @@ fn pack_with_optional_alt_filter(
                 .liquidity
                 .map(|liq| (now_ms.saturating_sub(liq.updated_at_ms), liq.base_lamports))
                 .unwrap_or((0, 0));
-            tracing::info!(
+            tracing::debug!(
                 "  pool_reject cpmm[{}] pool={} eligibility={:?} enabled={} age_ms={} base_lamports={} last_update_slot={}",
                 idx,
                 pool.pool,
@@ -3175,7 +3162,7 @@ fn pack_with_optional_alt_filter(
                 .liquidity
                 .map(|liq| (now_ms.saturating_sub(liq.updated_at_ms), liq.base_lamports))
                 .unwrap_or((0, 0));
-            tracing::info!(
+            tracing::debug!(
                 "  pool_reject damm_v2[{}] pool={} eligibility={:?} enabled={} age_ms={} base_lamports={} last_update_slot={}",
                 idx,
                 pool.pool,
