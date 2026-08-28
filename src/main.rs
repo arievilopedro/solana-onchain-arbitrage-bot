@@ -2018,14 +2018,44 @@ async fn run_single_geyser_account_worker(
         plan.subscriptions.len(),
         command_rx.is_some()
     );
+    // Counter for handler-entry logging. We log every account update at INFO
+    // for the first `INITIAL_LOG_BURST` messages so operators can verify
+    // gRPC delivery immediately, then downsample to 1-in-N to avoid hot-path
+    // spam. Slot updates are counted separately (no log per-slot).
+    const INITIAL_LOG_BURST: u64 = 30;
+    const SAMPLED_LOG_EVERY: u64 = 200;
+    let mut account_updates_received: u64 = 0;
+    let mut slot_updates_received: u64 = 0;
     let handler = move |update: GeyserStreamUpdate| -> anyhow::Result<()> {
         let update = match update {
             GeyserStreamUpdate::Account(update) => update,
             GeyserStreamUpdate::Slot(slot_update) => {
+                slot_updates_received = slot_updates_received.saturating_add(1);
+                if slot_updates_received == 1 {
+                    info!(
+                        "gRPC slot updates started: worker={} first_slot={}",
+                        worker_index, slot_update.slot
+                    );
+                }
                 slot_tracker.record_processed_slot(slot_update.slot);
                 return Ok(());
             }
         };
+
+        account_updates_received = account_updates_received.saturating_add(1);
+        if account_updates_received <= INITIAL_LOG_BURST
+            || account_updates_received % SAMPLED_LOG_EVERY == 0
+        {
+            info!(
+                "gRPC account update arrived: worker={} n={} owner={} pubkey={} slot={} data_len={}",
+                worker_index,
+                account_updates_received,
+                update.owner,
+                update.pubkey,
+                update.slot,
+                update.account.data.len(),
+            );
+        }
 
         // Step 1: snapshot the allowlist under a brief lock so we can drop it
         // before running enrichment RPCs. This prevents the registry mutex from
@@ -2165,15 +2195,41 @@ async fn run_single_geyser_account_worker(
                 );
             }
         } else if report.ignored_not_pool_program {
-            tracing::debug!("gRPC account update ignored: not_pool_program");
+            // Promoted to INFO: this being the dominant outcome means our
+            // subscription owner filter is too broad (extra accounts leaking
+            // through) — should be rare with the mint-scoped subscriptions.
+            info!(
+                "gRPC account update ignored: reason=not_pool_program owner={} pubkey={} slot={}",
+                update.owner, update.pubkey, update.slot
+            );
         } else if report.ignored_not_pool_account {
-            tracing::debug!("gRPC account update ignored: not_pool_account");
+            // Promoted to INFO: the account is owned by pump/dlmm but did NOT
+            // decode as a pool account (wrong discriminator / length). If
+            // frequent for the same pubkey, our parser is out of date.
+            info!(
+                "gRPC account update ignored: reason=not_pool_account owner={} pubkey={} slot={}",
+                update.owner, update.pubkey, update.slot
+            );
         } else if report.ignored_not_allowlisted {
-            tracing::debug!("gRPC account update ignored: not_allowlisted");
+            // Promoted to INFO: pool decoded fine but its base mint is not in
+            // the current allowlist snapshot. If this fires for a mint we
+            // expect to be allowlisted, the snapshot is stale.
+            info!(
+                "gRPC account update ignored: reason=not_allowlisted owner={} pubkey={} slot={}",
+                update.owner, update.pubkey, update.slot
+            );
         } else if report.ignored_missing_mint_state {
-            tracing::debug!("gRPC account update ignored: missing_mint_state");
+            // Promoted to INFO: the mint IS allowlisted but has no registry
+            // entry yet. Suggests race between promoter and gRPC subscription.
+            info!(
+                "gRPC account update ignored: reason=missing_mint_state owner={} pubkey={} slot={}",
+                update.owner, update.pubkey, update.slot
+            );
         } else if report.ignored_non_sol_route {
-            tracing::debug!("gRPC account update ignored: non_sol_route");
+            info!(
+                "gRPC account update ignored: reason=non_sol_route owner={} pubkey={} slot={}",
+                update.owner, update.pubkey, update.slot
+            );
         }
 
         Ok(())
