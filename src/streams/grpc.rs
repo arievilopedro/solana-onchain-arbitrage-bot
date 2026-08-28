@@ -161,15 +161,24 @@ pub mod yellowstone {
     /// Legacy entry point (no command channel). Preserved so the existing
     /// worker in `main.rs` keeps compiling until Phase 7 migrates it to the
     /// command-aware variant. Internally forwards to
-    /// `run_account_stream_with_commands` with an already-closed receiver so
-    /// no `Replace` traffic can arrive.
+    /// `run_account_stream_with_commands` with a live-but-idle sender so
+    /// the inner `biased` select loop can't observe a channel-closed
+    /// `None` from `command_rx.recv()` and exit immediately.
     pub async fn run_account_stream(
         plan: GeyserAccountStreamPlan,
         on_update: impl FnMut(GeyserStreamUpdate) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        let (_tx, rx) = mpsc::channel::<SubscriptionCommand>(1);
-        drop(_tx);
-        run_account_stream_with_commands(plan, rx, on_update).await
+        // NOTE: keep `tx` alive across the await. Dropping it before
+        // entering the select loop closes `command_rx`, causing `recv()`
+        // to return `None` on first poll. Under `biased;`, that branch
+        // fires first and matches `None => break`, exiting the loop
+        // before any updates are processed and returning `Ok(())`
+        // silently. Keeping the sender parked means `command_rx.recv()`
+        // stays `Pending` forever and `stream.next()` gets fair polling.
+        let (tx, rx) = mpsc::channel::<SubscriptionCommand>(1);
+        let result = run_account_stream_with_commands(plan, rx, on_update).await;
+        drop(tx);
+        result
     }
 
     /// Command-aware account stream. In addition to forwarding gRPC updates
