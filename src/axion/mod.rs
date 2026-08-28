@@ -313,10 +313,17 @@ pub mod yellowstone {
             Some("sell") => amount_out,
             _ => 0,
         };
-        let raw_amount = if lamports > 0 {
-            lamports
-        } else {
-            amount_in.max(amount_out)
+        // `raw_amount` must reflect the TOKEN side of the swap (base-6 for
+        // pump tokens), because downstream `estimate_pump_sell_sol_from_registry`
+        // feeds it into a constant-product formula as `raw_token_amount`.
+        // Axion swap ix layout: `amount_in` = input, `amount_out` = output.
+        // BUY: SOL in / tokens out; SELL: tokens in / SOL out. Using the SOL
+        // side (~10^9 lamports) as token amount yields ~1000x underestimates
+        // for pump tokens (which are 6-decimal), tripping the safety clamp.
+        let raw_amount = match side {
+            Some("buy") => amount_out,
+            Some("sell") => amount_in,
+            _ => amount_in.max(amount_out),
         };
         if raw_amount == 0 {
             return None;
@@ -692,23 +699,33 @@ pub mod yellowstone {
         }
 
         #[test]
-        fn axion_swap_decodes_buy_side_and_amount_in() {
+        fn axion_swap_buy_reports_token_amount_out_as_raw_amount() {
+            // BUY: user spends 2.5 SOL (amount_in) to receive 999_999 tokens
+            // (amount_out). `raw_amount` must expose the TOKEN side so the
+            // pump SELL estimator downstream never receives a SOL-scaled
+            // value in place of a token count.
             let data = swap_ix_bytes(2_500_000_000, 999_999, 0);
             let volume =
                 axion_volume_from_instruction(&[0, 1], &data, &[], None).expect("volume");
             assert_eq!(volume.side, Some("buy"));
-            assert_eq!(volume.raw_amount, Some(2_500_000_000));
+            assert_eq!(volume.raw_amount, Some(999_999));
             assert_eq!(volume.sol_amount, 2.5);
             assert_eq!(volume.source, "axion_instruction_amount");
         }
 
         #[test]
-        fn axion_swap_decodes_sell_side_and_amount_out() {
+        fn axion_swap_sell_reports_token_amount_in_as_raw_amount() {
+            // SELL: user spends 4_240_000_000_000 tokens (amount_in) to
+            // receive 18.87 SOL (amount_out). Before the fix, `raw_amount`
+            // was set to `amount_out` (SOL lamports), which the pump SELL
+            // estimator then treated as token count -> ~1000x underestimate
+            // for 6-decimal pump tokens vs 9-decimal SOL (see
+            // `pump_estimate_ignored ratio=0.000-0.003` log noise pre-fix).
             let data = swap_ix_bytes(4_240_000_000_000, 18_870_000_000, 1);
             let volume =
                 axion_volume_from_instruction(&[0, 1], &data, &[], None).expect("volume");
             assert_eq!(volume.side, Some("sell"));
-            assert_eq!(volume.raw_amount, Some(18_870_000_000));
+            assert_eq!(volume.raw_amount, Some(4_240_000_000_000));
             assert_eq!(volume.sol_amount, 18.87);
         }
 
