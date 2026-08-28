@@ -19,7 +19,6 @@ pub enum PoolKind {
 pub enum PoolRejectReason {
     NonSolBase,
     BelowMinLiquidity,
-    StaleState,
     MissingLiquidity,
     Disabled,
 }
@@ -479,10 +478,11 @@ fn pool_eligibility(
         return PoolEligibility::Rejected(PoolRejectReason::BelowMinLiquidity);
     }
 
-    if now_ms.saturating_sub(liquidity.updated_at_ms) > max_state_age_ms as u128 {
-        return PoolEligibility::Rejected(PoolRejectReason::StaleState);
-    }
-
+    // Freshness gate removed: quiet DLMM pools never emit lb_pair mutations,
+    // so `updated_at_ms` lags without indicating real staleness. The
+    // liquidity floor above is the only defense against drained pools;
+    // pricing errors from a truly stale state are rejected on-chain.
+    let _ = (max_state_age_ms, now_ms);
     PoolEligibility::Eligible
 }
 
@@ -720,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_eligibility_requires_sol_base_liquidity_and_freshness() {
+    fn pool_eligibility_requires_sol_base_and_liquidity_floor() {
         let now_ms = 10_000;
         let min_liquidity = 1_000;
         let max_age_ms = 500;
@@ -763,18 +763,47 @@ mod tests {
             low_liquidity.eligibility(min_liquidity, max_age_ms, now_ms),
             PoolEligibility::Rejected(PoolRejectReason::BelowMinLiquidity)
         );
+    }
 
-        let stale = pump(
+    #[test]
+    fn pool_eligibility_accepts_stale_pool_with_sufficient_liquidity() {
+        // Freshness gate is intentionally disabled. A pool with an ancient
+        // `updated_at_ms` (e.g. a DLMM whose lb_pair has not mutated in
+        // minutes because it only sees swaps, not bin migrations) must
+        // still be eligible so long as its liquidity is above floor.
+        let now_ms = 1_000_000_000;
+        let min_liquidity = 1_000;
+        let stale_but_liquid = pump(
             sol_mint(),
             Some(PoolLiquidity {
-                base_lamports: 1_500,
+                base_lamports: 5_000,
                 token_lamports: None,
-                updated_at_ms: 9_000,
+                updated_at_ms: 0, // ~11.5 days old
             }),
         );
         assert_eq!(
-            stale.eligibility(min_liquidity, max_age_ms, now_ms),
-            PoolEligibility::Rejected(PoolRejectReason::StaleState)
+            stale_but_liquid.eligibility(min_liquidity, 500, now_ms),
+            PoolEligibility::Eligible
+        );
+    }
+
+    #[test]
+    fn pool_eligibility_rejects_pool_below_liquidity_floor_regardless_of_age() {
+        // Liquidity floor is the sole defense post-freshness-gate removal.
+        // A brand-new pool with insufficient liquidity is still rejected.
+        let now_ms = 10_000;
+        let min_liquidity = 1_000;
+        let fresh_but_drained = pump(
+            sol_mint(),
+            Some(PoolLiquidity {
+                base_lamports: 100,
+                token_lamports: None,
+                updated_at_ms: 10_000,
+            }),
+        );
+        assert_eq!(
+            fresh_but_drained.eligibility(min_liquidity, u64::MAX, now_ms),
+            PoolEligibility::Rejected(PoolRejectReason::BelowMinLiquidity)
         );
     }
 }

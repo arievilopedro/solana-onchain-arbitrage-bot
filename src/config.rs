@@ -854,6 +854,17 @@ impl AppConfig {
             );
         }
 
+        // `execution.max_pool_state_age_ms` is deprecated: the pool freshness
+        // gate has been removed (quiet DLMMs frequently have stale
+        // `updated_at_ms` despite being healthy). The value is still parsed
+        // for backward compatibility but is otherwise ignored.
+        if self.execution.max_pool_state_age_ms != 0 {
+            tracing::warn!(
+                value_ms = self.execution.max_pool_state_age_ms,
+                "execution.max_pool_state_age_ms is deprecated and ignored; freshness gate removed"
+            );
+        }
+
         if self.runtime.hot_mints.enabled {
             if self.runtime.hot_mints.top_n == 0 {
                 anyhow::bail!("runtime.hot_mints.top_n must be >= 1 when enabled");
