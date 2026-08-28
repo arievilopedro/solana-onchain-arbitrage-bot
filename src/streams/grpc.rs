@@ -204,6 +204,17 @@ pub mod yellowstone {
             );
         }
         tx.send(initial).await?;
+        // Confirms the initial SubscribeRequest reached the server without
+        // a transport-level error. Yellowstone has no application-layer
+        // ACK, so this is the closest signal we get to "handshake OK"
+        // before waiting for actual updates. Pair with `gRPC slot updates
+        // started` and `gRPC account update arrived` to isolate silent
+        // server-side rejection vs filter-specific issues.
+        tracing::info!(
+            "gRPC subscribe request sent: url={} accounts={} slots=1 commitment=processed",
+            plan.url,
+            plan.subscriptions.len(),
+        );
 
         loop {
             tokio::select! {
