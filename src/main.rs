@@ -238,6 +238,14 @@ async fn main() -> anyhow::Result<()> {
         report.discovered_damm_v2,
         report.skipped_low_liquidity
     );
+    // Visibility: print the effective monitored set so operators don't have to
+    // grep ATA-creation logs to figure out which mints the bot is watching.
+    let monitored: Vec<String> = allowed_mints.iter().map(|m| m.to_string()).collect();
+    info!(
+        "monitored_mints: count={} mints=[{}]",
+        monitored.len(),
+        monitored.join(", ")
+    );
     let registry = report.registry;
 
     // Delta B1 (per-mint ATA at boot): the hot path assumes the target-mint
@@ -942,6 +950,16 @@ fn run_rabbitstream_trigger_worker(
                             .lock()
                             .map_err(|_| anyhow::anyhow!("seen_signatures mutex poisoned"))?;
                         if !seen.insert(signal.signature.clone()) {
+                            // Duplicate signature (same trigger seen twice
+                            // across reconnects or the parser emitted twice).
+                            // Log at INFO so we can distinguish "no signal
+                            // arrived" from "signal arrived but was deduped".
+                            tracing::info!(
+                                "rabbitstream axion trigger dedup: mint={} slot={} sig={}",
+                                signal.mint,
+                                signal.slot,
+                                signal.signature,
+                            );
                             return Ok(());
                         }
                         let mut order = seen_signature_order_iter.lock().map_err(|_| {
@@ -954,6 +972,24 @@ fn run_rabbitstream_trigger_worker(
                             }
                         }
                     }
+                    // Emit an INFO log at the earliest point where we know a
+                    // signal actually reached the callback (allowlist
+                    // matched, structure parsed). Without this the operator
+                    // has no way to distinguish "stream received nothing"
+                    // from "signal was filtered by min_sol/cooldown".
+                    tracing::info!(
+                        "rabbitstream axion trigger received: mint={} slot={} sig={} raw_sol={:.6} side={} raw_amount={} volume_source={}",
+                        signal.mint,
+                        signal.slot,
+                        signal.signature,
+                        signal.sol_amount,
+                        signal.side.unwrap_or("unknown"),
+                        signal
+                            .raw_amount
+                            .map(|amount| amount.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        signal.volume_source,
+                    );
                     let (sol_amount, volume_source) = adjusted_trigger_sol_amount(
                         &config_iter,
                         registry_iter.as_ref(),
@@ -964,7 +1000,7 @@ fn run_rabbitstream_trigger_worker(
                         signal.raw_amount,
                     )?;
                     if sol_amount < config_iter.axion.min_sol {
-                        tracing::debug!(
+                        tracing::info!(
                             "rabbitstream axion trigger filtered: mint={} slot={} sig={} sol_amount={:.6} min_sol={:.6} volume_source={} side={} raw_amount={}",
                             signal.mint,
                             signal.slot,
@@ -989,7 +1025,7 @@ fn run_rabbitstream_trigger_worker(
                             if now.duration_since(*last_trigger)
                                 < Duration::from_millis(config_iter.axion.cooldown_ms)
                             {
-                                tracing::debug!(
+                                tracing::info!(
                                     "rabbitstream axion trigger skipped: mint={} slot={} sig={} reason=cooldown cooldown_ms={}",
                                     signal.mint,
                                     signal.slot,

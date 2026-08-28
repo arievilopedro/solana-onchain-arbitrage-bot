@@ -72,6 +72,18 @@ pub mod yellowstone {
         })
         .await?;
 
+        // INFO-visible confirmation that the subscription was accepted by
+        // the server. Without this, operators cannot distinguish "stream
+        // never connected" from "stream connected but zero triggers".
+        let allowed_snapshot = allowed_mints.load();
+        tracing::info!(
+            "rabbitstream axion stream connected: url={} axion_program={} allowlist_size={}",
+            plan.url,
+            axion_program,
+            allowed_snapshot.len(),
+        );
+        drop(allowed_snapshot);
+
         while let Some(update) = stream.next().await {
             let update = update?;
             let Some(UpdateOneof::Transaction(transaction_update)) = update.update_oneof else {
@@ -147,6 +159,15 @@ pub mod yellowstone {
             ..Default::default()
         })
         .await?;
+
+        let allowed_snapshot = allowed_mints.load();
+        tracing::info!(
+            "rabbitstream fomo stream connected: url={} fomo_signer={} allowlist_size={}",
+            plan.url,
+            fomo_signer,
+            allowed_snapshot.len(),
+        );
+        drop(allowed_snapshot);
 
         while let Some(update) = stream.next().await {
             let update = update?;
