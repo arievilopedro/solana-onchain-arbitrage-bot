@@ -8,9 +8,10 @@ use solana_client::rpc_client::RpcClient;
 use solana_program::pubkey::Pubkey;
 use solana_program::system_instruction;
 use solana_sdk::hash::Hash;
-use solana_sdk::nonce::state::Data as NonceData;
+use solana_sdk::nonce::state::{State as NonceState, Versions as NonceVersions};
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
+use solana_sdk::system_program;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -67,11 +68,17 @@ impl NonceManager {
         for pubkey in nonce_pubkeys {
             match Self::fetch_nonce_state(rpc_client, pubkey) {
                 Ok(state) => {
+                    // Authority mismatch is fatal for THIS account: any TX we
+                    // build against it would fail at runtime because the wallet
+                    // cannot sign AdvanceNonceAccount for a nonce whose stored
+                    // authority is a different key. Skip it rather than admit
+                    // a broken slot into the round-robin pool.
                     if state.authority != authority {
                         warn!(
-                            "nonce account {} has authority {}, expected {}",
+                            "nonce account {} rejected: authority={} expected={} (wallet cannot advance)",
                             pubkey, state.authority, authority
                         );
+                        continue;
                     }
                     info!(
                         "nonce account loaded: pubkey={} nonce_hash={} authority={}",
@@ -87,7 +94,10 @@ impl NonceManager {
         }
 
         if accounts.is_empty() {
-            anyhow::bail!("no valid nonce accounts found");
+            anyhow::bail!(
+                "no valid nonce accounts found (all {} candidates rejected)",
+                nonce_pubkeys.len()
+            );
         }
 
         info!(
@@ -105,39 +115,84 @@ impl NonceManager {
     }
 
     /// Fetch nonce state from chain.
+    ///
+    /// The on-chain layout of a durable nonce account is
+    /// `Versions::Current(Box<State::Initialized(Data)>)` — NOT bare `Data`.
+    /// Deserializing directly into `Data` either fails outright or (worse)
+    /// silently returns garbage `authority`/`blockhash` values that make
+    /// every TX built against it fail with `NonceMismatch` / `BlockhashNotFound`.
+    /// See `solana-program/src/nonce/state/mod.rs` for the canonical layout.
     fn fetch_nonce_state(
         rpc_client: &RpcClient,
         pubkey: &Pubkey,
     ) -> anyhow::Result<NonceAccountState> {
         let account = rpc_client.get_account(pubkey)?;
 
-        // Parse nonce account data
-        let nonce_data: NonceData = bincode::deserialize(&account.data)
-            .map_err(|e| anyhow::anyhow!("failed to deserialize nonce account: {}", e))?;
+        // Owner MUST be the System program — otherwise this is not a real
+        // nonce account and `AdvanceNonceAccount` will hard-fail on-chain.
+        if account.owner != system_program::ID {
+            anyhow::bail!(
+                "nonce account {} has owner {}, expected system_program",
+                pubkey,
+                account.owner
+            );
+        }
+
+        let versions: NonceVersions = bincode::deserialize(&account.data).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to deserialize nonce account {} as Versions: {}",
+                pubkey,
+                e
+            )
+        })?;
+
+        let data = match versions.state() {
+            NonceState::Initialized(data) => data,
+            NonceState::Uninitialized => {
+                anyhow::bail!(
+                    "nonce account {} is Uninitialized (run nonce_setup or InitializeNonceAccount)",
+                    pubkey
+                );
+            }
+        };
 
         Ok(NonceAccountState {
             pubkey: *pubkey,
-            authority: nonce_data.authority,
-            nonce_hash: nonce_data.blockhash(),
+            authority: data.authority,
+            nonce_hash: data.blockhash(),
             fetched_at: Instant::now(),
             in_flight: false,
         })
     }
 
-    /// Get the next available nonce using round-robin selection.
+    /// Reserve the next available nonce using round-robin selection.
     ///
-    /// Returns (nonce_pubkey, nonce_hash, authority) for use in transaction building.
+    /// Atomically flips `in_flight=true` on the returned account under the
+    /// DashMap per-key write lock, preventing two concurrent callers from
+    /// grabbing the same nonce (which would collide on-chain — only the first
+    /// TX to land advances the stored hash; subsequent TXs signed against the
+    /// old hash fail with `NonceMismatch`).
+    ///
+    /// Returns `None` when every account is currently in-flight. Callers
+    /// MUST release the reservation via `release_nonce` (or the periodic
+    /// refresher will eventually clear it as a safety net).
     pub fn next_nonce(&self) -> Option<(Pubkey, Hash, Pubkey)> {
-        if self.account_order.is_empty() {
+        let n = self.account_order.len();
+        if n == 0 {
             return None;
         }
-
-        let index = self.current_index.fetch_add(1, Ordering::Relaxed) % self.account_order.len();
-        let pubkey = self.account_order[index];
-
-        self.accounts.get(&pubkey).map(|state| {
-            (state.pubkey, state.nonce_hash, state.authority)
-        })
+        // Try up to `n` slots to find one that is not in-flight.
+        for _ in 0..n {
+            let index = self.current_index.fetch_add(1, Ordering::Relaxed) % n;
+            let pubkey = self.account_order[index];
+            if let Some(mut state) = self.accounts.get_mut(&pubkey) {
+                if !state.in_flight {
+                    state.in_flight = true;
+                    return Some((state.pubkey, state.nonce_hash, state.authority));
+                }
+            }
+        }
+        None
     }
 
     /// Get a specific nonce by pubkey.
@@ -165,8 +220,14 @@ impl NonceManager {
 
     /// Refresh nonce values from chain.
     ///
-    /// Should be called periodically or after transactions confirm.
+    /// Refreshes the stored `nonce_hash` for every account. Also acts as an
+    /// orphan `in_flight` GC: any nonce whose reservation is older than
+    /// `orphan_ttl` is force-cleared, so a dropped release task never pins
+    /// a nonce permanently. Nonces with fresher reservations are left alone
+    /// (the delayed release task will handle them).
     pub fn refresh_all(&self, rpc_client: &RpcClient) -> usize {
+        use std::time::Duration;
+        let orphan_ttl = Duration::from_secs(30);
         let mut refreshed = 0;
 
         for pubkey in &self.account_order {
@@ -174,9 +235,17 @@ impl NonceManager {
                 Ok(new_state) => {
                     if let Some(mut state) = self.accounts.get_mut(pubkey) {
                         let old_hash = state.nonce_hash;
+                        let reservation_age = state.fetched_at.elapsed();
                         state.nonce_hash = new_state.nonce_hash;
                         state.fetched_at = new_state.fetched_at;
-                        state.in_flight = false;
+                        if state.in_flight && reservation_age > orphan_ttl {
+                            warn!(
+                                "nonce refresh cleared orphan in_flight: pubkey={} age_ms={}",
+                                pubkey,
+                                reservation_age.as_millis()
+                            );
+                            state.in_flight = false;
+                        }
 
                         if old_hash != new_state.nonce_hash {
                             debug!(
@@ -196,8 +265,13 @@ impl NonceManager {
         refreshed
     }
 
-    /// Refresh a single nonce from chain.
-    pub fn refresh_one(&self, rpc_client: &RpcClient, pubkey: &Pubkey) -> anyhow::Result<Hash> {
+    /// Refresh a single nonce from chain and clear its in-flight reservation.
+    ///
+    /// Intended to be called a few seconds after submitting a TX that used the
+    /// nonce: if the TX landed the on-chain nonce advanced (so the fresh fetch
+    /// updates `nonce_hash`); if it dropped, the fetch returns the unchanged
+    /// hash so the nonce remains usable. Either way the reservation is freed.
+    pub fn release_nonce(&self, rpc_client: &RpcClient, pubkey: &Pubkey) -> anyhow::Result<Hash> {
         let new_state = Self::fetch_nonce_state(rpc_client, pubkey)?;
 
         if let Some(mut state) = self.accounts.get_mut(pubkey) {

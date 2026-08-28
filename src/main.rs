@@ -1410,21 +1410,24 @@ async fn process_axion_trigger(
         );
         return Ok(());
     };
-    let compilation = {
+    let (compilation, nonce_manager_arc) = {
         let registry = registry
             .lock()
             .map_err(|_| anyhow::anyhow!("runtime registry mutex poisoned"))?;
         let route_execution_cache = route_execution_cache
             .read()
             .map_err(|_| anyhow::anyhow!("route execution cache lock poisoned"))?;
-        compile_controlled_mint_routes_cached(
+        let compilation = compile_controlled_mint_routes_cached(
             &config,
             wallet.as_ref(),
             &registry,
             signal.mint,
             recent_blockhash,
             &route_execution_cache,
-        )?
+        )?;
+        // Clone the Arc so we can release the nonce after dropping locks.
+        let nonce_manager_arc = route_execution_cache.nonce_manager.clone();
+        (compilation, nonce_manager_arc)
     };
     tracing::info!(
         "trigger compiled: mint={} sig={} routes={} compiled={} missing_route_shard={} compile_failed={} compile_ms={}",
@@ -1452,6 +1455,7 @@ async fn process_axion_trigger(
         );
         return Ok(());
     }
+    let used_nonce = compilation.used_nonce;
     let txs = compilation.transactions;
 
     if !config.execution.send_live_transactions {
@@ -1551,6 +1555,40 @@ async fn process_axion_trigger(
                         error,
                     ),
                 }
+            }
+        });
+    }
+
+    // Release the trigger's reserved nonce a few seconds after dispatch. This
+    // is long enough for the durable-nonce TX to have either landed (in which
+    // case `release_nonce`'s fresh RPC fetch picks up the advanced hash) or
+    // been dropped (in which case the fetch returns the unchanged hash and the
+    // slot becomes usable again). Uses `spawn_blocking` because
+    // `NonceManager::release_nonce` performs a synchronous RPC call.
+    if let (Some(nonce_pubkey), Some(nonce_mgr)) = (used_nonce, nonce_manager_arc) {
+        let rpc_client_clone = rpc_client.clone();
+        let trigger_mint_dbg = signal.mint;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let rpc_for_blocking = rpc_client_clone.clone();
+            let nonce_mgr_for_blocking = nonce_mgr.clone();
+            let release = tokio::task::spawn_blocking(move || {
+                nonce_mgr_for_blocking.release_nonce(&rpc_for_blocking, &nonce_pubkey)
+            })
+            .await;
+            match release {
+                Ok(Ok(hash)) => tracing::debug!(
+                    "nonce released after trigger: mint={} pubkey={} new_hash={}",
+                    trigger_mint_dbg, nonce_pubkey, hash
+                ),
+                Ok(Err(e)) => tracing::warn!(
+                    "nonce release failed: mint={} pubkey={} error={}",
+                    trigger_mint_dbg, nonce_pubkey, e
+                ),
+                Err(e) => tracing::warn!(
+                    "nonce release task panicked: mint={} pubkey={} error={}",
+                    trigger_mint_dbg, nonce_pubkey, e
+                ),
             }
         });
     }
@@ -2602,6 +2640,10 @@ struct TaggedTransaction {
 struct ControlledMintCompilation {
     summary: ControlledTxDryRunSummary,
     transactions: Vec<TaggedTransaction>,
+    /// Nonce account reserved for this trigger (if any). Callers MUST release
+    /// it via `NonceManager::release_nonce` a few seconds after submitting the
+    /// TXs, so the reservation is freed regardless of landing outcome.
+    used_nonce: Option<Pubkey>,
 }
 
 #[derive(Debug, Clone)]
@@ -2894,6 +2936,19 @@ fn compile_controlled_mint_routes_cached(
     );
 
     let spam_copies = spam_copies_per_route(config);
+    // Only the FIRST TX built for this trigger reserves a durable nonce. The
+    // remaining spam copies and per-provider variants use the normal
+    // `recent_blockhash`. Rationale:
+    //   1. If N TXs from one trigger all reserved distinct nonces, a trigger
+    //      burst (5 providers × 3 spam) would drain the entire nonce pool in
+    //      one shot, starving the next trigger and forcing round-robin
+    //      collisions (same nonce reused → `NonceMismatch` on-chain).
+    //   2. If N TXs all reused the *same* nonce, only the first to land
+    //      advances the on-chain hash; the rest fail with `NonceMismatch`
+    //      and cost CU with no landing benefit.
+    //   3. One nonce-backed TX per trigger gives us a guaranteed-durable
+    //      landing path (no blockhash expiration) plus the spam copies for
+    //      speed via alternate providers. Best of both.
     for route in route_groups {
         compilation.summary.routes += 1;
         // Fan out: one TX per (provider × spam copy). Each TX carries a tip
@@ -2905,9 +2960,12 @@ fn compile_controlled_mint_routes_cached(
             for _copy in 0..spam_copies {
                 let params =
                     controlled_execution_params_with_tip(config, Some(tip_cfg.clone()));
-                let build_result = if let Some(nonce_mgr) = &route_execution_cache.nonce_manager {
+                let use_nonce_for_this_tx = compilation.used_nonce.is_none()
+                    && route_execution_cache.nonce_manager.is_some();
+                let build_result = if use_nonce_for_this_tx {
+                    let nonce_mgr = route_execution_cache.nonce_manager.as_ref().unwrap();
                     if let Some((nonce_pubkey, nonce_hash, _authority)) = nonce_mgr.next_nonce() {
-                        nonce_mgr.mark_in_flight(&nonce_pubkey);
+                        compilation.used_nonce = Some(nonce_pubkey);
                         build_controlled_transaction_with_nonce(
                             wallet,
                             &route,
@@ -2918,12 +2976,20 @@ fn compile_controlled_mint_routes_cached(
                             params,
                         )
                     } else {
+                        // Nonce pool exhausted — fall back to blockhash so we
+                        // still send the TX. Warn once per trigger.
                         tracing::warn!(
-                            "trigger nonce unavailable: mint={} reason=all_nonces_in_flight",
+                            "trigger nonce unavailable: mint={} reason=all_nonces_in_flight fallback=recent_blockhash",
                             mint
                         );
-                        compilation.summary.compile_failed += 1;
-                        continue;
+                        build_controlled_transaction(
+                            wallet,
+                            &route,
+                            mint_state.token_program,
+                            recent_blockhash,
+                            &lookup_tables,
+                            params,
+                        )
                     }
                 } else {
                     build_controlled_transaction(
